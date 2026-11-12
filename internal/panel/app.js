@@ -2154,6 +2154,7 @@ function grantsMsg(gs) {
   $('btnCheckinState').onclick = async () => {
     const b = $('btnCheckinState');
     b.disabled = true;
+    let note = '';
     try {
       const d = await api('checkin_status');
       checkinState = {};
@@ -2162,9 +2163,11 @@ function grantsMsg(gs) {
       if (d.failed) parts.push('查询失败 ' + d.failed);
       const skipped = (d.accounts || []).filter(r => r.skipped).length;
       if (skipped) parts.push('无签到接口 ' + skipped);
-      $('accNote').textContent = '签到状态：' + parts.join(' · ');
+      note = '签到状态：' + parts.join(' · ');
     } catch (e) { toast(e.message, 'err'); }
-    finally { b.disabled = false; loadOverview(true); }
+    // 摘要要写在刷新**之后**：loadOverview() 每次都会重写 accNote（"已启用密钥鉴权"），
+    // 先写就被它覆盖，用户永远看不到这次查询的结果。
+    finally { b.disabled = false; await loadOverview(true); if (note) $('accNote').textContent = note; }
   };
   // 领一次性新手礼包（全池）：桌面端 + 移动端各 3000 分。领过的号上游回「已领过」，
   // 不是失败——所以「新到账 / 已领过 / 失败」三档分开报，别把幂等回执说成错误。
@@ -2183,6 +2186,7 @@ function grantsMsg(gs) {
   $('btnTasks').onclick = async () => {
     const b = $('btnTasks');
     b.disabled = true;
+    let note = '';
     try {
       const d = await api('tasks');
       const rows = d.accounts || [];
@@ -2201,9 +2205,9 @@ function grantsMsg(gs) {
         parts.push('邀请码 ' + inv.code + '（已邀 ' + (inv.registered_invitees || 0) +
           ' 人，每邀一位 +' + (inv.register_reward_points || 0) + ' 分）');
       }
-      $('accNote').textContent = '新手任务：' + parts.join(' · ');
+      note = '新手任务：' + parts.join(' · ');
     } catch (e) { toast(e.message, 'err'); }
-    finally { b.disabled = false; loadOverview(true); }
+    finally { b.disabled = false; await loadOverview(true); if (note) $('accNote').textContent = note; }
   };
   $('accBody').addEventListener('click', async ev => {
     const b = ev.target.closest('button[data-a]');
