@@ -110,6 +110,14 @@ Docker：`docker compose up -d --build`（`auths/`、`data/`、`config.json` 都
 点确认授权）仍然由人完成——发码要阿里云无痕验证的令牌，服务端拿不到，这步无法自动化。
 重复提交/链接失效这类幂等场景它按「先看账号池」处理，不会把你带进"重开登录"的循环。
 
+**邀请关系只能绑在注册那一刻**（2026-11-12 查实）：上游**没有"补绑"接口**——
+前端全量 bundle 里找不到任何邀请写接口，10 条候选路由（`/points/v1/invite/bind`、
+`/bind_invite`、`/attend_invite`…）实测全是 404，对照 `/points/v1/tasks` 返回 401。
+邀请码只出现在**注册/登录请求的归因载荷**里（`registration_attribution{invite_code,
+registration_entry, registration_source}` 与 `inviter_user_id`），写死在注册那一刻。
+所以 `/panel/api/login/sms` 支持可选的 `invite_code`：未注册的号在"登录即注册"时带上它，
+邀请码的主人才能拿到奖励；已注册的号带也无效（这条就是"补绑不存在"的另一面）。
+
 **添加账号 → 手机验证码**：走官方网页端同一条通道（auth 域的 `/send_sms` 与 `/login_with_sms`），
 手机号按官方前端那套对称加密（AES-128-CFB，密钥写在网页里）上行——明文会被上游拒。
 

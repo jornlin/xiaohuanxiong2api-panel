@@ -86,12 +86,16 @@ func TestPanelSmsLogin(t *testing.T) {
 		}
 	})
 
-	code, body := call(t, pn, http.MethodPost, "/panel/api/login/sms", `{"phone":"13800000001","sms_code":"123456"}`)
+	code, body := call(t, pn, http.MethodPost, "/panel/api/login/sms",
+		`{"phone":"13800000001","sms_code":"123456","invite_code":"c32ce479531e42a88ff6f230cdeabbf7"}`)
 	if code != http.StatusOK {
 		t.Fatalf("验证码登录 = %d (%v)", code, body)
 	}
 	if body["uid"] != "7982218" {
 		t.Errorf("uid = %v", body["uid"])
+	}
+	if body["invite_code"] != "c32ce479531e42a88ff6f230cdeabbf7" {
+		t.Errorf("邀请码没回显：%v", body["invite_code"])
 	}
 	if gotCode != "123456" {
 		t.Errorf("上游收到的 sms_code = %q（应明文透传）", gotCode)
@@ -107,6 +111,12 @@ func TestPanelSmsLogin(t *testing.T) {
 	}
 	if _, ok := pn.cfg.Pool.Status("7982218"); !ok {
 		t.Error("账号没入池")
+	}
+
+	// 邀请码长度不对：本地拦下，不打上游。
+	if code, _ := call(t, pn, http.MethodPost, "/panel/api/login/sms",
+		`{"phone":"13800000001","sms_code":"123456","invite_code":"x"}`); code != http.StatusBadRequest {
+		t.Errorf("过短邀请码 = %d，期望 400", code)
 	}
 
 	// 验证码非数字：本地拦下，不打上游。

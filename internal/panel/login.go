@@ -558,6 +558,9 @@ func (p *Panel) loginSms(w http.ResponseWriter, r *http.Request) {
 		Nation string `json:"nation_code"`
 		Phone  string `json:"phone"`
 		Code   string `json:"sms_code"`
+		// Invite 可选：只在**注册那一刻**有效（上游没有补绑接口）。
+		// 未注册的号在登录即注册时带上它，邀请码的主人才能拿到奖励。
+		Invite string `json:"invite_code"`
 	}
 	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&req); err != nil {
 		writeErr(w, http.StatusBadRequest, "请求体不是合法 JSON")
@@ -583,7 +586,12 @@ func (p *Panel) loginSms(w http.ResponseWriter, r *http.Request) {
 	} else if left <= 2 {
 		log.Printf("panel: 验证码登录尝试接近上限 +%s（本窗口还剩 %d 次）", maskPhone(phone), left)
 	}
-	creds, err := p.cfg.Upstream.LoginWithSms(nation, phone, code)
+	invite := strings.TrimSpace(req.Invite)
+	if invite != "" && (len(invite) < 8 || len(invite) > 64) {
+		writeErr(w, http.StatusBadRequest, "邀请码长度不对（8-64 位）")
+		return
+	}
+	creds, err := p.cfg.Upstream.LoginWithSms(nation, phone, code, invite)
 	if err != nil {
 		log.Printf("panel: 验证码登录失败 +%s: %v", maskPhone(phone), err)
 		writeErr(w, http.StatusBadGateway, publicErr(err))
@@ -608,9 +616,13 @@ func (p *Panel) loginSms(w http.ResponseWriter, r *http.Request) {
 		log.Printf("panel: 验证码登录成功 +%s uid=%s —— 上游没给 refresh_token，到期后需重新登录",
 			maskPhone(phone), uid)
 	}
+	if invite != "" {
+		log.Printf("panel: 验证码登录 +%s uid=%s 已带邀请码（注册归因）", maskPhone(phone), uid)
+	}
 	log.Printf("panel: 验证码登录成功 +%s uid=%s", maskPhone(phone), uid)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"ok": true, "action": "imported", "uid": uid, "nickname": nick,
+		"invite_code":           invite,
 		"refresh_token_missing": noRefresh,
 		"warn":                  warn,
 	})

@@ -109,13 +109,25 @@ func (c *Client) SendSmsCode(nation, phone, captchaParam string) error {
 //
 // uid 以 user_info 为准（与 exchangeCode 同口径）：登录响应里的 user_id 可能是
 // 平台 id（pu-…，iam 域），直接用会让同一个号在池子里出现两行。
-func (c *Client) LoginWithSms(nation, phone, code string) (*auth.Auth, error) {
+//
+// inviteCode 非空时附带注册归因（registration_attribution）—— 这是**唯一**能绑邀请的地方：
+// 上游没有"补绑"接口（前端全量 bundle 里没有任何邀请写接口，10 条候选路由实测全 404，
+// 对照 /points/v1/tasks 返回 401），邀请关系写死在**注册那一刻**的请求载荷里。
+// 未注册的号在登录即注册时会带上它，邀请人才能拿到奖励；已注册的号带也无效。
+func (c *Client) LoginWithSms(nation, phone, code, inviteCode string) (*auth.Auth, error) {
 	enc, err := EncryptSmsField(phone)
 	if err != nil {
 		return nil, err
 	}
 	// sms_code 是明文（官方页就是这么发的，实测也走到了验码那一步）。
 	body := map[string]any{"nation_code": nation, "phone": enc, "sms_code": code}
+	if inviteCode != "" {
+		body["registration_attribution"] = map[string]any{
+			"invite_code":         inviteCode,
+			"registration_entry":  "register",
+			"registration_source": "web",
+		}
+	}
 	resp, err := c.doJSON(http.MethodPost, c.authBase()+LoginSmsPath, body, c.clientIDHeaders())
 	if err != nil {
 		return nil, err

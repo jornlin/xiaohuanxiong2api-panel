@@ -89,7 +89,7 @@ func TestLoginWithSmsBuildsAccount(t *testing.T) {
 	up := New()
 	up.SetAgentHosts(srv.URL, srv.URL)
 
-	acc, err := up.LoginWithSms("86", "13800000001", "123456")
+	acc, err := up.LoginWithSms("86", "13800000001", "123456", "")
 	if err != nil {
 		t.Fatalf("LoginWithSms 出错: %v", err)
 	}
@@ -136,7 +136,7 @@ func TestLoginWithSmsFriendlyErrors(t *testing.T) {
 
 			up := New()
 			up.SetAgentHosts(srv.URL, srv.URL)
-			_, err := up.LoginWithSms("86", "13800000001", "000000")
+			_, err := up.LoginWithSms("86", "13800000001", "000000", "")
 			if err == nil {
 				t.Fatal("业务失败应当报错")
 			}
@@ -199,5 +199,45 @@ func TestSmsNationsFallbackOnBadPayload(t *testing.T) {
 	up.SetAgentHosts(srv.URL, srv.URL)
 	if got := up.SmsNations(); len(got) != 4 {
 		t.Errorf("形状不对时应用兜底表（4 条），得到 %+v", got)
+	}
+}
+
+// TestLoginWithSmsInviteAttribution 邀请码只能挂在注册请求的归因里（上游没有补绑接口）：
+// 给了就必须带上 registration_attribution，没给就不许出现这个字段（免得把老号也标成新注册）。
+func TestLoginWithSmsInviteAttribution(t *testing.T) {
+	var got map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/user_info" {
+			_, _ = io.WriteString(w, `{"code":0,"data":{"id":"u-inv","name":"被邀请人"}}`)
+			return
+		}
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &got)
+		_, _ = io.WriteString(w, `{"code":0,"data":{"access_token":"`+testJWT+`","refresh_token":"rt"}}`)
+	}))
+	defer srv.Close()
+
+	up := New()
+	up.SetAgentHosts(srv.URL, srv.URL)
+
+	if _, err := up.LoginWithSms("86", "13800000001", "123456", ""); err != nil {
+		t.Fatalf("无邀请码登录出错: %v", err)
+	}
+	if _, present := got["registration_attribution"]; present {
+		t.Error("没给邀请码却发了 registration_attribution：会把这次登录标成注册归因")
+	}
+
+	if _, err := up.LoginWithSms("86", "13800000001", "123456", "c32ce479531e42a88ff6f230cdeabbf7"); err != nil {
+		t.Fatalf("带邀请码登录出错: %v", err)
+	}
+	attr, _ := got["registration_attribution"].(map[string]any)
+	if attr == nil {
+		t.Fatal("给了邀请码却没带 registration_attribution")
+	}
+	if attr["invite_code"] != "c32ce479531e42a88ff6f230cdeabbf7" {
+		t.Errorf("invite_code = %v", attr["invite_code"])
+	}
+	if attr["registration_entry"] != "register" || attr["registration_source"] != "web" {
+		t.Errorf("归因字段名/取值与官方页不一致: %v", attr)
 	}
 }
