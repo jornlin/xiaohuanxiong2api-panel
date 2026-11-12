@@ -2,6 +2,7 @@ package panel
 
 import (
 	"os"
+	"os/exec"
 	"regexp"
 	"strings"
 	"testing"
@@ -59,5 +60,26 @@ func TestStatsStripSingleRow(t *testing.T) {
 	rule := html[i : i+strings.Index(html[i:], "}")]
 	if !strings.Contains(rule, "auto-fit") {
 		t.Errorf(".stats 应使用 auto-fit 自适应列数，实际规则：%s", rule)
+	}
+}
+
+// TestPanelScriptsParse 面板的 JS 是 go:embed 进去的，**没有构建期校验**：
+// 一个漏写的 async（里面却有 await）就能让整个 app.js 解析失败，而 Go 侧一切正常、
+// 只有浏览器里才炸（2026-11-12 真踩过：复制按钮忘了 async）。
+// 这里用 node --check 过一遍语法；没装 node 就跳过（本地/CI 大多有）。
+func TestPanelScriptsParse(t *testing.T) {
+	if _, err := exec.LookPath("node"); err != nil {
+		t.Skip("没装 node，跳过 JS 语法检查")
+	}
+	for _, f := range []string{"app.js", "theme.js"} {
+		raw, err := os.ReadFile(f)
+		if err != nil {
+			t.Fatalf("读 %s 失败: %v", f, err)
+		}
+		cmd := exec.Command("node", "--check", "-")
+		cmd.Stdin = strings.NewReader(string(raw))
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Errorf("%s 语法错误（node --check）：%s", f, strings.TrimSpace(string(out)))
+		}
 	}
 }

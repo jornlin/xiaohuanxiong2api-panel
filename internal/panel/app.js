@@ -82,6 +82,35 @@ async function api(path, opts = {}) {
   if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
   return d;
 }
+/* copyText：把文字复制到剪贴板，返回是否成功。
+   面板常常跑在 http://（非安全上下文）上，这时 navigator.clipboard 是 undefined ——
+   以前两个「复制」按钮都只 catch 一下就完事，点了跟没点一样（用户看到"复制失败"）。
+   这里退回 execCommand('copy')：先 select 一个只读输入框（或临时 textarea）再执行。 */
+async function copyText(text, inputEl) {
+  if (!text) return false;
+  if (window.isSecureContext && navigator.clipboard) {
+    try { await navigator.clipboard.writeText(text); return true; } catch (e) { /* 落到下面 */ }
+  }
+  let tmp = null, el = inputEl;
+  try {
+    if (!el) {
+      tmp = el = document.createElement('textarea');
+      el.value = text;
+      el.setAttribute('readonly', '');
+      el.style.cssText = 'position:fixed;top:-1000px;opacity:0';
+      document.body.appendChild(el);
+    }
+    el.focus();
+    el.select();
+    if (el.setSelectionRange) el.setSelectionRange(0, text.length);
+    return document.execCommand('copy');
+  } catch (e) {
+    return false;
+  } finally {
+    if (tmp) tmp.remove();
+  }
+}
+
 function toast(msg, cls) {
   const el = document.createElement('div');
   el.className = 'tst ' + (cls || '');
@@ -1913,7 +1942,7 @@ function openAdd() {
   $('addVeil').classList.add('on');
   api('login/start', { method: 'POST', body: JSON.stringify({ realm: addRealm }) }).then(d => {
     loginID = d.id;
-    $('addUrl').textContent = d.url;
+    $('addUrl').value = d.url;   // 现在是个只读 input：可选中、可复制（http 下 clipboard API 不可用）
     $('addUrl').title = d.url; // 单行截断，悬停看全
     $('addLoad').hidden = true;
     $('addReady').hidden = false;
@@ -2082,22 +2111,33 @@ function boot() {
   $('btnQrRefresh').onclick = () => { qrStarted = false; startQrLogin(); };
   // 回车即提交，省一次点击（粘贴完习惯性敲回车）。
   $('addCallbackUrl').addEventListener('keydown', e => { if (e.key === 'Enter') submitCallback(); });
-  $('btnCopyUrl').onclick = () => {
-    if (navigator.clipboard) navigator.clipboard.writeText($('addUrl').textContent).catch(() => {});
+  // 注意必须是 async：里面 await 了 copyText。漏写 async 会让整个 app.js 解析失败
+  // （面板是 go:embed 的，没有构建期校验，浏览器里才会炸）。
+  $('btnCopyUrl').onclick = async () => {
+    const url = $('addUrl').value || $('addUrl').textContent;
+    if (await copyText(url, $('addUrl'))) toast('授权链接已复制', 'ok');
+    else toast('复制没成功：链接已选中，按 ⌘C / Ctrl+C 复制', 'err');
   };
   // 新标签页打开：点击是用户手势，弹窗拦截不挡；noopener 不给新页面 window.opener 句柄。
-  $('btnOpenUrl').onclick = () => window.open($('addUrl').textContent, '_blank', 'noopener');
+  $('btnOpenUrl').onclick = () => {
+    const url = $('addUrl').value || $('addUrl').textContent;
+    if (!url) { toast('授权链接还没生成', 'err'); return; }
+    window.open(url, '_blank', 'noopener');
+  };
   $('btnRefreshLogin').onclick = refreshLogin;
   $('btnSmsSend').onclick = sendSmsCode;
   $('btnSmsLogin').onclick = loginBySms;
   // 官方登录页：发码要过它的人机校验，这是唯一能拿到验证码的地方。
+  // 从「手机验证码」跳到「授权页登录」：那条路是"整条登录都在用户浏览器里完成"，
+  // 只把回调链接交回面板，不存在跨上下文提交被拒的问题。
+  $('btnSmsGoAuthorize').onclick = () => { switchAddTab('browser'); };
   $('btnSmsInviteRefresh').onclick = loadSmsInvites;
   $('smsInvite').onchange = syncInviteUrl;
   $('btnSmsCopyInvite').onclick = async () => {
     const url = $('smsInviteUrl').value;
     if (!url) { toast('先选一个邀请码', 'err'); return; }
-    try { await navigator.clipboard.writeText(url); toast('注册链接已复制，去浏览器里打开它发码', 'ok'); }
-    catch (e) { $('smsInviteUrl').select(); toast('复制失败，已选中文本，按 ⌘C 复制', 'warn'); }
+    if (await copyText(url, $('smsInviteUrl'))) toast('注册链接已复制，去浏览器里打开它发码', 'ok');
+    else toast('复制没成功：链接已选中，按 ⌘C / Ctrl+C 复制', 'err');
   };
   $('btnSmsOpenInvite').onclick = () => {
     const url = $('smsInviteUrl').value;
