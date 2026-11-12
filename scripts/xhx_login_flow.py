@@ -195,11 +195,11 @@ def main() -> int:
     api = Api(args.base, args.key, insecure=args.insecure)
 
     try:
-        step("1/5 连通性自检")
+        step("1) 连通性自检")
         acc_before = [a.get("uid") for a in show_accounts(api)]
         uids_before = {str(u) for u in acc_before}
 
-        step("2/5 发起授权会话")
+        step("2) 发起授权会话")
         sess = start_login(api, args.realm)
         session_id, auth_url = sess["id"], sess["url"]
         ok(f"会话 id {session_id[:12]}…（回调地址写死 127.0.0.1:{sess.get('callback_port')}，"
@@ -210,7 +210,7 @@ def main() -> int:
         if raw:
             ok("使用 --url 传入的回调链接")
         else:
-            step("3/5 在浏览器里完成登录（这几步必须人工：验证码要过阿里云无痕验证）")
+            step("3) 在浏览器里完成登录（这几步必须人工：验证码要过阿里云无痕验证）")
             print("      1) 打开授权页 → 点「登录并继续」")
             print("      2) 输入手机号 → 发送验证码 → 勾选同意 → 填验证码 → 登录")
             print("      3) 点「确认授权」→ 浏览器跳到 http://127.0.0.1:… （打不开是正常的）")
@@ -238,25 +238,22 @@ def main() -> int:
             return 1
         ok(f"解析到 code={code[:12]}…" + (f" state={state[:12]}…" if state else "（没有 state）"))
 
-        step("4/5 提交回调，等账号入池")
+        step("4) 提交回调，等账号入池")
         try:
             out = submit_callback(api, raw)
         except PanelError as e:
-            # 一次性授权码最典型的两种误报：链接重复提交、或已被上一轮消费。
-            if e.status in (400, 409, 410):
-                warn(f"面板回报：{e.message}")
-                warn("授权码是一次性的：如果这条链接刚提交过，账号很可能已经在池子里了")
-                if e.payload.get("uid"):
-                    ok(f"面板已确认账号 uid={e.payload['uid']}")
-                step("复查账号池")
-                accounts = show_accounts(api)
-                new = [a for a in accounts if str(a.get("uid")) not in uids_before]
-                if new:
-                    ok(f"确有新账号入池：{new[0].get('uid')}（{new[0].get('nickname')}）")
-                    return 0
-                fail("池子里没有新账号。请回面板重新发起一次登录（旧链接已经作废）")
-                return 1
-            raise
+            # 提交失败先别急着下结论：授权码是一次性的，账号很可能已经被另一条路径
+            # （另一次提交、浏览器自动回调、上一次重试）加进池子了。以账号池为准。
+            warn(f"面板回报：{e.message}")
+            step("复查账号池（授权码一次性，先看账号是否已经进去了）")
+            accounts = show_accounts(api)
+            new = [a for a in accounts if str(a.get("uid")) not in uids_before]
+            if new:
+                ok(f"确有新账号入池：{new[0].get('uid')}（{new[0].get('nickname')}）"
+                   f"—— 上面那条报错可以忽略，链接已经生效过")
+                return 0
+            fail("池子里没有新账号。这条链接的授权码已经作废，请重新发起一次登录")
+            return 1
 
         if out.get("action") == "imported":
             ok(f"已入池：{out.get('nickname') or out.get('uid')}（uid={out.get('uid')}）")
@@ -278,7 +275,7 @@ def main() -> int:
             new_uid = str(done.get("uid") or "")
             ok(f"已入池：{done.get('nickname') or new_uid}（uid={new_uid}）")
 
-        step("5/5 核对结果")
+        step("5) 核对结果")
         show_accounts(api, highlight=new_uid)
         if args.checkin:
             print()
