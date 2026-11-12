@@ -640,7 +640,11 @@ func (d *DeviceLogin) Realm() string { return d.realm }
 // AuthURL 返回授权页地址，面板展示 + 一键打开。
 func (d *DeviceLogin) AuthURL() string { return d.url }
 
-// AcceptCallback 收下浏览器送回的授权码（state 必须与本会话一致，且只收一次）。
+// AcceptCallback 收下浏览器送回的授权码（state 必须与本会话一致）。
+//
+// **同一个 code 重复提交是幂等的**（返回 nil）：面板上「提交回调链接」被点两次、
+// 或浏览器自动回调与手工粘贴同时到达，都是正常操作，不该报错——报错会让人以为
+// 链接失效，然后反复重开登录。只有「已收下一个 code，又来一个不同的」才拒绝。
 func (d *DeviceLogin) AcceptCallback(state, code string) error {
 	if subtle.ConstantTimeCompare([]byte(state), []byte(d.state)) != 1 {
 		return errors.New("state 不匹配：这条回调不属于当前登录会话")
@@ -651,26 +655,55 @@ func (d *DeviceLogin) AcceptCallback(state, code string) error {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.code == code {
+		return nil // 重复提交同一条链接：收下了，不重复换票
+	}
 	if d.code != "" {
-		return errors.New("这个登录会话已经用过了，请回面板重新添加")
+		return errors.New("这个登录会话已经收过另一个授权码了，请回面板重新发起登录")
 	}
 	d.code = code
 	return nil
 }
 
-// Poll 还没收到回调 → (nil,false,nil)；收到了 → 换票并返回凭证（授权码一次性，取走即清）。
+// Pending 会话手上是否已经有一个还没换票的授权码（面板据此回报「重复提交」）。
+func (d *DeviceLogin) Pending() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.code != ""
+}
+
+// Poll 还没收到回调 → (nil,false,nil)；收到了 → 换票并返回凭证。
+//
+// 授权码一次性，所以取走即清；但**只在得到确定结论时清**：
+//   - 换票成功 → 清
+//   - 上游说授权码失效（ErrCodeExpired）→ 清（这个码已经废了，留着只会每轮白打一次）
+//   - 网络层/5xx 等可重试失败 → **保留**，下一轮再试
+//
+// 早先的实现在换票之前就把 code 清掉了：一次超时就能让会话永远拿不到票，
+// 前端一直转圈、用户重复提交，最后看到的是「链接失效」。
 func (d *DeviceLogin) Poll(context.Context) (*auth.Auth, bool, error) {
 	d.mu.Lock()
 	code := d.code
-	d.code = ""
 	d.mu.Unlock()
 	if code == "" {
 		return nil, false, nil
 	}
 	creds, err := d.client.exchangeCode(code)
 	if err != nil {
+		if errors.Is(err, ErrCodeExpired) {
+			d.mu.Lock()
+			if d.code == code {
+				d.code = ""
+			}
+			d.mu.Unlock()
+		}
 		return nil, false, err
 	}
+	d.mu.Lock()
+	if d.code == code {
+		d.code = ""
+	}
+	d.mu.Unlock()
 	if creds != nil && d.machine != "" {
 		if err := creds.CompleteIdentity(d.machine); err != nil {
 			return nil, false, err

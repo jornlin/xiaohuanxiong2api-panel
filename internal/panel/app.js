@@ -1924,11 +1924,16 @@ async function submitCallback() {
   try {
     const d = await api('login/code', { method: 'POST', body: JSON.stringify({ url: raw }) });
     if (d.action === 'session') {
-      // 交回了本次登录会话：立刻问一次，别等下一个 3s tick。
+      // 交回了本次登录会话：**先给反馈再轮询**。以前这里直接 await pollLogin()，
+      // 换票没在这一次轮询里完成就什么都不显示，看起来像「点了没反应」，
+      // 于是用户重复提交、被授权码一次性打回，以为链接坏了。
+      toast(d.duplicate ? '这条链接已经提交过了，正在换票…' : '授权码已收到，正在换票…', 'ok');
+      $('addErr').hidden = true;
+      // 立刻问一次，别等下一个 3s tick。
       await pollLogin();
       return;
     }
-    toast('已加入：' + (d.nickname || d.uid), 'ok');
+    toast('已加入：' + (d.nickname || d.uid) + (d.duplicate ? '（这条链接此前已提交过）' : ''), 'ok');
     $('addVeil').classList.remove('on');
     loginID = '';
     stopLoginPoll();
@@ -1963,7 +1968,9 @@ async function pollLogin() {
     if (e.status === 404 || e.status === 410) {
       stopLoginPoll();
       $('addErr').hidden = false;
-      $('addErr').textContent = '登录会话已过期，请关闭后重新添加';
+      // 服务端现在会区分「授权码已失效（链接提交过两次）」和「会话过期」，
+      // 原样展示它的话——两者处置不同，笼统说一句过期会让人白试。
+      $('addErr').textContent = e.message || '登录会话已过期，请关闭后重新添加';
       return;
     }
     if (++pollFails >= POLL_MAX_FAILS) {

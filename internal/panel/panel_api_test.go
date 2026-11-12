@@ -429,3 +429,79 @@ func TestRequestIDFromBillEvent(t *testing.T) {
 		}
 	}
 }
+
+// TestLoginCodeDuplicateSubmit 同一条回调链接重复提交必须幂等成功。
+//
+// 踩过的坑：第一次提交把授权码交给会话后，界面在换票完成前什么都不显示（看起来像
+// 没反应），用户再点一次 —— 老实现回 400「这个登录会话已经用过了」，把正常操作
+// 说成链接失效，于是重开登录反复折腾两三次。现在第二次返回 duplicate:true 的成功。
+func TestLoginCodeDuplicateSubmit(t *testing.T) {
+	pn, _, _ := newTestPanel(t)
+	_, body := call(t, pn, http.MethodPost, "/panel/api/login/start", `{"realm":"cn"}`)
+	state := fmt.Sprint(body["id"])
+	pasted := "http://127.0.0.1:17867/auth/callback?code=ac_dup&state=" + state
+
+	code, res := call(t, pn, http.MethodPost, "/panel/api/login/code", `{"url":`+strconv.Quote(pasted)+`}`)
+	if code != http.StatusOK || res["action"] != "session" {
+		t.Fatalf("首次提交 = %d %v", code, res)
+	}
+	if res["duplicate"] == true {
+		t.Error("首次提交不该标成 duplicate")
+	}
+
+	code, res = call(t, pn, http.MethodPost, "/panel/api/login/code", `{"url":`+strconv.Quote(pasted)+`}`)
+	if code != http.StatusOK {
+		t.Fatalf("重复提交应当幂等成功，得到 %d %v", code, res)
+	}
+	if res["action"] != "session" || res["duplicate"] != true {
+		t.Errorf("重复提交应回报 action=session duplicate=true，得到 %v", res)
+	}
+
+	// 换票完成、会话被删之后，再提交同一条链接：回报上次的账号，而不是「无会话」直接换票。
+	if code, res := call(t, pn, http.MethodGet, "/panel/api/login/poll?id="+state, ""); code != http.StatusOK || res["done"] != true {
+		t.Fatalf("poll = %d %v", code, res)
+	}
+	code, res = call(t, pn, http.MethodPost, "/panel/api/login/code", `{"url":`+strconv.Quote(pasted)+`}`)
+	if code != http.StatusOK || res["action"] != "imported" || res["uid"] != "u-9" || res["duplicate"] != true {
+		t.Errorf("会话完成后重复提交应幂等回报账号，得到 %d %v", code, res)
+	}
+}
+
+// TestLoginPollTerminalOnBadCode 换票被业务层拒绝是终态：停轮询并说明原因，
+// 不能让前端一直转圈（用户干等之后只会重复提交）。
+func TestLoginPollTerminalOnBadCode(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/login_with_authorization_code" {
+			_, _ = io.WriteString(w, `{"code":200035,"message":"authorization code expired"}`)
+			return
+		}
+		http.NotFound(w, r)
+	}))
+	t.Cleanup(srv.Close)
+
+	up := upstream.New()
+	up.SetAgentHosts(srv.URL, srv.URL)
+	up.SetAPIHosts(srv.URL, srv.URL)
+	pn := New(Config{
+		Pool: pool.New(""), Upstream: up, AuthDir: t.TempDir(), Version: "test",
+		CallbackBase: "http://127.0.0.1:17867",
+		Models:       func() []map[string]any { return []map[string]any{} },
+	})
+	_, body := call(t, pn, http.MethodPost, "/panel/api/login/start", `{"realm":"cn"}`)
+	state := fmt.Sprint(body["id"])
+	pasted := "http://127.0.0.1:17867/auth/callback?code=ac_bad&state=" + state
+	if code, _ := call(t, pn, http.MethodPost, "/panel/api/login/code", `{"url":`+strconv.Quote(pasted)+`}`); code != http.StatusOK {
+		t.Fatalf("提交回调 = %d", code)
+	}
+	code, res := call(t, pn, http.MethodGet, "/panel/api/login/poll?id="+state, "")
+	if code != http.StatusGone {
+		t.Fatalf("业务拒绝后 poll 应当 410（终态），得到 %d %v", code, res)
+	}
+	if msg, _ := res["error"].(string); !strings.Contains(msg, "重新发起") {
+		t.Errorf("终态原因要说清怎么办：%q", msg)
+	}
+	// 会话已删：再轮询是 410，不是重新开始换票。
+	if code, _ := call(t, pn, http.MethodGet, "/panel/api/login/poll?id="+state, ""); code != http.StatusGone {
+		t.Errorf("会话应已删除，再轮询 = %d", code)
+	}
+}

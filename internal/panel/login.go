@@ -27,6 +27,14 @@ const (
 
 var errLoginSession = errors.New("登录链接已失效，请回面板重新点「添加账号」")
 
+// loginDone 是一次已完成会话的结果（state → 账号）。只服务「同一条回调被重复提交」这一种情况：
+// 授权码一次性，重复提交得幂等回应成功，而不是甩一句「链接失效」把人吓回去重开登录。
+type loginDone struct {
+	UID      string
+	Nickname string
+	At       time.Time
+}
+
 // loginSession 是一次登录流程（一个账号一个全新设备号）。
 //
 // 两种形态：Qr != nil 时走微信扫码轮询（不需要任何回调地址，服务器/局域网部署都能用）；
@@ -92,8 +100,14 @@ func (p *Panel) authCallback(w http.ResponseWriter, r *http.Request) {
 		writeCallbackPage(w, http.StatusGone, "登录会话已失效", "请回到面板重新点「添加账号」")
 		return
 	}
+	duplicate := sess.Login.Pending()
 	if err := sess.Login.AcceptCallback(state, code); err != nil {
 		writeCallbackPage(w, http.StatusBadRequest, "无法接收授权", err.Error())
+		return
+	}
+	if duplicate {
+		// 与「粘贴回调」撞车：同一个码已经被收下，换票正在进行，这里照样回成功页。
+		writeCallbackPage(w, http.StatusOK, "这条回调已经收到过了", "换票正在进行，回到面板即可（账号会自动出现）")
 		return
 	}
 	log.Printf("panel: 收到浏览器授权回调 state=%.8s…", state)
@@ -158,15 +172,33 @@ func (p *Panel) loginCode(w http.ResponseWriter, r *http.Request) {
 		sess, found := p.logins[state]
 		p.loginMu.Unlock()
 		if found && time.Since(sess.At) <= loginTTL {
+			// 这次提交之前会话手上是不是已经有码了：有 = 同一链接被点了第二次。
+			duplicate := sess.Login.Pending()
 			if err := sess.Login.AcceptCallback(state, code); err != nil {
 				writeErr(w, http.StatusBadRequest, err.Error())
 				return
 			}
-			log.Printf("panel: 收到粘贴的授权回调 state=%.8s…", state)
+			if !duplicate {
+				log.Printf("panel: 收到粘贴的授权回调 state=%.8s…", state)
+			} else {
+				log.Printf("panel: 重复提交同一条回调 state=%.8s…（幂等放行）", state)
+			}
 			// 交回会话后由前端轮询换票，这里只报告已接收。
-			writeJSON(w, http.StatusOK, map[string]any{"ok": true, "action": "session", "id": state})
+			// duplicate 让前端说「这条链接已经提交过了，正在处理」，而不是让人以为没反应。
+			writeJSON(w, http.StatusOK, map[string]any{
+				"ok": true, "action": "session", "id": state, "duplicate": duplicate,
+			})
 			return
 		}
+	}
+	// 会话已经完成过（同一条链接被再次提交，且会话已被换票流程删掉）：直接回报上次的结果。
+	// 授权码一次性，重复提交本就该是幂等成功，不是「链接失效」。
+	if uid, nick, done := p.completedLogin(state); done {
+		log.Printf("panel: 重复提交已完成的回调 state=%.8s… → uid=%s（幂等）", state, uid)
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "action": "imported", "uid": uid, "nickname": nick, "duplicate": true,
+		})
+		return
 	}
 	// 没有对应会话：自己换票（PrepareAccount 与「导入凭证」同一条管线）。
 	creds, err := p.cfg.Upstream.PrepareAccount(r.Context(), map[string]any{"code": code}, newMachineID())
@@ -180,6 +212,44 @@ func (p *Panel) loginCode(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "action": "imported", "uid": uid, "nickname": nick})
+}
+
+// completedLogin 查某个 state 的会话是否已经成功换票入池，返回当时的 uid/昵称。
+// 记到「会话完成」为止，之后同一条回调再提交就能幂等回报成功，而不是报「链接失效」。
+func (p *Panel) completedLogin(state string) (uid, nickname string, ok bool) {
+	if state == "" {
+		return "", "", false
+	}
+	p.loginMu.Lock()
+	defer p.loginMu.Unlock()
+	done, found := p.loginDone[state]
+	if !found {
+		return "", "", false
+	}
+	if time.Since(done.At) > loginTTL {
+		delete(p.loginDone, state)
+		return "", "", false
+	}
+	return done.UID, done.Nickname, true
+}
+
+// markLoginDone 记一次会话成功（loginPoll 换票入池后调用）。
+func (p *Panel) markLoginDone(state, uid, nickname string) {
+	if state == "" {
+		return
+	}
+	p.loginMu.Lock()
+	defer p.loginMu.Unlock()
+	if p.loginDone == nil {
+		p.loginDone = map[string]loginDone{}
+	}
+	// 顺手清掉过期条目：这张表只为「重复提交」服务，不该无限长。
+	for k, v := range p.loginDone {
+		if time.Since(v.At) > loginTTL {
+			delete(p.loginDone, k)
+		}
+	}
+	p.loginDone[state] = loginDone{UID: uid, Nickname: nickname, At: time.Now()}
 }
 
 // loginQrStart 开一次微信扫码登录：返回会话 id、二维码内容、二维码 PNG 地址。
@@ -327,7 +397,20 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		creds, done, err = sess.Login.Poll(r.Context())
 	}
 	if err != nil {
-		// 5xx/超时交给前端继续重试：授权可能已在浏览器侧完成，停掉就永远不入池。
+		// 换票被「业务层面」拒绝 = 这个码废了（一次性码重复使用、过期、伪造），
+		// 再轮询也是白轮。删掉会话、如实回报，前端据此停轮询（此前只会一直转圈，
+		// 用户干等一阵后重复提交，再被同样的错误打回来）。
+		// 只有网络层/5xx 才交给前端继续重试——那种情况授权可能已在浏览器侧完成。
+		var be *upstream.BusinessError
+		if errors.Is(err, upstream.ErrCodeExpired) || errors.As(err, &be) {
+			p.loginMu.Lock()
+			delete(p.logins, id)
+			p.loginMu.Unlock()
+			log.Printf("panel: 会话 %.8s 换票被拒（%v），结束该会话", id, err)
+			writeErr(w, http.StatusGone, "授权码无效或已被使用（一次性码，同一条链接提交两次就会这样）：请回面板重新发起登录")
+			return
+		}
+		// 其余（5xx/超时）交给前端继续重试：授权可能已在浏览器侧完成，停掉就永远不入池。
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
@@ -348,6 +431,9 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	p.loginMu.Lock()
 	delete(p.logins, id)
 	p.loginMu.Unlock()
+	// 记下这次会话的结果：同一 state 的回调再被提交（用户点了第二次、或浏览器回调与
+	// 手工粘贴同时到达）时，loginCode 直接幂等回报这个账号，而不是报「已经用过了」。
+	p.markLoginDone(id, uid, nick)
 	writeJSON(w, http.StatusOK, map[string]any{"done": true, "ok": true, "uid": uid, "nickname": nick})
 }
 

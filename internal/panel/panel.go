@@ -64,6 +64,8 @@ type Panel struct {
 
 	loginMu sync.Mutex
 	logins  map[string]loginSession
+	// loginDone 记已成功入池的会话（state → 账号），只服务「同一回调重复提交」的幂等回报。
+	loginDone map[string]loginDone
 }
 
 // New 构建面板。Logs 为空时自建一个环，但 main 应传入和标准日志共用的那个。
@@ -72,12 +74,13 @@ func New(cfg Config) *Panel {
 		cfg.Logs = NewRing(400)
 	}
 	p := &Panel{
-		cfg:     cfg,
-		apiKey:  cfg.APIKey,
-		mux:     http.NewServeMux(),
-		started: time.Now(),
-		logs:    cfg.Logs,
-		logins:  map[string]loginSession{},
+		cfg:       cfg,
+		apiKey:    cfg.APIKey,
+		mux:       http.NewServeMux(),
+		started:   time.Now(),
+		logs:      cfg.Logs,
+		logins:    map[string]loginSession{},
+		loginDone: map[string]loginDone{},
 	}
 	p.mux.HandleFunc("GET /panel/{$}", p.index)
 	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
