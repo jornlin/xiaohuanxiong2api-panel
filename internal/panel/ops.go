@@ -6,6 +6,7 @@ package panel
 
 import (
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -15,6 +16,8 @@ import (
 	"time"
 
 	"github.com/misakano7545/xiaohuanxiong2api-panel/internal/auth"
+	"github.com/misakano7545/xiaohuanxiong2api-panel/internal/scheduler"
+	"github.com/misakano7545/xiaohuanxiong2api-panel/internal/upstream"
 )
 
 // maskSecret 只回前缀 + 长度，绝不回完整 token（与 overview 同口径）。
@@ -170,6 +173,72 @@ func (p *Panel) accountImport(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "action": "imported", "uid": uid, "nickname": nick})
+}
+
+// grantsAll 全池领一次性新手礼包（桌面端 + 移动端，各 3000 分）。
+// 强制问上游：进程内的「已问过」标记只是省一次幂等请求，不该拦下显式点击。
+func (p *Panel) grantsAll(w http.ResponseWriter, r *http.Request) {
+	if p.cfg.Scheduler == nil {
+		writeErr(w, http.StatusNotImplemented, "scheduler unavailable")
+		return
+	}
+	grants := p.cfg.Scheduler.RunNewcomerNow()
+	log.Printf("panel: newcomer grants（全池），本次问上游 %d 笔", len(grants))
+	p.writeOverview(w, map[string]any{"grants": grants})
+}
+
+// accountGrants 单号领一次性新手礼包。
+func (p *Panel) accountGrants(w http.ResponseWriter, r *http.Request) {
+	uid, ok := p.uidFrom(w, r)
+	if !ok {
+		return
+	}
+	if p.cfg.Scheduler == nil {
+		writeErr(w, http.StatusNotImplemented, "scheduler unavailable")
+		return
+	}
+	grants, err := p.cfg.Scheduler.ClaimNewcomerNow(uid)
+	switch {
+	case errors.Is(err, scheduler.ErrDisabled):
+		writeErr(w, http.StatusConflict, "account disabled")
+		return
+	case errors.Is(err, scheduler.ErrNotFound):
+		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	}
+	st, _ := p.cfg.Pool.Status(uid)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "grants": grants, "account": st})
+}
+
+// tasksStatus 任务状态（**只读**，零额度消耗）：透传上游 /points/v1/tasks。
+//
+// 面板据此显示「新手任务领了几项」与邀请码——只靠余额猜「礼包到底领没领到」
+// 是这次踩坑的起点（移动端那 3000 一直没领，账面上看只是一个对不上的数字）。
+func (p *Panel) tasksStatus(w http.ResponseWriter, r *http.Request) {
+	type row struct {
+		UID      string                `json:"uid"`
+		Nickname string                `json:"nickname,omitempty"`
+		NewUser  []upstream.TaskState  `json:"new_user_tasks"`
+		Invitee  []upstream.TaskState  `json:"invitee_tasks"`
+		Invite   upstream.InviteStatus `json:"invite"`
+		Error    string                `json:"error,omitempty"`
+	}
+	out := []row{}
+	for _, st := range p.cfg.Pool.List() {
+		a := p.cfg.Pool.AuthByUID(st.UID)
+		if a == nil {
+			continue
+		}
+		rw := row{UID: st.UID, Nickname: st.Nickname}
+		tasks, err := p.cfg.Upstream.Tasks(a)
+		if err != nil {
+			rw.Error = publicErr(err)
+		} else {
+			rw.NewUser, rw.Invitee, rw.Invite = tasks.NewUser, tasks.Invitee, tasks.Invite
+		}
+		out = append(out, rw)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": out})
 }
 
 // checkinStatus 批量签到状态（**只读**，只查 status 不 claim）：面板点「签到状态」时查一次。

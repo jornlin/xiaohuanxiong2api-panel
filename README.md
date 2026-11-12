@@ -60,6 +60,7 @@
 | 积分 | `GET {points_base}/balance` | `data.available_points` + 四个钱包字段 |
 | 签到 | `POST {origin}/api/web/desktop/v1/login/points/grant` + `GET {points_base}/bills` | 每日 300 分是服务端 00:00 自动发放、午夜清零，没有「调一下就发分」的客户端开关；grant 是幂等的登录领取（领过回 `granted:false`），是否到账以 bills 里当天的 `daily_grant` 为准 |
 | 手机端首登 | `POST {origin}/api/web/mobile/v1/login/points/grant` | 与桌面端那笔额度独立，桌面端领过的号照样能领 |
+| 任务状态 | `GET {points_base}/tasks` | 只读回任务三组：`new_user_task_states`（注册/桌面端/移动端礼包）、`invitee_task_states`（活跃 7 天/首次付费）、`invite`（邀请码与进度）。上游**没有任何「完成任务」写端点**（POST/PUT 全是 404），所以能靠 API 领的只有桌面端与移动端两笔礼包，活跃/付费由服务端按行为判定 |
 | 换码登录 | `POST {auth_base}/login_with_authorization_code` | 用 `office-raccoon://` 回调里的 code 换票 |
 
 网关只做四件事：选号与续期、把响应帧里的 `model` 改回客户端请求的名字、
@@ -161,6 +162,12 @@ wire_api = "responses"
 - **不注入提示词**、不改消息序列。
 - 上游不认 `reasoning_effort` 档位；它自己回的 `reasoning_content` 会作为 thinking/推理内容下发。
 - 积分单价没有可信公开表，用量页只记 token，不编造金额。
+- **一次性新手礼包（桌面端 + 移动端，各 3000 分）与签到解耦**：每日 300 分是上游 00:00
+  自动入账的，`CheckinStatus` 几乎总是 `checked_in=true`，签到流程走「已签」短路——
+  礼包挂在签到成功路径上就永远领不到（实测漏掉过移动端那 3000）。所以它们由
+  `scheduler.claimNewcomerGrants` 每轮无条件结算一次，面板「领新手礼包」按钮则强制问上游；
+  `granted:false` 是上游的幂等回执（这个号早领过），不是失败。面板「新手任务」
+  只读展示任务完成度与邀请码，免得「领没领到」只能靠余额猜。
 
 ## 开发
 

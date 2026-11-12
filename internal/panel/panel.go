@@ -119,6 +119,11 @@ func New(cfg Config) *Panel {
 	p.mux.HandleFunc("GET /panel/api/accounts/{uid}/json", p.withAuth(p.accountCredential))
 	p.mux.HandleFunc("POST /panel/api/accounts/import", p.withAuth(p.accountImport))
 	p.mux.HandleFunc("GET /panel/api/checkin_status", p.withAuth(p.checkinStatus))
+	// 一次性新手礼包（桌面端/移动端各 3000）与任务状态：前者是领取动作，后者只读。
+	// 两者都独立于签到——礼包挂在签到成功路径上会永远领不到（见 scheduler.claimNewcomerGrants）。
+	p.mux.HandleFunc("POST /panel/api/grants", p.withAuth(p.grantsAll))
+	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/grants", p.withAuth(p.accountGrants))
+	p.mux.HandleFunc("GET /panel/api/tasks", p.withAuth(p.tasksStatus))
 	return p
 }
 

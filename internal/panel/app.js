@@ -245,6 +245,33 @@ function ago(t) {
 // uid → 今日是否已签。只在用户点「签到状态」后填充（按需拉取，不吃额度）；未拉取时行上无标记。
 let checkinState = {};
 
+// uid → 任务状态。只在用户点「新手任务」后填充（只读 GET，零额度消耗）。
+let taskState = {};
+
+// 任务 key → 中文名（与上游 key 对齐；上游 /tasks 只回 key + status）。
+const TASK_NAME = {
+  register_pack: '新人注册礼包', desktop_login: '桌面端礼包', mobile_login: '移动端礼包',
+  active_7d: '活跃 7 天', first_payment: '首次付费'
+};
+
+// taskTags 把一次任务状态渲染成行内标记。
+//
+// 「礼包到底领没领到」不能靠余额猜：移动端那 3000 曾静悄悄没领到，账面上只是
+// 一个对不上的数字。这里按上游实际下发的项算完成度，缺项（活跃/付费要满足条件
+// 才出现）不补空、不冒充未完成。
+function taskTags(t) {
+  if (!t || t.error) return '';
+  const all = (t.new_user_tasks || []).concat(t.invitee_tasks || []);
+  if (!all.length) return tag('mute', '任务状态空', '上游未下发任何任务项');
+  const done = all.filter(x => x.status === 'completed').length;
+  const detail = all.map(x => (TASK_NAME[x.key] || x.key) + '：' + x.status +
+    (x.points ? '（' + x.points + ' 分）' : '')).join('\n');
+  const out = [tag(done === all.length ? 'mute' : 'warn', '新手任务 ' + done + '/' + all.length, detail)];
+  const pending = all.filter(x => (x.key === 'desktop_login' || x.key === 'mobile_login') && x.status !== 'completed');
+  if (pending.length) out.push(tag('warn', pending.map(x => TASK_NAME[x.key]).join('/') + '未领'));
+  return out.join(' ');
+}
+
 function renderAccounts(list) {
   const tb = $('accBody');
   if (!list.length) {
@@ -267,8 +294,12 @@ function renderAccounts(list) {
     const cs = checkinState[String(a.uid)];
     if (!a.disabled && cs === true) st.push(tag('mute', '今日已签'));
     else if (!a.disabled && cs === false) st.push(tag('warn', '今日未签'));
-    // 签到：一次 setting_info 调用（上游幂等），拿不到就如实显示未签。
+    // 新手任务：同样按需拉取（点「新手任务」才有），标记里带完成度与礼包欠账。
+    if (!a.disabled && taskState[String(a.uid)]) st.push(taskTags(taskState[String(a.uid)]));
     const acts = ['<button class="xs" data-a="checkin" data-u="' + esc(a.uid) + '">签到</button>',
+      // 一次性新手礼包（桌面端 + 移动端各 3000）：与签到解耦，领过的号上游回「已领过」。
+      '<button class="xs" data-a="grants" data-u="' + esc(a.uid) +
+        '" title="领这个号的一次性新手礼包（桌面端 + 移动端，各 3000 分）">领礼包</button>',
       '<button class="xs" data-a="balance" data-u="' + esc(a.uid) + '">刷新</button>',
       // 单号刷票：只动这个号，省掉整池保活。
       '<button class="xs" data-a="refresh" data-u="' + esc(a.uid) +
@@ -1981,6 +2012,22 @@ function checkinMsg(rs, accounts) {
   return msg;
 }
 
+/* 礼包领取结果如实回报：新到账 / 已领过 / 失败三档分开说。
+   「已领过」是上游的幂等回执（granted:false），不是错误——混在一起会让人以为没领到。
+   移动端那 3000 曾因为挂在签到成功路径上一直没领，这里必须一眼看出这次到底领到什么。 */
+function grantsMsg(gs) {
+  const name = g => TASK_NAME[g.key] || g.key;
+  const who = g => (g.uid ? g.uid + ' ' : '') + name(g);
+  const got = gs.filter(g => g.granted && !g.error);
+  const had = gs.filter(g => !g.granted && !g.error);
+  const bad = gs.filter(g => g.error);
+  const parts = [];
+  if (got.length) parts.push('新到账 ' + got.length + ' 笔（各 3000 分）：' + got.map(who).join('、'));
+  if (had.length) parts.push('已领过 ' + had.length + ' 笔');
+  if (bad.length) parts.push('失败 ' + bad.length + ' 笔：' + bad.map(g => who(g) + ' — ' + g.error).join('；'));
+  return parts.length ? parts.join('；') : '没有待领的礼包（两个号都早领过了）';
+}
+
   $('btnCheckinAll').onclick = async () => {
     try {
       const d = await api('checkin', { method: 'POST', body: '{}' });
@@ -2039,6 +2086,40 @@ function checkinMsg(rs, accounts) {
     } catch (e) { toast(e.message, 'err'); }
     finally { b.disabled = false; loadOverview(true); }
   };
+  // 领一次性新手礼包（全池）：桌面端 + 移动端各 3000 分。领过的号上游回「已领过」，
+  // 不是失败——所以「新到账 / 已领过 / 失败」三档分开报，别把幂等回执说成错误。
+  $('btnGrants').onclick = async () => {
+    const b = $('btnGrants');
+    b.disabled = true;
+    try {
+      const d = await api('grants', { method: 'POST', body: '{}' });
+      toast(grantsMsg(d.grants || []), 'ok');
+    } catch (e) { toast(e.message, 'err'); }
+    finally { b.disabled = false; loadOverview(true); }
+  };
+  // 新手任务状态：只读查一次（零额度消耗），结果落在行上的「新手任务 n/m」标记里。
+  $('btnTasks').onclick = async () => {
+    const b = $('btnTasks');
+    b.disabled = true;
+    try {
+      const d = await api('tasks');
+      const rows = d.accounts || [];
+      taskState = {};
+      for (const r of rows) taskState[String(r.uid)] = r;
+      const failed = rows.filter(r => r.error).length;
+      const done = rows.reduce((n, r) => n + (r.new_user_tasks || []).filter(x => x.status === 'completed').length, 0);
+      const total = rows.reduce((n, r) => n + (r.new_user_tasks || []).length + (r.invitee_tasks || []).length, 0);
+      const parts = ['已领 ' + done + '/' + total];
+      if (failed) parts.push('查询失败 ' + failed);
+      const inv = rows[0] && rows[0].invite;
+      if (inv && inv.code) {
+        parts.push('邀请码 ' + inv.code + '（已邀 ' + (inv.registered_invitees || 0) +
+          ' 人，每邀一位 +' + (inv.register_reward_points || 0) + ' 分）');
+      }
+      $('accNote').textContent = '新手任务：' + parts.join(' · ');
+    } catch (e) { toast(e.message, 'err'); }
+    finally { b.disabled = false; loadOverview(true); }
+  };
   $('accBody').addEventListener('click', async ev => {
     const b = ev.target.closest('button[data-a]');
     if (!b) return;
@@ -2061,6 +2142,8 @@ function checkinMsg(rs, accounts) {
       if (a === 'checkin') {
         toast(r.status === 'already' ? '今天已经签过了'
           : (r.earned ? '签到完成 +' + r.earned + ' 分' : '签到完成，本次没有新增积分'), 'ok');
+      } else if (a === 'grants') {
+        toast(grantsMsg(r.grants || []), 'ok');
       } else if (a === 'balance') {
         // 单号刷新：按账号自己的口径回报，美元号不能回一个 0 积分。
         const acc = r.account;
