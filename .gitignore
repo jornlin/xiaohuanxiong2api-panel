@@ -31,9 +31,10 @@ docs/
 __pycache__/
 /dist/
 
-# IDE
+# IDE / macOS
 .idea/
 .vscode/
+.DS_Store
 
 # 任务输入文档
 tickets/
