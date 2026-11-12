@@ -70,13 +70,23 @@ func (c *Client) Tasks(a *auth.Auth) (TasksStatus, error) {
 	if inv, ok := data["invite"].(map[string]any); ok {
 		out.Invite = InviteStatus{
 			Code:                    text(inv, "invite_code"),
-			RegisteredInvitees:      mustInt(inv["registered_invitee_count"]),
-			GrantedPoints:           mustInt(inv["granted_points"]),
-			RemainingRewardInvitees: mustInt(inv["remaining_reward_invitees"]),
-			RegisterRewardPoints:    mustInt(inv["register_reward_points"]),
+			RegisteredInvitees:      nonNegative(inv["registered_invitee_count"]),
+			GrantedPoints:           nonNegative(inv["granted_points"]),
+			RemainingRewardInvitees: nonNegative(inv["remaining_reward_invitees"]),
+			RegisterRewardPoints:    nonNegative(inv["register_reward_points"]),
 		}
 	}
 	return out, nil
+}
+
+// nonNegative 读一个展示用的计数：缺字段/非数字（mustInt 回 -1）一律当 0。
+// 面板拿到 -1 会原样渲染成「已邀 -1 人」，而上游这条只读接口的字段名不受我们控制，
+// 少一个字段不该在界面上变成一个负数。
+func nonNegative(raw any) int64 {
+	if v := mustInt(raw); v > 0 {
+		return v
+	}
+	return 0
 }
 
 // taskStates 把上游的 [{"key":…,"status":…}] 归一成 TaskState 并补上分值。

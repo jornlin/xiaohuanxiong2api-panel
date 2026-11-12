@@ -89,6 +89,81 @@ func TestGrantsClaimedWhenCheckinAlreadyDone(t *testing.T) {
 	}
 }
 
+// TestGrantsNoDuplicateOnFailure 回归：礼包领取失败时，同一轮里不能再打一次。
+//
+// 踩过的坑：claimWithRetry 里也调了一次 claimNewcomerGrants，失败路径不落标记，
+// 于是紧随其后的统一补领又来一遍——同一轮里同一端点被打两次，正是这个文件反复
+// 强调要避免的秒级重复请求（9074 风控会因为连着打而延长限流窗口）。
+func TestGrantsNoDuplicateOnFailure(t *testing.T) {
+	cases := []struct {
+		name        string
+		failDesktop bool
+		failMobile  bool
+		wantDesktop int
+		wantMobile  int
+	}{
+		{name: "移动端失败", failMobile: true, wantDesktop: 1, wantMobile: 1},
+		{name: "桌面端失败", failDesktop: true, wantDesktop: 1, wantMobile: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			desktopCalls, mobileCalls := 0, 0
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/balance":
+					_, _ = io.WriteString(w, `{"code":0,"data":{"available_points":100,"daily_points":300}}`)
+				case "/bills":
+					// 流水里没有 daily_grant → 签到走 claim 分支（要试一次每日领取），
+					// 礼包步骤紧跟在它后面——重复请求就发生在这两处之间。
+					_, _ = io.WriteString(w, `{"code":0,"data":{"items":[]}}`)
+				case "/api/web/desktop/v1/login/points/grant":
+					desktopCalls++
+					if tc.failDesktop {
+						w.WriteHeader(http.StatusInternalServerError)
+						_, _ = io.WriteString(w, `{"code":500000,"message":"boom"}`)
+						return
+					}
+					_, _ = io.WriteString(w, `{"code":0,"data":{"granted":false,"popup":null}}`)
+				case "/api/web/mobile/v1/login/points/grant":
+					mobileCalls++
+					if tc.failMobile {
+						w.WriteHeader(http.StatusInternalServerError)
+						_, _ = io.WriteString(w, `{"code":500000,"message":"boom"}`)
+						return
+					}
+					_, _ = io.WriteString(w, `{"code":0,"data":{"granted":false,"popup":null}}`)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+
+			up := upstream.New()
+			up.SetAPIHosts(srv.URL, srv.URL)
+			up.SetAgentHosts(srv.URL, srv.URL)
+			p := pool.New("")
+			p.Add(&auth.Auth{Data: auth.Data{
+				AccessToken: "dt", ExpiresAt: time.Now().Add(48 * time.Hour).UnixMilli(),
+				MachineID: "m-1", UID: "u-dup",
+			}})
+			s := New(Config{Pool: p, Upstream: up, CheckinEnabled: true, KeepaliveEnabled: true})
+
+			// 桌面端失败时 CheckinUID 本身会如实返回错误（每日领取没成），这是既有口径，
+			// 不是本轮要断言的：这里只关心「同一轮里别再打第二次」。
+			if _, err := s.CheckinUID("u-dup"); err != nil && !tc.failDesktop {
+				t.Fatalf("CheckinUID 出错: %v", err)
+			}
+			// 桌面端：签到流程的每日领取打一次；失败时不补打。移动端：只由礼包步骤打一次。
+			if desktopCalls != tc.wantDesktop {
+				t.Errorf("桌面端端点调用 %d 次，期望 %d 次（同一轮不得重复）", desktopCalls, tc.wantDesktop)
+			}
+			if mobileCalls != tc.wantMobile {
+				t.Errorf("移动端端点调用 %d 次，期望 %d 次（同一轮不得重复）", mobileCalls, tc.wantMobile)
+			}
+		})
+	}
+}
+
 // TestClaimNewcomerNowForcesUpstream 面板上的手动领取不受进程内「已问过」标记限制：
 // 显式点一次就该真问上游一次（标记只是省幂等请求，不是「已领到」的凭据）。
 func TestClaimNewcomerNowForcesUpstream(t *testing.T) {

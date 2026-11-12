@@ -2095,7 +2095,7 @@ function grantsMsg(gs) {
   if (got.length) parts.push('新到账 ' + got.length + ' 笔（各 3000 分）：' + got.map(who).join('、'));
   if (had.length) parts.push('已领过 ' + had.length + ' 笔');
   if (bad.length) parts.push('失败 ' + bad.length + ' 笔：' + bad.map(g => who(g) + ' — ' + g.error).join('；'));
-  return parts.length ? parts.join('；') : '没有待领的礼包（两个号都早领过了）';
+  return parts.length ? parts.join('；') : '没有可领礼包的账号（账号池为空或都已禁用）';
 }
 
   $('btnCheckinAll').onclick = async () => {
@@ -2163,7 +2163,9 @@ function grantsMsg(gs) {
     b.disabled = true;
     try {
       const d = await api('grants', { method: 'POST', body: '{}' });
-      toast(grantsMsg(d.grants || []), 'ok');
+      const gs = d.grants || [];
+      // 有失败就别报成绿色成功——「失败 N 笔」配绿底等于自相矛盾。
+      toast(grantsMsg(gs), gs.some(g => g.error) ? 'err' : 'ok');
     } catch (e) { toast(e.message, 'err'); }
     finally { b.disabled = false; loadOverview(true); }
   };
@@ -2177,8 +2179,11 @@ function grantsMsg(gs) {
       taskState = {};
       for (const r of rows) taskState[String(r.uid)] = r;
       const failed = rows.filter(r => r.error).length;
-      const done = rows.reduce((n, r) => n + (r.new_user_tasks || []).filter(x => x.status === 'completed').length, 0);
-      const total = rows.reduce((n, r) => n + (r.new_user_tasks || []).length + (r.invitee_tasks || []).length, 0);
+      // 分子分母都按「两组一起」算，与行上的 taskTags 同口径：
+      // 只算 new_user 的分子配含 invitee 的分母，会让行显示 4/4、工具栏显示 3/4。
+      const tasksOf = r => (r.new_user_tasks || []).concat(r.invitee_tasks || []);
+      const done = rows.reduce((n, r) => n + tasksOf(r).filter(x => x.status === 'completed').length, 0);
+      const total = rows.reduce((n, r) => n + tasksOf(r).length, 0);
       const parts = ['已领 ' + done + '/' + total];
       if (failed) parts.push('查询失败 ' + failed);
       const inv = rows[0] && rows[0].invite;
@@ -2213,7 +2218,8 @@ function grantsMsg(gs) {
         toast(r.status === 'already' ? '今天已经签过了'
           : (r.earned ? '签到完成 +' + r.earned + ' 分' : '签到完成，本次没有新增积分'), 'ok');
       } else if (a === 'grants') {
-        toast(grantsMsg(r.grants || []), 'ok');
+        const gs = r.grants || [];
+        toast(grantsMsg(gs), gs.some(g => g.error) ? 'err' : 'ok');
       } else if (a === 'balance') {
         // 单号刷新：按账号自己的口径回报，美元号不能回一个 0 积分。
         const acc = r.account;

@@ -205,6 +205,10 @@ func (p *Panel) accountGrants(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, scheduler.ErrNotFound):
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
+	case err != nil:
+		// 与 accountCheckin 同口径：将来多出别的错误类型时，别静默当成成功回 200。
+		writeErr(w, http.StatusBadGateway, publicErr(err))
+		return
 	}
 	st, _ := p.cfg.Pool.Status(uid)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "grants": grants, "account": st})

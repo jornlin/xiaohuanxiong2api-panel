@@ -551,6 +551,9 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 		}
 	}
 	var checkinErr error
+	// desktopTried：本轮 default 分支已经打过桌面端那条端点（每日领取与礼包同一条）。
+	// 打了就不再在同一轮里补打一次——秒级重复请求正是上游风控盯的东西。
+	desktopTried := false
 	switch {
 	case serr != nil:
 		checkinErr = serr
@@ -564,6 +567,7 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 		log.Printf("checkin %s: upstream disabled (enable=false)", uid)
 	default:
 		claimErr := s.claimWithRetry(a)
+		desktopTried = true
 		switch {
 		case claimErr == nil:
 			// 交给下面的复核判定
@@ -618,7 +622,7 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 	// 一次性新手礼包（桌面端/移动端各 3000 分）在这里无条件补一次：
 	// 每日分是上游 00:00 自动发的，上面几乎总走「already」短路，claim 分支
 	// 根本不执行——礼包不能跟着签到结果一起被跳过（见 claimNewcomerGrants）。
-	if grants := s.claimNewcomerGrants(a, false); len(grants) > 0 {
+	if grants := s.claimNewcomerGrants(a, false, desktopTried); len(grants) > 0 {
 		res.Grants = grants
 	}
 	if res.Status == "" {
@@ -673,13 +677,15 @@ func checkinCooldown(err error) (time.Duration, bool) {
 
 // claimWithRetry 只在网络层失败时重试一次。
 // 业务失败与 HTTP 错误不会因重试而改变，重试只会成倍增加上游请求、触发风控。
+//
+// 这里只负责「每日登录领取」这一件事（9095 换指纹、9074 限流的判定都靠它的返回值）。
+// 一次性新手礼包不在这里领：同一轮里再领一次就是秒级重复请求，正是本文件反复强调要避免的
+// （见下面 claimNewcomerGrants 的说明）。打过的痕迹只记「端点给了答复」这一种，
+// 网络层失败留给下一轮——否则一次抖动会把礼包永久判成已结算。
 func (s *Scheduler) claimWithRetry(a *auth.Auth) error {
 	err := s.cfg.Upstream.CheckinClaim(a)
 	if err == nil {
-		// 桌面端那笔（与每日领取决同一条端点）刚打过，记账，
-		// 免得紧随其后的 claimNewcomerGrants 再打一次。
 		a.MarkDesktopGrantDone()
-		s.claimNewcomerGrants(a, false)
 		return nil
 	}
 	if !isNetworkError(err) {
@@ -690,7 +696,6 @@ func (s *Scheduler) claimWithRetry(a *auth.Auth) error {
 		return err
 	}
 	a.MarkDesktopGrantDone()
-	s.claimNewcomerGrants(a, false)
 	return nil
 }
 
@@ -712,13 +717,18 @@ type NewcomerGrant struct {
 // 只有注册礼包 + 桌面端到账，移动端那 3000 从没被试过）。所以每轮签到都无条件
 // 试一次，用账号上的「已问过」标记压住重复请求。
 //
-// force=true 先抹掉标记再问，给面板的手动领取用（显式点击不该被进程内标记拦下）。
-func (s *Scheduler) claimNewcomerGrants(a *auth.Auth, force bool) []NewcomerGrant {
+// skipDesktop 表示本轮已经打过桌面端那条端点（每日领取与它是同一条
+// login/points/grant，见 claimWithRetry）：同一轮里再打一次就是秒级重复请求，
+// 与「9074 风控时不要连着打」的口径冲突，所以跳过；下一轮标记若还没落就自然重试。
+//
+// force=true 先抹掉标记再问，给面板的手动领取用（显式点击不该被进程内标记拦下），
+// 此时 skipDesktop 一并忽略。
+func (s *Scheduler) claimNewcomerGrants(a *auth.Auth, force, skipDesktop bool) []NewcomerGrant {
 	if force {
 		a.ResetGrantMarks()
 	}
 	var out []NewcomerGrant
-	if !a.DesktopGrantDone() {
+	if !a.DesktopGrantDone() && !(skipDesktop && !force) {
 		granted, err := s.cfg.Upstream.ClaimDesktopGrant(a)
 		switch {
 		case err != nil:
@@ -758,7 +768,7 @@ func (s *Scheduler) ClaimNewcomerNow(uid string) ([]NewcomerGrant, error) {
 	if a == nil {
 		return nil, ErrNotFound
 	}
-	grants := s.claimNewcomerGrants(a, true)
+	grants := s.claimNewcomerGrants(a, true, false)
 	for i := range grants {
 		grants[i].UID = uid
 	}
@@ -776,7 +786,7 @@ func (s *Scheduler) RunNewcomerNow() []NewcomerGrant {
 		if a == nil {
 			continue
 		}
-		for _, g := range s.claimNewcomerGrants(a, true) {
+		for _, g := range s.claimNewcomerGrants(a, true, false) {
 			g.UID = st.UID
 			out = append(out, g)
 		}
