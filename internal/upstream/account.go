@@ -585,8 +585,9 @@ type DeviceLogin struct {
 	state   string
 	url     string
 
-	mu   sync.Mutex
-	code string // 回调已经送到的授权码（单次使用）
+	mu    sync.Mutex
+	code  string // 回调已经送到的授权码（单次使用）
+	spent bool   // 码已经换过票（成功即置位）：重复提交按幂等回报，不再把码装回
 }
 
 // ErrLoopbackUnsupported 说明当前监听端口不能用于环回回调。
@@ -658,6 +659,11 @@ func (d *DeviceLogin) AcceptCallback(state, code string) error {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
+	if d.spent {
+		// 这个会话的码已经换过票了（可能正在落盘）：重复提交照样算"收下了"，
+		// 但不能再把码装回去 —— 那是已经花掉的一次性码，装回去只会换票失败。
+		return nil
+	}
 	if d.code == code {
 		return nil // 重复提交同一条链接：收下了，不重复换票
 	}
@@ -672,7 +678,9 @@ func (d *DeviceLogin) AcceptCallback(state, code string) error {
 func (d *DeviceLogin) Pending() bool {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	return d.code != ""
+	// spent 也算"手上已经有过码"：换票成功到会话被删之间有个窗口（含落盘），
+	// 这期间重复提交要如实回报 duplicate，而不是装作第一次。
+	return d.code != "" || d.spent
 }
 
 // Poll 还没收到回调 → (nil,false,nil)；收到了 → 换票并返回凭证。
@@ -706,6 +714,7 @@ func (d *DeviceLogin) Poll(context.Context) (*auth.Auth, bool, error) {
 	if d.code == code {
 		d.code = ""
 	}
+	d.spent = true // 码已换过票：之后任何重复提交都按幂等处理
 	d.mu.Unlock()
 	if creds != nil && d.machine != "" {
 		if err := creds.CompleteIdentity(d.machine); err != nil {
@@ -814,6 +823,17 @@ func businessCodeOf(body []byte) (int, bool) {
 		return 0, false
 	}
 	return intOf(envelope["code"])
+}
+
+// businessCodeText 取响应体里 code 字段的**文本**形式：有的服务用字符串码
+// （iam 域就是 "COMMON_INVALID_ARGUMENT" / "captcha_verify_error" 这种），
+// 只按数字码翻译会漏掉它们。
+func businessCodeText(body []byte) string {
+	var envelope map[string]any
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return ""
+	}
+	return text(envelope, "code")
 }
 
 // businessMessageOf 取响应体里的 message/msg（上游原话），没有就空串。

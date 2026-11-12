@@ -95,8 +95,17 @@ func TestPollKeepsCodeOnTransientError(t *testing.T) {
 	if creds.UID != "u-dev" {
 		t.Errorf("uid = %q", creds.UID)
 	}
-	if d.Pending() {
-		t.Error("换票成功后应当清掉授权码")
+	// 换票成功后：授权码确实清掉了（不会再换一次票），但 Pending 仍为 true ——
+	// 会话进入 spent 状态，这个窗口里（换票成功到会话被删之间，含落盘）重复提交
+	// 要按"已收过码"幂等回报，不能装作第一次、更不能把花掉的码装回去。
+	if !d.Pending() {
+		t.Error("换票成功后 Pending 仍应为 true（spent）")
+	}
+	if err := d.AcceptCallback("st-1", "ac-1"); err != nil {
+		t.Errorf("spent 之后重复提交应幂等放行，得到 %v", err)
+	}
+	if creds2, done2, err := d.Poll(t.Context()); err != nil || done2 || creds2 != nil {
+		t.Errorf("码已用掉后不该再换一次票: creds=%v done=%v err=%v", creds2, done2, err)
 	}
 }
 

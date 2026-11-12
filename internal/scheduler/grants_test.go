@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -229,8 +230,8 @@ func TestRunNewcomerNowSkipsDisabled(t *testing.T) {
 	p.Disable("u-3", "测试禁用")
 	s := New(Config{Pool: p, Upstream: up, CheckinEnabled: true, KeepaliveEnabled: true})
 
-	if grants := s.RunNewcomerNow(); len(grants) != 0 {
-		t.Fatalf("禁用账号不该领礼包: %+v", grants)
+	if grants, err := s.RunNewcomerNow(); err != nil || len(grants) != 0 {
+		t.Fatalf("禁用账号不该领礼包: %+v (err=%v)", grants, err)
 	}
 	if calls != 0 {
 		t.Errorf("禁用账号仍然打了上游 %d 次", calls)
@@ -292,5 +293,42 @@ func TestDesktopGrantReportedOnClaimPath(t *testing.T) {
 	}
 	if res.Credits != 0 {
 		t.Errorf("Credits=%d，礼包不该并进每日签到收益", res.Credits)
+	}
+}
+
+// TestRunNewcomerNowSingleFlight 面板的全池领取要和签到轮共用单飞锁：
+// 两边同时打同一批端点就是秒级重复请求（上游 9074 会被延长），必须挡住一边。
+func TestRunNewcomerNowSingleFlight(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"code":0,"data":{"granted":false,"popup":null}}`)
+	}))
+	defer srv.Close()
+
+	up := upstream.New()
+	up.SetAPIHosts(srv.URL, srv.URL)
+	p := pool.New("")
+	p.Add(&auth.Auth{Data: auth.Data{
+		AccessToken: "dt", ExpiresAt: time.Now().Add(48 * time.Hour).UnixMilli(), UID: "u-lock",
+	}})
+	s := New(Config{Pool: p, Upstream: up, CheckinEnabled: true, KeepaliveEnabled: true})
+
+	// 模拟"签到轮正在跑"：手动占住那把锁
+	if !s.checkinLock.TryLock() {
+		t.Fatal("测试自己拿不到锁")
+	}
+	if _, err := s.RunNewcomerNow(); !errors.Is(err, ErrRoundBusy) {
+		t.Errorf("签到轮在跑时全池领取应回 ErrRoundBusy，得到 %v", err)
+	}
+	if _, err := s.ClaimNewcomerNow("u-lock"); !errors.Is(err, ErrRoundBusy) {
+		t.Errorf("签到轮在跑时单号领取应回 ErrRoundBusy，得到 %v", err)
+	}
+	if _, err := s.RunCheckinOne("u-lock"); !errors.Is(err, ErrRoundBusy) {
+		t.Errorf("签到轮在跑时行内签到应回 ErrRoundBusy，得到 %v", err)
+	}
+	s.checkinLock.Unlock()
+
+	// 放开之后要能正常工作
+	if _, err := s.RunNewcomerNow(); err != nil {
+		t.Errorf("锁放开后全池领取仍失败: %v", err)
 	}
 }

@@ -2089,7 +2089,25 @@ function checkinMsg(rs, accounts) {
       pending.length + ' 个新号今日无每日积分可领（上游次日 00:00 首批）：' +
       pending.map(r => r.nickname || r.uid).join('、');
   }
+  // 顺带领到的礼包也要说：不然"没有新增积分"会盖住实际到账的 3000。
+  const brief = grantsBrief(rs.flatMap(r => (r.grants || []).map(g => ({ ...g, who: r.nickname || r.uid }))));
+  if (brief) msg += '；' + brief;
   return msg;
+}
+
+/* 新手礼包的一行摘要：只列本轮**真领到**的，其余如实说"早领过"/"失败"。
+   签到这条路径也会顺带领礼包（每日领取与桌面端礼包是同一条端点），
+   不报出来就会出现"签到完成，本次没有新增积分"而实际到账 3000 的假象。 */
+function grantsBrief(gs) {
+  const name = g => TASK_NAME[g.key] || g.key;
+  const got = (gs || []).filter(g => g.granted && !g.error);
+  const had = (gs || []).filter(g => !g.granted && !g.error).length;
+  const bad = (gs || []).filter(g => g.error).length;
+  const parts = [];
+  if (got.length) parts.push('新手礼包到账：' + got.map(g => (g.who ? g.who + ' ' : '') + name(g)).join('、'));
+  if (had) parts.push(had + ' 笔早领过');
+  if (bad) parts.push(bad + ' 笔失败');
+  return parts.join('，');
 }
 
 /* 礼包领取结果如实回报：新到账 / 已领过 / 失败三档分开说。
@@ -2229,8 +2247,10 @@ function grantsMsg(gs) {
     try {
       const r = await api('accounts/' + encodeURIComponent(u) + '/' + a, { method: 'POST', body: '{}' });
       if (a === 'checkin') {
-        toast(r.status === 'already' ? '今天已经签过了'
-          : (r.earned ? '签到完成 +' + r.earned + ' 分' : '签到完成，本次没有新增积分'), 'ok');
+        const brief = grantsBrief(r.grants);
+        toast((r.status === 'already' ? '今天已经签过了'
+          : (r.earned ? '签到完成 +' + r.earned + ' 分' : '签到完成，本次没有新增积分'))
+          + (brief ? '；' + brief : ''), 'ok');
       } else if (a === 'grants') {
         const gs = r.grants || [];
         toast(grantsMsg(gs), gs.some(g => g.error) ? 'err' : 'ok');

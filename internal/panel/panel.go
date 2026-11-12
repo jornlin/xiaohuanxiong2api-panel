@@ -64,6 +64,10 @@ type Panel struct {
 
 	loginMu sync.Mutex
 	logins  map[string]loginSession
+	// smsAttempts 每个手机号的短信登录尝试时刻（进程内）：这条端点按设计不需要人机校验，
+	// 有面板密钥就能对着一个已知手机号猜 6 位码，所以本地留一道限流，别只指望上游。
+	smsMu       sync.Mutex
+	smsAttempts map[string][]time.Time
 	// loginDone 记已成功入池的会话（state → 账号），只服务「同一回调重复提交」的幂等回报。
 	loginDone map[string]loginDone
 }
@@ -74,13 +78,14 @@ func New(cfg Config) *Panel {
 		cfg.Logs = NewRing(400)
 	}
 	p := &Panel{
-		cfg:       cfg,
-		apiKey:    cfg.APIKey,
-		mux:       http.NewServeMux(),
-		started:   time.Now(),
-		logs:      cfg.Logs,
-		logins:    map[string]loginSession{},
-		loginDone: map[string]loginDone{},
+		cfg:         cfg,
+		apiKey:      cfg.APIKey,
+		mux:         http.NewServeMux(),
+		started:     time.Now(),
+		logs:        cfg.Logs,
+		logins:      map[string]loginSession{},
+		smsAttempts: map[string][]time.Time{},
+		loginDone:   map[string]loginDone{},
 	}
 	p.mux.HandleFunc("GET /panel/{$}", p.index)
 	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
@@ -678,7 +683,7 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "scheduler unavailable")
 		return
 	}
-	res, err := p.cfg.Scheduler.CheckinUID(uid)
+	res, err := p.cfg.Scheduler.RunCheckinOne(uid)
 	if errors.Is(err, scheduler.ErrDisabled) {
 		writeErr(w, http.StatusConflict, "account disabled")
 		return
@@ -687,13 +692,20 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotFound, "account not found")
 		return
 	}
+	if errors.Is(err, scheduler.ErrRoundBusy) {
+		writeErr(w, http.StatusConflict, err.Error())
+		return
+	}
 	if err != nil {
 		writeErr(w, checkinErrorStatus(err), publicErr(err))
 		return
 	}
 	st, _ := p.cfg.Pool.Status(uid)
+	// grants 必须一起回报：这一轮可能顺手把桌面端/移动端礼包领了，
+	// 只回 credits 的话界面会说"没有新增积分"，而实际到账 3000 —— 那正是要消灭的"靠余额猜"。
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok": true, "status": res.Status, "earned": res.Credits, "account": st,
+		"ok": true, "status": res.Status, "earned": res.Credits,
+		"grants": res.Grants, "account": st,
 	})
 }
 

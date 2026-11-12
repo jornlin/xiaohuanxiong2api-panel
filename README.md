@@ -124,7 +124,6 @@ Docker：`docker compose up -d --build`（`auths/`、`data/`、`config.json` 都
 过滑块取码 → 面板填 `手机号 + 验证码` 登录。面板 tab 里就有「去官方页面取码」按钮，
 这条路径在任何部署形态下都能用。
 
-## 配置
 
 ## 配置
 

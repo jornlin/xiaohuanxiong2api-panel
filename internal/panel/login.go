@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"html"
 	"io"
 	"log"
@@ -517,6 +518,36 @@ func (p *Panel) loginSmsSend(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "action": "sent"})
 }
 
+// 短信登录的本地限流参数：一个号 10 分钟内最多 8 次尝试。
+// 这条端点上游不设人机校验（实测），不加上限就是一个对着已知手机号猜验证码的入口。
+const (
+	smsLoginWindow = 10 * time.Minute
+	smsLoginMax    = 8
+)
+
+// allowSmsAttempt 记一次尝试并判断是否超限。返回剩余可试次数与是否放行。
+func (p *Panel) allowSmsAttempt(phone string) (int, bool) {
+	p.smsMu.Lock()
+	defer p.smsMu.Unlock()
+	if p.smsAttempts == nil { // 防御：别的构造路径忘了初始化时也不该 panic
+		p.smsAttempts = map[string][]time.Time{}
+	}
+	now := time.Now()
+	kept := make([]time.Time, 0, smsLoginMax)
+	for _, t := range p.smsAttempts[phone] {
+		if now.Sub(t) < smsLoginWindow {
+			kept = append(kept, t)
+		}
+	}
+	if len(kept) >= smsLoginMax {
+		p.smsAttempts[phone] = kept
+		return 0, false
+	}
+	kept = append(kept, now)
+	p.smsAttempts[phone] = kept
+	return smsLoginMax - len(kept), true
+}
+
 // loginSms 手机号 + 验证码登录，成功即落盘入池。
 //
 // 登录接入与其它几条路径完全一致：拿凭证 → saveAccount（落 auths/ + 入池）。
@@ -542,6 +573,16 @@ func (p *Panel) loginSms(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusBadRequest, "验证码只能是数字")
 		return
 	}
+	if left, ok := p.allowSmsAttempt(phone); !ok {
+		log.Printf("panel: 验证码登录尝试过于频繁 +%s（%d 分钟内已 %d 次）",
+			maskPhone(phone), int(smsLoginWindow.Minutes()), smsLoginMax)
+		writeErr(w, http.StatusTooManyRequests,
+			fmt.Sprintf("同一个号码 %d 分钟内最多试 %d 次，请稍后再来（或重新获取验证码）",
+				int(smsLoginWindow.Minutes()), smsLoginMax))
+		return
+	} else if left <= 2 {
+		log.Printf("panel: 验证码登录尝试接近上限 +%s（本窗口还剩 %d 次）", maskPhone(phone), left)
+	}
 	creds, err := p.cfg.Upstream.LoginWithSms(nation, phone, code)
 	if err != nil {
 		log.Printf("panel: 验证码登录失败 +%s: %v", maskPhone(phone), err)
@@ -558,8 +599,21 @@ func (p *Panel) loginSms(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	// 没有 refresh_token 的账号到期后无法自动续期（别处登录路径对这种情况是直接拒绝的，
+	// 短信登录这条上游可能不给 refresh_token）：不拦，但必须当场说清楚。
+	noRefresh := creds.RefreshTokenValue() == ""
+	warn := ""
+	if noRefresh {
+		warn = "上游没返回 refresh_token：这个号能用到 access token 过期，之后需要重新登录"
+		log.Printf("panel: 验证码登录成功 +%s uid=%s —— 上游没给 refresh_token，到期后需重新登录",
+			maskPhone(phone), uid)
+	}
 	log.Printf("panel: 验证码登录成功 +%s uid=%s", maskPhone(phone), uid)
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "action": "imported", "uid": uid, "nickname": nick})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "action": "imported", "uid": uid, "nickname": nick,
+		"refresh_token_missing": noRefresh,
+		"warn":                  warn,
+	})
 }
 
 // maskPhone 日志里只留后四位：手机号是个人标识，日志面板会被整屏看。

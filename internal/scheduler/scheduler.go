@@ -709,6 +709,10 @@ func (s *Scheduler) claimWithRetry(a *auth.Auth) (*NewcomerGrant, error) {
 	return &NewcomerGrant{Key: "desktop_login", Granted: granted}, nil
 }
 
+// ErrRoundBusy 说明已经有一轮签到/领取在跑：同一账号被两路同时送进 claim 就是秒级二次请求，
+// 会延长上游 9074 的限流窗口（本文件反复强调的那条）。面板据此回 409 让用户稍等。
+var ErrRoundBusy = errors.New("上一轮签到/领取还在跑，稍等几秒再试")
+
 // NewcomerGrant 是一笔一次性新手礼包的领取结果（面板如实回报用）。
 // 一笔一次失败：Error 非空时 Granted 无意义，且账号上的「已问过」标记没落，
 // 下一轮签到会自己重试。
@@ -766,7 +770,12 @@ func (s *Scheduler) claimNewcomerGrants(a *auth.Auth, force, skipDesktop bool) [
 }
 
 // ClaimNewcomerNow 领单个账号的一次性新手礼包（面板按钮，强制问上游）。
+// 与签到轮共用单飞锁：正在跑一轮签到时就别挤进去，返回 ErrRoundBusy 让面板提示稍等。
 func (s *Scheduler) ClaimNewcomerNow(uid string) ([]NewcomerGrant, error) {
+	if !s.checkinLock.TryLock() {
+		return nil, ErrRoundBusy
+	}
+	defer s.checkinLock.Unlock()
 	st, ok := s.cfg.Pool.Status(uid)
 	if !ok {
 		return nil, ErrNotFound
@@ -786,8 +795,16 @@ func (s *Scheduler) ClaimNewcomerNow(uid string) ([]NewcomerGrant, error) {
 }
 
 // RunNewcomerNow 对全池领一遍一次性新手礼包（面板按钮）。禁用的跳过。
-func (s *Scheduler) RunNewcomerNow() []NewcomerGrant {
+//
+// 与签到轮共用单飞锁 + 账号之间留 checkinPace 的节奏：全池一次点下去就是 2×N 个请求
+// 连打同一批上游端点，那正是 9074 的成因（RunCheckinNow 一直在这么做，这里照抄）。
+func (s *Scheduler) RunNewcomerNow() ([]NewcomerGrant, error) {
+	if !s.checkinLock.TryLock() {
+		return nil, ErrRoundBusy
+	}
+	defer s.checkinLock.Unlock()
 	out := []NewcomerGrant{}
+	first := true
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
 			continue
@@ -796,12 +813,26 @@ func (s *Scheduler) RunNewcomerNow() []NewcomerGrant {
 		if a == nil {
 			continue
 		}
+		if !first {
+			time.Sleep(checkinPace())
+		}
+		first = false
 		for _, g := range s.claimNewcomerGrants(a, true, false) {
 			g.UID = st.UID
 			out = append(out, g)
 		}
 	}
-	return out
+	return out, nil
+}
+
+// RunCheckinOne 单号签到（面板行内「签到」）：同样要先拿到单飞锁，
+// 免得和整点那一轮把同一个账号同时送进 claim。
+func (s *Scheduler) RunCheckinOne(uid string) (CheckinResult, error) {
+	if !s.checkinLock.TryLock() {
+		return CheckinResult{UID: uid}, ErrRoundBusy
+	}
+	defer s.checkinLock.Unlock()
+	return s.CheckinUID(uid)
 }
 
 // isNetworkError 判断是否传输层失败：http.Client 会把传输错误包成 *url.Error，

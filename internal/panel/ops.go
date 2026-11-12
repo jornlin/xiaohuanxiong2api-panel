@@ -182,7 +182,11 @@ func (p *Panel) grantsAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "scheduler unavailable")
 		return
 	}
-	grants := p.cfg.Scheduler.RunNewcomerNow()
+	grants, err := p.cfg.Scheduler.RunNewcomerNow()
+	if errors.Is(err, scheduler.ErrRoundBusy) {
+		writeErr(w, http.StatusConflict, err.Error())
+		return
+	}
 	log.Printf("panel: newcomer grants（全池），本次问上游 %d 笔", len(grants))
 	p.writeOverview(w, map[string]any{"grants": grants})
 }
@@ -204,6 +208,9 @@ func (p *Panel) accountGrants(w http.ResponseWriter, r *http.Request) {
 		return
 	case errors.Is(err, scheduler.ErrNotFound):
 		writeErr(w, http.StatusNotFound, "account not found")
+		return
+	case errors.Is(err, scheduler.ErrRoundBusy):
+		writeErr(w, http.StatusConflict, err.Error())
 		return
 	case err != nil:
 		// 与 accountCheckin 同口径：将来多出别的错误类型时，别静默当成成功回 200。

@@ -168,7 +168,7 @@ func smsFriendly(resp *apiResponse, err error) error {
 	// 官方页面里的滑块能拿到（面板是内网地址，不在那个 SceneId 的域白名单里）。
 	// 这条失败**没有**已收录的业务码（官方 web 端也只把它归成一句 captchaVerifyFailed），
 	// 所以按 message 文本判——它是稳定的英文标识。
-	if strings.Contains(raw, "captcha") {
+	if strings.Contains(raw, "captcha") || strings.Contains(businessCodeText(resp.Body), "captcha") {
 		return &BusinessError{Code: code, Message: "上游要求人机校验（滑块），面板这边拿不到回执；" +
 			"请到官方页面点「验证码登录」取码（xiaohuanxiong.com/account 或官方客户端），" +
 			"再把手机号 + 验证码填到这里登录（登录这条不需要滑块）"}
