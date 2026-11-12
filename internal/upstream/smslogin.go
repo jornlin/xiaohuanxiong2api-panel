@@ -1,7 +1,6 @@
 package upstream
 
 import (
-	"errors"
 	"net/http"
 
 	"github.com/misakano7545/xiaohuanxiong2api-panel/internal/auth"
@@ -97,10 +96,10 @@ func (c *Client) SendSmsCode(nation, phone, captchaParam string) error {
 	}
 	resp, err := c.doJSON(http.MethodPost, c.authBase()+SendSmsPath, body, c.clientIDHeaders())
 	if err != nil {
-		return smsFriendly(err)
+		return err
 	}
 	if _, err := payloadOf(resp, "发送验证码"); err != nil {
-		return smsFriendly(err)
+		return smsFriendly(resp, err)
 	}
 	return nil
 }
@@ -118,11 +117,11 @@ func (c *Client) LoginWithSms(nation, phone, code string) (*auth.Auth, error) {
 	body := map[string]any{"nation_code": nation, "phone": enc, "sms_code": code}
 	resp, err := c.doJSON(http.MethodPost, c.authBase()+LoginSmsPath, body, c.clientIDHeaders())
 	if err != nil {
-		return nil, smsFriendly(err)
+		return nil, err
 	}
 	data, err := payloadOf(resp, "验证码登录")
 	if err != nil {
-		return nil, smsFriendly(err)
+		return nil, smsFriendly(resp, err)
 	}
 	access := text(data, "access_token", "accessToken")
 	refresh := text(data, "refresh_token", "refreshToken")
@@ -153,19 +152,28 @@ func (c *Client) LoginWithSms(nation, phone, code string) (*auth.Auth, error) {
 	return account, nil
 }
 
-// smsFriendly 把上游的英文业务码换成人话再往上抛（面板直接展示 Message）。
-func smsFriendly(err error) error {
-	var be *BusinessError
-	if !errors.As(err, &be) {
+// smsFriendly 把短信通道的失败翻成人话再往上抛（BusinessError.Error() 就是 Message，
+// 面板原样展示）。
+//
+// 为什么按**响应体**里的业务码翻、而不是看 payloadOf 返回的错误类型：上游这些失败是
+// HTTP 400 + 业务码（不是 2xx 带非零 code），payloadOf 在状态码那一步就把它们归成通用
+// *Error 了，等拿到错误再判类型已经晚了——实测漏翻过一次，面板上只剩英文原话。
+// 业务码认不出来时保留 payloadOf 的原错误（含 HTTP 状态与上游原话）。
+func smsFriendly(resp *apiResponse, err error) error {
+	code, ok := businessCodeOf(resp.Body)
+	if !ok {
 		return err
 	}
-	switch be.Code {
-	case CodeSmsCodeVerify:
-		return &BusinessError{Code: be.Code, Message: "验证码不正确或已过期，请重新获取（" + be.Message + "）"}
-	case CodeParamsInvalid:
-		return &BusinessError{Code: be.Code, Message: "手机号不合法，检查区号与号码是否对得上（" + be.Message + "）"}
-	case CodeParamsEncrypted:
-		return &BusinessError{Code: be.Code, Message: "上游拒绝了加密字段，说明加密方式与官方不一致（" + be.Message + "）"}
+	msg, known := map[int]string{
+		CodeSmsCodeVerify:   "验证码不正确或已过期，请重新获取",
+		CodeParamsInvalid:   "手机号不合法，检查区号与号码是否对得上",
+		CodeParamsEncrypted: "上游拒绝了加密字段，加密方式与官方不一致",
+	}[code]
+	if !known {
+		return err
 	}
-	return err
+	if raw := businessMessageOf(resp.Body); raw != "" {
+		msg += "（上游：" + raw + "）"
+	}
+	return &BusinessError{Code: code, Message: msg}
 }

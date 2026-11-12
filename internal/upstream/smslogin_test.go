@@ -127,7 +127,10 @@ func TestLoginWithSmsFriendlyErrors(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				_, _ = io.WriteString(w, `{"code":`+strconv.Itoa(tc.code)+`,"message":"upstream english message"}`)
+				// 上游真实形态：HTTP 400 + 业务码（payloadOf 会先把状态码归成通用错误，
+				// 所以翻译必须按响应体里的业务码走）。
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = io.WriteString(w, `{"code":`+strconv.Itoa(tc.code)+`,"message":"upstream english message","details":"more detail"}`)
 			}))
 			defer srv.Close()
 

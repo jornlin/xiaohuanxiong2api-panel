@@ -779,3 +779,13 @@ func businessCodeOf(body []byte) (int, bool) {
 	}
 	return intOf(envelope["code"])
 }
+
+// businessMessageOf 取响应体里的 message/msg（上游原话），没有就空串。
+// 与 businessCodeOf 配套：翻成人话时要把上游原文附上，排障不至于只剩一句中文。
+func businessMessageOf(body []byte) string {
+	var envelope map[string]any
+	if err := json.Unmarshal(body, &envelope); err != nil {
+		return ""
+	}
+	return text(envelope, "message", "msg")
+}
