@@ -8,7 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/misakano7545/xiaohuanxiong2api-panel/internal/auth"
 	"github.com/misakano7545/xiaohuanxiong2api-panel/internal/pool"
 	"github.com/misakano7545/xiaohuanxiong2api-panel/internal/upstream"
 )
@@ -26,6 +28,17 @@ func newSmsPanel(t *testing.T, handler http.HandlerFunc) *Panel {
 		Pool: pool.New(""), Upstream: up, AuthDir: t.TempDir(), Version: "test",
 		Models: func() []map[string]any { return []map[string]any{} },
 	})
+}
+
+// newSmsPanelWith 与 newSmsPanel 相同，但账号池里放一个号（邀请码列表要有号才列得出来）。
+func newSmsPanelWith(t *testing.T, handler http.HandlerFunc) *Panel {
+	t.Helper()
+	pn := newSmsPanel(t, handler)
+	pn.cfg.Pool.Add(&auth.Auth{Data: auth.Data{
+		AccessToken: "dt-1", RefreshToken: "rt-1", UID: "u-1", Nickname: "测试号",
+		ExpiresAt: time.Now().Add(48 * time.Hour).UnixMilli(),
+	}})
+	return pn
 }
 
 // TestPanelSmsSend 发码端点：手机号密文上行、空 captcha 不带字段、明显笔误本地就拦。
@@ -141,5 +154,36 @@ func TestPanelSmsNations(t *testing.T) {
 	first, _ := nations[0].(map[string]any)
 	if first["code"] != "86" {
 		t.Errorf("第一条 = %v，期望 86", first)
+	}
+}
+
+// TestPanelInvites 邀请码列表：面板「添加账号 → 手机验证码」用它拼注册链接，
+// 所以必须带上码本身与进度（已邀人数 / 已得积分），注册完立刻能判卷。
+func TestPanelInvites(t *testing.T) {
+	pn := newSmsPanelWith(t, func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/tasks":
+			_, _ = io.WriteString(w, `{"code":0,"data":{"invite":{"invite_code":"inv-abc",
+				"registered_invitee_count":2,"granted_points":3000,"register_reward_points":1500},
+				"new_user_task_states":[],"invitee_task_states":[]}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	})
+	code, body := call(t, pn, http.MethodGet, "/panel/api/invites", "")
+	if code != http.StatusOK {
+		t.Fatalf("invites = %d", code)
+	}
+	rows, _ := body["accounts"].([]any)
+	if len(rows) != 1 {
+		t.Fatalf("accounts = %v", body["accounts"])
+	}
+	row, _ := rows[0].(map[string]any)
+	if row["code"] != "inv-abc" || row["registered_invitees"] != float64(2) ||
+		row["granted_points"] != float64(3000) || row["register_reward_points"] != float64(1500) {
+		t.Errorf("邀请信息不全: %v", row)
+	}
+	if row["uid"] != "u-1" {
+		t.Errorf("uid = %v", row["uid"])
 	}
 }

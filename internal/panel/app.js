@@ -1739,7 +1739,10 @@ function switchAddTab(tab) {
   $('btnRefreshLogin').hidden = tab !== 'token';
   $('btnSmsLogin').hidden = tab !== 'sms';
   if (tab === 'qr' && !qrStarted) startQrLogin();
-  if (tab === 'sms' && !smsNationsLoaded) loadSmsNations();
+  if (tab === 'sms') {
+    if (!smsNationsLoaded) loadSmsNations();
+    if (!smsInvitesLoaded) loadSmsInvites();
+  }
 }
 
 // ---------------------------------------------------------------- 手机号 + 验证码
@@ -1759,6 +1762,40 @@ async function loadSmsNations() {
     // 区号表拉不到不该挡住登录：内置一条最常用的。
     sel.innerHTML = '<option value="86">中国大陆 +86</option>';
   }
+}
+
+// 邀请码列表：拼"带 invite_code 的注册链接"。奖励记在邀请人账上，所以码必须取自池里的账号。
+let smsInvitesLoaded = false;
+
+async function loadSmsInvites() {
+  smsInvitesLoaded = true;
+  const sel = $('smsInvite');
+  try {
+    const d = await api('invites');
+    const rows = (d.accounts || []).filter(r => r.code);
+    if (!rows.length) {
+      sel.innerHTML = '<option value="">（池里没有可用邀请码：先把邀请人账号加进来）</option>';
+      $('smsInviteUrl').value = '';
+      return;
+    }
+    // 默认随机挑一个：多号池时避免每次都灌同一个邀请人（和你脚本里的做法一致）
+    const pick = rows[Math.floor(Math.random() * rows.length)];
+    sel.innerHTML = rows.map(r =>
+      '<option value="' + esc(r.code) + '"' + (r.code === pick.code ? ' selected' : '') + '>' +
+      esc(r.nickname || r.uid) + ' · 已邀 ' + (r.registered_invitees || 0) + ' 人 · ' +
+      esc(r.code.slice(0, 8)) + '… · 每邀 +' + (r.register_reward_points || 0) + '</option>').join('');
+    syncInviteUrl();
+  } catch (e) {
+    sel.innerHTML = '<option value="">（拉取失败：' + esc(e.message) + '）</option>';
+  }
+}
+
+// 注册链接：官方注册入口 + invite_code（前端就是这么拼的：/register 页面从 query 取 invite_code）
+function syncInviteUrl() {
+  const code = $('smsInvite').value;
+  $('smsInviteUrl').value = code
+    ? 'https://xiaohuanxiong.com/register?lang=zh&invite_code=' + encodeURIComponent(code)
+    : '';
 }
 
 // sendSmsCode 发验证码：成功后按上游惯例倒计时 60 秒，避免连点触发风控。
@@ -1793,10 +1830,15 @@ async function loginBySms() {
   const btn = $('btnSmsLogin');
   btn.disabled = true;
   try {
+    const invite = $('smsInvite') ? $('smsInvite').value : '';
     const d = await api('login/sms', {
-      method: 'POST', body: JSON.stringify({ nation_code: $('smsNation').value, phone, sms_code: code })
+      method: 'POST',
+      body: JSON.stringify({ nation_code: $('smsNation').value, phone, sms_code: code, invite_code: invite })
     });
-    toast('已加入：' + (d.nickname || d.uid), 'ok');
+    toast('已加入：' + (d.nickname || d.uid) +
+      (invite ? '（邀请码 ' + invite.slice(0, 8) + '… 已随本次注册提交）' : '（未带邀请码）'), 'ok');
+    if (d.warn) setTimeout(() => toast(d.warn, 'err'), 300);   // 错开一条，别两条叠一起
+    loadSmsInvites();   // 刷新邀请进度：涨了就说明这次注册算到了邀请人头上
     $('addVeil').classList.remove('on');
     $('smsCode').value = '';
     loadOverview(true);
@@ -2049,7 +2091,19 @@ function boot() {
   $('btnSmsSend').onclick = sendSmsCode;
   $('btnSmsLogin').onclick = loginBySms;
   // 官方登录页：发码要过它的人机校验，这是唯一能拿到验证码的地方。
-  $('btnSmsOfficial').onclick = () => window.open('https://xiaohuanxiong.com/account?lang=zh', '_blank', 'noopener');
+  $('btnSmsInviteRefresh').onclick = loadSmsInvites;
+  $('smsInvite').onchange = syncInviteUrl;
+  $('btnSmsCopyInvite').onclick = async () => {
+    const url = $('smsInviteUrl').value;
+    if (!url) { toast('先选一个邀请码', 'err'); return; }
+    try { await navigator.clipboard.writeText(url); toast('注册链接已复制，去浏览器里打开它发码', 'ok'); }
+    catch (e) { $('smsInviteUrl').select(); toast('复制失败，已选中文本，按 ⌘C 复制', 'warn'); }
+  };
+  $('btnSmsOpenInvite').onclick = () => {
+    const url = $('smsInviteUrl').value;
+    if (!url) { toast('先选一个邀请码', 'err'); return; }
+    window.open(url, '_blank', 'noopener');
+  };
   // 回车即登录（验证码填完习惯性敲回车），与回调链接那条一致。
   $('smsCode').addEventListener('keydown', e => { if (e.key === 'Enter') loginBySms(); });
   $('btnKey').onclick = submitKey;

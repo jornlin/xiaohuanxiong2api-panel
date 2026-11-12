@@ -1187,23 +1187,39 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
            手机号密文传输）。登录那步不需要图形验证码，所以「自己在官网/客户端取码
            再回来登录」在任何部署形态下都成立；发码若被上游要求滑块回执，面板会照实
            把上游原话报出来，并指向上面那条退路。 -->
+      <!-- 手机号 + 验证码：人工只做"发码"这一步（上游要人机校验，面板做不到），其余全在这里闭环。
+           面板给一条**带邀请码**的注册链接 → 你在自己浏览器里发码 → 回来填手机号+验证码 →
+           面板带着邀请码完成注册登录，账号直接入池。 -->
       <div id="addTabSms" class="tab-panel" hidden>
+        <label class="fld"><span class="lb">邀请码（这一步决定新号算谁的邀请）</span>
+          <div class="urlrow">
+            <select id="smsInvite" style="max-width:280px"></select>
+            <button class="xs" id="btnSmsInviteRefresh" title="重新拉取池里各账号的邀请码与已邀进度">刷新</button>
+          </div>
+          <div class="urlrow">
+            <input id="smsInviteUrl" readonly spellcheck="false"
+                   placeholder="选中邀请码后，这里出现可复制的注册链接">
+            <button class="xs" id="btnSmsCopyInvite">复制链接</button>
+            <button class="xs" id="btnSmsOpenInvite">打开</button>
+          </div>
+          <span class="hint"><b>流程：</b>① 复制上面这条链接 → ② 在<b>你自己的浏览器</b>里打开，输手机号点「发送验证码」
+            （这一步必须人工：上游发码要过阿里云人机校验，服务端拿不到回执）→ ③ 回来填手机号 + 验证码登录。<br>
+            链接里带 <code>invite_code</code>，注册时邀请会算到<b>这个码的主人</b>账上（1500 分/位）。
+            上游<b>没有补绑接口</b>，邀请只在注册那一刻生效，所以新号要用这条链接注册。</span>
+        </label>
         <label class="fld"><span class="lb">手机号</span>
           <div class="urlrow">
             <select id="smsNation" style="max-width:120px"></select>
             <input id="smsPhone" spellcheck="false" autocomplete="off" inputmode="numeric"
                    placeholder="不带区号的手机号">
-            <button class="xs" id="btnSmsSend" title="上游发码要人机校验（滑块），官方页面之外通常拿不到回执；拿不到时请走「去官方页面取码」">发送验证码</button>
-            <button class="xs" id="btnSmsOfficial" title="打开官方登录页（手机号登录 / 验证码登录），在那里过滑块取码">去官方页面取码</button>
+            <button class="xs" id="btnSmsSend" title="面板直接发码：上游要人机校验，多数会被拒；被拒就用上面的注册链接在自己的浏览器里发">发送验证码</button>
           </div>
-          <span class="hint">上游发码要人机校验（阿里云滑块），那个回执只有官方页面能拿到——
-            所以标准流程是：官方页面点「验证码登录」过滑块取码 → 回到这里填手机号 + 验证码。
-            <strong>登录这一步不需要滑块</strong>，凭验证码就能把账号收进池子。</span>
+          <span class="hint">手机号填你在浏览器里发过码的那个号（同一个号）。</span>
         </label>
         <label class="fld"><span class="lb">验证码</span>
           <input id="smsCode" spellcheck="false" autocomplete="one-time-code" inputmode="numeric"
                  maxlength="8" placeholder="短信里的数字验证码">
-          <span class="hint">验证码只用于换取凭证；登录成功后账号自动落盘入池，与扫码进来的完全等价。</span>
+          <span class="hint">登录这一步<b>不需要</b>人机校验：凭验证码就能换到凭证，账号自动落盘入池，与扫码进来的完全等价。</span>
         </label>
       </div>
       <div id="addTabBrowser" class="tab-panel" hidden>

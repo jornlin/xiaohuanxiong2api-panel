@@ -221,6 +221,42 @@ func (p *Panel) accountGrants(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "grants": grants, "account": st})
 }
 
+// invites 池里各账号的邀请码（只读）：面板「添加账号 → 手机验证码」用它拼注册链接。
+//
+// 邀请奖励记在**邀请人**账上（1500 分/位），所以链接里的码必须来自池里的账号 ——
+// 直接把池子里的码列出来，用户就不用去官网后台翻。顺带回报已邀人数与已得积分，
+// 注册完立刻能看出这次邀请算没算上（上游没有补绑接口，只在注册那一刻生效）。
+func (p *Panel) invites(w http.ResponseWriter, r *http.Request) {
+	type row struct {
+		UID               string `json:"uid"`
+		Nickname          string `json:"nickname,omitempty"`
+		Code              string `json:"code"`
+		RegisteredInvitee int64  `json:"registered_invitees"`
+		GrantedPoints     int64  `json:"granted_points"`
+		RewardPerInvitee  int64  `json:"register_reward_points"`
+		Error             string `json:"error,omitempty"`
+	}
+	out := []row{}
+	for _, st := range p.cfg.Pool.List() {
+		a := p.cfg.Pool.AuthByUID(st.UID)
+		if a == nil {
+			continue
+		}
+		rw := row{UID: st.UID, Nickname: st.Nickname}
+		tasks, err := p.cfg.Upstream.Tasks(a)
+		if err != nil {
+			rw.Error = publicErr(err)
+		} else {
+			rw.Code = tasks.Invite.Code
+			rw.RegisteredInvitee = tasks.Invite.RegisteredInvitees
+			rw.GrantedPoints = tasks.Invite.GrantedPoints
+			rw.RewardPerInvitee = tasks.Invite.RegisterRewardPoints
+		}
+		out = append(out, rw)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": out})
+}
+
 // tasksStatus 任务状态（**只读**，零额度消耗）：透传上游 /points/v1/tasks。
 //
 // 面板据此显示「新手任务领了几项」与邀请码——只靠余额猜「礼包到底领没领到」
