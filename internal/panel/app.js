@@ -1733,10 +1733,76 @@ let addTab = 'browser';
 function switchAddTab(tab) {
   document.querySelectorAll('#addTabs .tab').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
   $('addTabQr').hidden = tab !== 'qr';
+  $('addTabSms').hidden = tab !== 'sms';
   $('addTabBrowser').hidden = tab !== 'browser';
   $('addTabToken').hidden = tab !== 'token';
   $('btnRefreshLogin').hidden = tab !== 'token';
+  $('btnSmsLogin').hidden = tab !== 'sms';
   if (tab === 'qr' && !qrStarted) startQrLogin();
+  if (tab === 'sms' && !smsNationsLoaded) loadSmsNations();
+}
+
+// ---------------------------------------------------------------- 手机号 + 验证码
+
+// 区号只在第一次切到该 tab 时拉一次（上游拉不到就用服务端内置兜底表）。
+let smsNationsLoaded = false;
+let smsCountdown = null;
+
+async function loadSmsNations() {
+  smsNationsLoaded = true;
+  const sel = $('smsNation');
+  try {
+    const d = await api('login/sms/nations');
+    sel.innerHTML = (d.nations || []).map(n =>
+      '<option value="' + esc(n.code) + '">' + esc(n.name) + ' +' + esc(n.code) + '</option>').join('');
+  } catch (e) {
+    // 区号表拉不到不该挡住登录：内置一条最常用的。
+    sel.innerHTML = '<option value="86">中国大陆 +86</option>';
+  }
+}
+
+// sendSmsCode 发验证码：成功后按上游惯例倒计时 60 秒，避免连点触发风控。
+async function sendSmsCode() {
+  const phone = $('smsPhone').value.trim();
+  if (!phone) { toast('先填手机号', 'err'); return; }
+  const btn = $('btnSmsSend');
+  btn.disabled = true;
+  try {
+    await api('login/sms/send', { method: 'POST', body: JSON.stringify({ nation_code: $('smsNation').value, phone }) });
+    toast('验证码已发送', 'ok');
+    let left = 60;
+    btn.textContent = left + 's';
+    smsCountdown = setInterval(() => {
+      left -= 1;
+      btn.textContent = left > 0 ? left + 's' : '发送验证码';
+      if (left <= 0) { clearInterval(smsCountdown); smsCountdown = null; btn.disabled = false; }
+    }, 1000);
+  } catch (e) {
+    // 上游要滑块回执（或其它原因）时把原话展示出来，并指向「自己取码」那条路。
+    $('addErr').hidden = false;
+    $('addErr').textContent = e.message + '（也可以去官方网页/客户端取码，直接填到下面登录）';
+    btn.disabled = false;
+  }
+}
+
+// loginBySms 用验证码登录并把账号入池。
+async function loginBySms() {
+  const phone = $('smsPhone').value.trim(), code = $('smsCode').value.trim();
+  if (!phone || !code) { toast('先填手机号和验证码', 'err'); return; }
+  const btn = $('btnSmsLogin');
+  btn.disabled = true;
+  try {
+    const d = await api('login/sms', {
+      method: 'POST', body: JSON.stringify({ nation_code: $('smsNation').value, phone, sms_code: code })
+    });
+    toast('已加入：' + (d.nickname || d.uid), 'ok');
+    $('addVeil').classList.remove('on');
+    $('smsCode').value = '';
+    loadOverview(true);
+  } catch (e) {
+    $('addErr').hidden = false;
+    $('addErr').textContent = e.message;
+  } finally { btn.disabled = false; }
 }
 
 
@@ -1972,6 +2038,10 @@ function boot() {
   // 新标签页打开：点击是用户手势，弹窗拦截不挡；noopener 不给新页面 window.opener 句柄。
   $('btnOpenUrl').onclick = () => window.open($('addUrl').textContent, '_blank', 'noopener');
   $('btnRefreshLogin').onclick = refreshLogin;
+  $('btnSmsSend').onclick = sendSmsCode;
+  $('btnSmsLogin').onclick = loginBySms;
+  // 回车即登录（验证码填完习惯性敲回车），与回调链接那条一致。
+  $('smsCode').addEventListener('keydown', e => { if (e.key === 'Enter') loginBySms(); });
   $('btnKey').onclick = submitKey;
   $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') submitKey(); });
 

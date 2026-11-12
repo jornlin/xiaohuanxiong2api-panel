@@ -100,6 +100,12 @@ func New(cfg Config) *Panel {
 	p.mux.HandleFunc("GET /panel/api/login/qr.png", p.withAuth(p.loginQrImage))
 	// 粘贴回调链接（跨机/服务器部署时 127.0.0.1 回调到不了，走这条）。
 	p.mux.HandleFunc("POST /panel/api/login/code", p.withAuth(p.loginCode))
+	// 手机号 + 验证码：发码走官方 auth 域的 /send_sms，登录走 /login_with_sms
+	// （手机号必须密文，见 upstream.EncryptSmsField）。登录那条不需要滑块，
+	// 所以「官网/客户端取码 + 面板登录」也成立。
+	p.mux.HandleFunc("GET /panel/api/login/sms/nations", p.withAuth(p.smsNations))
+	p.mux.HandleFunc("POST /panel/api/login/sms/send", p.withAuth(p.loginSmsSend))
+	p.mux.HandleFunc("POST /panel/api/login/sms", p.withAuth(p.loginSms))
 	// refreshToken 直登：不经过浏览器把号加进来（对方只给了一条 refresh_token 时的备用入口）。
 	p.mux.HandleFunc("POST /panel/api/login/refresh", p.withAuth(p.loginRefresh))
 	p.mux.HandleFunc("POST /panel/api/checkin", p.withAuth(p.checkinAll))

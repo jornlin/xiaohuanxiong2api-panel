@@ -61,6 +61,7 @@
 | 签到 | `POST {origin}/api/web/desktop/v1/login/points/grant` + `GET {points_base}/bills` | 每日 300 分是服务端 00:00 自动发放、午夜清零，没有「调一下就发分」的客户端开关；grant 是幂等的登录领取（领过回 `granted:false`），是否到账以 bills 里当天的 `daily_grant` 为准 |
 | 手机端首登 | `POST {origin}/api/web/mobile/v1/login/points/grant` | 与桌面端那笔额度独立，桌面端领过的号照样能领 |
 | 任务状态 | `GET {points_base}/tasks` | 只读回任务三组：`new_user_task_states`（注册/桌面端/移动端礼包）、`invitee_task_states`（活跃 7 天/首次付费）、`invite`（邀请码与进度）。上游**没有任何「完成任务」写端点**（POST/PUT 全是 404），所以能靠 API 领的只有桌面端与移动端两笔礼包，活跃/付费由服务端按行为判定 |
+| 验证码登录 | `POST {auth_base}/send_sms` + `POST {auth_base}/login_with_sms` | 官方网页端同款通道：`phone` 必须是密文（AES-128-CFB，密钥 `senseraccoon2023` 就写在网页里，见 `upstream.EncryptSmsField`），明文回 `params_encryted_error`；`sms_code` 明文。**登录不需要图形验证码**（实测：假验证码回 `sms_code_verify_error` 而不是验证码挑战），发码则可能要阿里云滑块回执 |
 | 换码登录 | `POST {auth_base}/login_with_authorization_code` | 用 `office-raccoon://` 回调里的 code 换票 |
 
 网关只做四件事：选号与续期、把响应帧里的 `model` 改回客户端请求的名字、
@@ -103,6 +104,13 @@ Docker：`docker compose up -d --build`（`auths/`、`data/`、`config.json` 都
 小浣熊**没有**设备码授权，所以面板「添加账号」的设备流入口会如实报错并指向「导入凭证」；
 这是上游协议差异，不是缺功能。账号文件落在 `auths/<uid>.json`（0600，原子写），
 `refresh_token` 每次续期都轮换，落盘失败会在日志里点名（新票只在内存里，重启后需重新登录）。
+
+**添加账号 → 手机验证码**：走官方网页端同一条通道（auth 域的 `/send_sms` 与 `/login_with_sms`），
+手机号按官方前端那套对称加密（AES-128-CFB，密钥写在网页里）上行——明文会被上游拒。
+登录那一步**不需要图形验证码**，所以就算发码被上游要滑块回执卡住，也可以去官方网页/客户端
+点一次「验证码登录」取码，再把 `手机号 + 验证码` 填进面板登录，效果一样。
+
+## 配置
 
 ## 配置
 

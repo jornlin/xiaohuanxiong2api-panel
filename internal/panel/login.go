@@ -365,6 +365,125 @@ func (p *Panel) saveAccount(creds *auth.Auth) (uid, nickname string, err error) 
 	return creds.UID, creds.Nickname, nil
 }
 
+// ---------------------------------------------------------------- 手机号 + 验证码
+
+// smsNations 可选区号。上游拉不到时用内置兜底表（见 upstream.SmsNations），
+// 所以这里不会因为一次网络抖动让登录页不可用。
+func (p *Panel) smsNations(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "nations": p.cfg.Upstream.SmsNations()})
+}
+
+// smsVerify 校验面板来的手机号/区号/验证码，返回归一后的值。
+// 只做形状校验（上游还有一层），目的是让明显的笔误在本地就报清楚。
+func smsVerify(nation, phone string) (string, string, error) {
+	nation = strings.TrimSpace(nation)
+	phone = strings.TrimSpace(phone)
+	if nation == "" {
+		nation = "86"
+	}
+	if !digitOnly(nation) || len(nation) > 4 {
+		return "", "", errors.New("区号只能是 1-4 位数字")
+	}
+	if !digitOnly(phone) || len(phone) < 5 || len(phone) > 20 {
+		return "", "", errors.New("手机号只能是 5-20 位数字（不要带区号、空格或 +）")
+	}
+	return nation, phone, nil
+}
+
+func digitOnly(s string) bool {
+	if s == "" {
+		return false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// loginSmsSend 发登录验证码。
+//
+// 走的是官方网页端同一条通道（auth 域的 /send_sms，手机号必须密文，见
+// upstream.EncryptSmsField）。captcha_param 是官方页阿里云滑块的回执，可空——
+// 上游真要它就会回业务码，面板把上游原话照实报出来，不编造「已发送」。
+func (p *Panel) loginSmsSend(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Nation  string `json:"nation_code"`
+		Phone   string `json:"phone"`
+		Captcha string `json:"captcha_param"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求体不是合法 JSON")
+		return
+	}
+	nation, phone, err := smsVerify(req.Nation, req.Phone)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := p.cfg.Upstream.SendSmsCode(nation, phone, strings.TrimSpace(req.Captcha)); err != nil {
+		log.Printf("panel: 发送验证码失败 +%s: %v", maskPhone(phone), err)
+		writeErr(w, http.StatusBadGateway, publicErr(err))
+		return
+	}
+	log.Printf("panel: 已请求发送验证码 +%s", maskPhone(phone))
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "action": "sent"})
+}
+
+// loginSms 手机号 + 验证码登录，成功即落盘入池。
+//
+// 登录接入与其它几条路径完全一致：拿凭证 → saveAccount（落 auths/ + 入池）。
+// 验证码由用户自己从官方页面/客户端获取时也走这里——**这条端点不需要滑块**，
+// 所以「官网取码 + 面板登录」在任何部署形态下都能用。
+func (p *Panel) loginSms(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Nation string `json:"nation_code"`
+		Phone  string `json:"phone"`
+		Code   string `json:"sms_code"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&req); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求体不是合法 JSON")
+		return
+	}
+	nation, phone, err := smsVerify(req.Nation, req.Phone)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	code := strings.TrimSpace(req.Code)
+	if !digitOnly(code) || len(code) > 8 {
+		writeErr(w, http.StatusBadRequest, "验证码只能是数字")
+		return
+	}
+	creds, err := p.cfg.Upstream.LoginWithSms(nation, phone, code)
+	if err != nil {
+		log.Printf("panel: 验证码登录失败 +%s: %v", maskPhone(phone), err)
+		writeErr(w, http.StatusBadGateway, publicErr(err))
+		return
+	}
+	// 设备指纹：与其它登录路径同形（UUID4），落盘前补上。
+	if err := creds.CompleteIdentity(newMachineID()); err != nil {
+		writeErr(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	uid, nick, err := p.saveAccount(creds)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	log.Printf("panel: 验证码登录成功 +%s uid=%s", maskPhone(phone), uid)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "action": "imported", "uid": uid, "nickname": nick})
+}
+
+// maskPhone 日志里只留后四位：手机号是个人标识，日志面板会被整屏看。
+func maskPhone(phone string) string {
+	if len(phone) <= 4 {
+		return "****"
+	}
+	return strings.Repeat("*", len(phone)-4) + phone[len(phone)-4:]
+}
+
 // loginRefresh 用一条 refreshToken 直登（最稳的免粘贴入口）。
 func (p *Panel) loginRefresh(w http.ResponseWriter, r *http.Request) {
 	var req struct {
