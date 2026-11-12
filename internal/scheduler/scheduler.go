@@ -551,6 +551,7 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 		}
 	}
 	var checkinErr error
+	var desktopGrant *NewcomerGrant
 	// desktopTried：本轮 default 分支已经打过桌面端那条端点（每日领取与礼包同一条）。
 	// 打了就不再在同一轮里补打一次——秒级重复请求正是上游风控盯的东西。
 	desktopTried := false
@@ -566,7 +567,10 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 		res.Status = "skipped"
 		log.Printf("checkin %s: upstream disabled (enable=false)", uid)
 	default:
-		claimErr := s.claimWithRetry(a)
+		var claimErr error
+		// 桌面端那笔礼包就是被这次"每日登录领取"顺带领掉的：把结果留好，
+		// 否则面板只会看到移动端那笔，看着像漏领。
+		desktopGrant, claimErr = s.claimWithRetry(a)
 		desktopTried = true
 		switch {
 		case claimErr == nil:
@@ -622,7 +626,11 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 	// 一次性新手礼包（桌面端/移动端各 3000 分）在这里无条件补一次：
 	// 每日分是上游 00:00 自动发的，上面几乎总走「already」短路，claim 分支
 	// 根本不执行——礼包不能跟着签到结果一起被跳过（见 claimNewcomerGrants）。
-	if grants := s.claimNewcomerGrants(a, false, desktopTried); len(grants) > 0 {
+	grants := s.claimNewcomerGrants(a, false, desktopTried)
+	if desktopGrant != nil {
+		grants = append([]NewcomerGrant{*desktopGrant}, grants...)
+	}
+	if len(grants) > 0 {
 		res.Grants = grants
 	}
 	if res.Status == "" {
@@ -682,21 +690,23 @@ func checkinCooldown(err error) (time.Duration, bool) {
 // 一次性新手礼包不在这里领：同一轮里再领一次就是秒级重复请求，正是本文件反复强调要避免的
 // （见下面 claimNewcomerGrants 的说明）。打过的痕迹只记「端点给了答复」这一种，
 // 网络层失败留给下一轮——否则一次抖动会把礼包永久判成已结算。
-func (s *Scheduler) claimWithRetry(a *auth.Auth) error {
-	err := s.cfg.Upstream.CheckinClaim(a)
+// 返回桌面端那笔礼包的领取结果（nil = 端点没给出答复，交给后面的统一礼包步骤再试）。
+func (s *Scheduler) claimWithRetry(a *auth.Auth) (*NewcomerGrant, error) {
+	granted, err := s.cfg.Upstream.CheckinClaim(a)
 	if err == nil {
 		a.MarkDesktopGrantDone()
-		return nil
+		return &NewcomerGrant{Key: "desktop_login", Granted: granted}, nil
 	}
 	if !isNetworkError(err) {
-		return err
+		return nil, err
 	}
 	time.Sleep(time.Second)
-	if err := s.cfg.Upstream.CheckinClaim(a); err != nil {
-		return err
+	granted, err = s.cfg.Upstream.CheckinClaim(a)
+	if err != nil {
+		return nil, err
 	}
 	a.MarkDesktopGrantDone()
-	return nil
+	return &NewcomerGrant{Key: "desktop_login", Granted: granted}, nil
 }
 
 // NewcomerGrant 是一笔一次性新手礼包的领取结果（面板如实回报用）。

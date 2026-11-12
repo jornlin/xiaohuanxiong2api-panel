@@ -418,17 +418,20 @@ func (c *Client) ClaimDesktopGrant(a *auth.Auth) (bool, error) {
 }
 
 // CheckinClaim 走登录领取接口（上游幂等：今日已发放则 granted=false）。
-// 只有 granted=true 才记本地台账——发放本体是服务端 00:00 做的，这里只是兜住
+// 只有 granted=true 才记本地签到台账——发放本体是服务端 00:00 做的，这里只是兜住
 // 登录弹窗式的手动领取路径。
-func (c *Client) CheckinClaim(a *auth.Auth) error {
+//
+// 返回 granted：这条端点同时也是**桌面端一次性礼包**的领取入口，调用方要能如实回报
+// "这一笔到底发出去了什么"（否则面板上只会看到移动端那笔，像是少领了）。
+func (c *Client) CheckinClaim(a *auth.Auth) (bool, error) {
 	granted, err := c.ClaimDesktopGrant(a)
 	if err != nil {
-		return err
+		return false, err
 	}
 	if granted {
 		a.MarkCheckedIn()
 	}
-	return nil
+	return granted, nil
 }
 
 // ClaimMobileGrant 领手机端首登奖励（一次性新手福利的另一笔，与桌面端额度独立）。

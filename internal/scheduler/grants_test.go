@@ -236,3 +236,61 @@ func TestRunNewcomerNowSkipsDisabled(t *testing.T) {
 		t.Errorf("禁用账号仍然打了上游 %d 次", calls)
 	}
 }
+
+// TestDesktopGrantReportedOnClaimPath 回归：桌面端那笔礼包是被「每日登录领取」顺带领掉的
+// （同一条端点），这条路径也必须把结果报出来 —— 否则面板/日志只显示移动端那笔，
+// 看着像漏领了 3000 分，而这正是用户最需要一眼看清的事。
+func TestDesktopGrantReportedOnClaimPath(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/balance":
+			_, _ = io.WriteString(w, `{"code":0,"data":{"available_points":5000,"daily_points":300}}`)
+		case "/bills":
+			// 流水空 → 今天还没签、也没有 daily_grant → 走 default 分支（要试每日领取）
+			_, _ = io.WriteString(w, `{"code":0,"data":{"items":[]}}`)
+		case "/api/web/desktop/v1/login/points/grant":
+			// 首次：桌面端礼包真发出去了
+			_, _ = io.WriteString(w, `{"code":0,"data":{"granted":true,"popup":{"source":"desktop_login","points":3000}}}`)
+		case "/api/web/mobile/v1/login/points/grant":
+			_, _ = io.WriteString(w, `{"code":0,"data":{"granted":false,"popup":null}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	up := upstream.New()
+	up.SetAPIHosts(srv.URL, srv.URL)
+	up.SetAgentHosts(srv.URL, srv.URL)
+	p := pool.New("")
+	p.Add(&auth.Auth{Data: auth.Data{
+		AccessToken: "dt", ExpiresAt: time.Now().Add(48 * time.Hour).UnixMilli(), UID: "u-report",
+	}})
+	s := New(Config{Pool: p, Upstream: up, CheckinEnabled: true, KeepaliveEnabled: true})
+
+	res, err := s.CheckinUID("u-report")
+	if err != nil {
+		t.Fatalf("CheckinUID 出错: %v", err)
+	}
+	var desktop, mobile *NewcomerGrant
+	for i := range res.Grants {
+		switch res.Grants[i].Key {
+		case "desktop_login":
+			desktop = &res.Grants[i]
+		case "mobile_login":
+			mobile = &res.Grants[i]
+		}
+	}
+	if desktop == nil {
+		t.Fatalf("签到分支领到的桌面端礼包没被报出来：res.Grants=%+v", res.Grants)
+	}
+	if !desktop.Granted {
+		t.Errorf("桌面端礼包 granted=true 没如实回报：%+v", *desktop)
+	}
+	if mobile == nil {
+		t.Errorf("移动端那笔也应当在同一轮回报：%+v", res.Grants)
+	}
+	if res.Credits != 0 {
+		t.Errorf("Credits=%d，礼包不该并进每日签到收益", res.Credits)
+	}
+}
