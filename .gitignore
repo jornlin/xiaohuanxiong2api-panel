@@ -3,6 +3,8 @@ auths/
 data/
 config.json
 .env
+# 面板密钥（本地登录脚本读它，别入库）
+scripts/.xhx_key
 *.key
 *.pem
 

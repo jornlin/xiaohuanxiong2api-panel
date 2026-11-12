@@ -1,23 +1,39 @@
 #!/usr/bin/env python3
 """小浣熊账号登录：半自动走完「发起授权 → 浏览器登录 → 提交回调 → 入池 → 领新手礼包」。
 
+直接运行即可（参数都写在下面的「配置」里，改完存盘跑就行）：
+
+    python3 scripts/xhx_login_flow.py
+
+命令行参数只是**临时覆盖**配置用（例如换一个面板地址），不传就用配置里的值。
+
 为什么是半自动：发码那一步上游要阿里云无痕验证的令牌，令牌只能由浏览器里的官方页面签发
-（服务端拿不到，带自动化标记的浏览器会被判 token 无效）。所以脚本负责所有能自动的部分，
+（服务端拿不到；带自动化标记的浏览器会被判 token 无效）。所以脚本负责所有能自动的部分，
 浏览器里那几步（过验证 → 收验证码 → 点确认授权）由人来点。
 
-只用标准库，直接跑：
-
-    python3 scripts/xhx_login_flow.py --base http://10.0.1.36:7867 --key sk-xhx-...
-
-常用参数：
-    --key      面板 api_key（也可用环境变量 XHX_API_KEY）
-    --url      已有回调链接时直接传，跳过交互式粘贴
-    --no-open  不自动打开浏览器
-    --checkin  入池后顺手签到一次（会把两笔一次性新手礼包一起领掉）
-    --insecure 跳过 TLS 校验（面板走 https 自签时用）
+注意：如果你在「配置」里填了面板 api_key，这个文件就带着密钥了 —— 别直接提交/推到
+公开仓库，要开 PR 时把 API_KEY 清空即可（清空后脚本会退回读环境变量 XHX_API_KEY）。
 """
 
 from __future__ import annotations
+
+# ═══════════════════════════ 配置：改这里就够了 ═══════════════════════════
+BASE = "http://10.0.1.36:7867"   # 面板地址
+API_KEY = ""                      # 面板 api_key（面板「配置」页可看）。留空则依次找：
+                                  #   环境变量 XHX_API_KEY → 同目录的 .xhx_key 文件（已被 git 忽略）
+REALM = "cn"                      # 小浣熊只有国内版，别改
+
+PHONE = ""                        # 可选：登录时用的手机号，只用于在屏幕上提醒你（不会自动填）
+AUTO_OPEN_BROWSER = True          # 自动用默认浏览器打开授权页
+CHECKIN_AFTER_LOGIN = True        # 入池后顺手签到一次（会把两笔一次性新手礼包一起领掉）
+SHOW_TASKS_AFTER_CHECKIN = True   # 签到后打印「桌面端/移动端礼包领没领到」
+
+CALLBACK_URL = ""                 # 已有回调链接就粘到这里，留空则运行时提示你粘贴
+INSECURE = False                  # 面板走 https 自签证书时改 True
+POLL_TIMEOUT = 90.0               # 换票轮询最长等多久（秒）
+POLL_INTERVAL = 2.0               # 轮询间隔（秒）
+HTTP_TIMEOUT = 30.0               # 单次 HTTP 超时（秒）
+# ═════════════════════════════════════════════════════════════════════════
 
 import argparse
 import json
@@ -30,11 +46,6 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
-
-DEFAULT_BASE = "http://10.0.1.36:7867"
-POLL_INTERVAL = 2.0
-POLL_TIMEOUT = 90.0
-
 
 class Api:
     """面板 HTTP 客户端：统一带 api_key、统一的错误人话。"""
@@ -96,6 +107,16 @@ def parse_callback(raw: str) -> tuple[str, str]:
         if m:
             return m.group(1), state
     return code, state
+
+
+def read_key_file() -> str:
+    """读同目录的 .xhx_key（一行）。这样无参直接跑不必把密钥写进脚本本身。"""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".xhx_key")
+    try:
+        with open(path, encoding="utf-8") as f:
+            return f.read().strip()
+    except OSError:
+        return ""
 
 
 def step(msg: str) -> None:
@@ -179,20 +200,27 @@ def show_tasks(api: Api) -> None:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="小浣熊账号半自动登录（浏览器里那几步由人完成）")
-    ap.add_argument("--base", default=os.environ.get("XHX_BASE", DEFAULT_BASE))
-    ap.add_argument("--key", default=os.environ.get("XHX_API_KEY", ""))
-    ap.add_argument("--realm", default="cn")
-    ap.add_argument("--url", default="", help="已有回调链接时直接传给脚本")
-    ap.add_argument("--no-open", action="store_true", help="不自动打开浏览器")
-    ap.add_argument("--checkin", action="store_true", help="入池后立刻签到一次（含两笔新手礼包）")
-    ap.add_argument("--insecure", action="store_true")
+    ap = argparse.ArgumentParser(
+        description="小浣熊账号半自动登录（参数写在脚本顶部「配置」里；命令行只用于临时覆盖）")
+    ap.add_argument("--base", default=os.environ.get("XHX_BASE") or BASE, help=f"面板地址（配置：{BASE}）")
+    ap.add_argument("--key", default=os.environ.get("XHX_API_KEY") or API_KEY, help="面板 api_key")
+    ap.add_argument("--realm", default=REALM)
+    ap.add_argument("--phone", default=PHONE, help="登录用的手机号（仅用于提醒）")
+    ap.add_argument("--url", default=CALLBACK_URL, help="已有回调链接时直接传，跳过交互式粘贴")
+    ap.add_argument("--no-open", action="store_true", default=not AUTO_OPEN_BROWSER,
+                    help="不自动打开浏览器（配置 AUTO_OPEN_BROWSER=False 等价）")
+    ap.add_argument("--checkin", action="store_true", default=CHECKIN_AFTER_LOGIN,
+                    help="入池后立刻签到一次（含两笔新手礼包）")
+    ap.add_argument("--no-checkin", dest="checkin", action="store_false", help="这次不签到")
+    ap.add_argument("--insecure", action="store_true", default=INSECURE)
     args = ap.parse_args()
 
-    if not args.key:
-        print("缺少面板密钥：用 --key 或环境变量 XHX_API_KEY", file=sys.stderr)
+    key = args.key or read_key_file()
+    if not key:
+        print("缺少面板密钥：把 api_key 填进脚本顶部配置的 API_KEY，"
+              "或写进 scripts/.xhx_key（一行），或用 --key / 环境变量 XHX_API_KEY", file=sys.stderr)
         return 2
-    api = Api(args.base, args.key, insecure=args.insecure)
+    api = Api(args.base, key, insecure=args.insecure, timeout=HTTP_TIMEOUT)
 
     try:
         step("1) 连通性自检")
@@ -212,7 +240,8 @@ def main() -> int:
         else:
             step("3) 在浏览器里完成登录（这几步必须人工：验证码要过阿里云无痕验证）")
             print("      1) 打开授权页 → 点「登录并继续」")
-            print("      2) 输入手机号 → 发送验证码 → 勾选同意 → 填验证码 → 登录")
+            print(f"      2) 输入手机号{('（' + args.phone + '）') if args.phone else ''} → 发送验证码"
+                  f" → 勾选同意 → 填验证码 → 登录")
             print("      3) 点「确认授权」→ 浏览器跳到 http://127.0.0.1:… （打不开是正常的）")
             print("      4) 把地址栏那条完整链接复制回来")
             if not args.no_open:
@@ -262,7 +291,7 @@ def main() -> int:
             ok("授权码已交给登录会话，正在换票…" + ("（这条链接之前提交过，属于重复提交）"
                                               if out.get("duplicate") else ""))
             try:
-                done = poll_until_done(api, session_id)
+                done = poll_until_done(api, session_id, timeout=POLL_TIMEOUT)
             except PanelError as e:
                 fail(f"会话结束：{e.message}")
                 if e.status == 410:
@@ -295,8 +324,9 @@ def main() -> int:
                     print(f"  {line}")
             except PanelError as e:
                 warn(f"签到失败（不影响入池）：{e.message}")
-            print()
-            show_tasks(api)
+            if SHOW_TASKS_AFTER_CHECKIN:
+                print()
+                show_tasks(api)
         return 0
     except PanelError as e:
         fail(e.message)
