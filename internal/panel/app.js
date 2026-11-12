@@ -1778,9 +1778,10 @@ async function sendSmsCode() {
       if (left <= 0) { clearInterval(smsCountdown); smsCountdown = null; btn.disabled = false; }
     }, 1000);
   } catch (e) {
-    // 上游要滑块回执（或其它原因）时把原话展示出来，并指向「自己取码」那条路。
+    // 上游要滑块回执（或其它原因）时把原话展示出来——取码那条路已经写在面板提示里，
+    // 别再往错误信息后面缀一句重复的话。
     $('addErr').hidden = false;
-    $('addErr').textContent = e.message + '（也可以去官方网页/客户端取码，直接填到下面登录）';
+    $('addErr').textContent = e.message;
     btn.disabled = false;
   }
 }
@@ -2040,6 +2041,8 @@ function boot() {
   $('btnRefreshLogin').onclick = refreshLogin;
   $('btnSmsSend').onclick = sendSmsCode;
   $('btnSmsLogin').onclick = loginBySms;
+  // 官方登录页：发码要过它的人机校验，这是唯一能拿到验证码的地方。
+  $('btnSmsOfficial').onclick = () => window.open('https://xiaohuanxiong.com/account?lang=zh', '_blank', 'noopener');
   // 回车即登录（验证码填完习惯性敲回车），与回调链接那条一致。
   $('smsCode').addEventListener('keydown', e => { if (e.key === 'Enter') loginBySms(); });
   $('btnKey').onclick = submitKey;

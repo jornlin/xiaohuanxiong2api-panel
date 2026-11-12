@@ -1193,14 +1193,17 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <select id="smsNation" style="max-width:120px"></select>
             <input id="smsPhone" spellcheck="false" autocomplete="off" inputmode="numeric"
                    placeholder="不带区号的手机号">
-            <button class="xs" id="btnSmsSend">发送验证码</button>
+            <button class="xs" id="btnSmsSend" title="上游发码要人机校验（滑块），官方页面之外通常拿不到回执；拿不到时请走「去官方页面取码」">发送验证码</button>
+            <button class="xs" id="btnSmsOfficial" title="打开官方登录页（手机号登录 / 验证码登录），在那里过滑块取码">去官方页面取码</button>
           </div>
-          <span class="hint">验证码发到官方账号绑定的手机号上；发送后需等倒计时结束才能重发。</span>
+          <span class="hint">上游发码要人机校验（阿里云滑块），那个回执只有官方页面能拿到——
+            所以标准流程是：官方页面点「验证码登录」过滑块取码 → 回到这里填手机号 + 验证码。
+            <strong>登录这一步不需要滑块</strong>，凭验证码就能把账号收进池子。</span>
         </label>
         <label class="fld"><span class="lb">验证码</span>
           <input id="smsCode" spellcheck="false" autocomplete="one-time-code" inputmode="numeric"
                  maxlength="8" placeholder="短信里的数字验证码">
-          <span class="hint">收不到短信时，可去官方网页/客户端点「验证码登录」取码，直接填这里登录（这条端点不需要滑块）。</span>
+          <span class="hint">验证码只用于换取凭证；登录成功后账号自动落盘入池，与扫码进来的完全等价。</span>
         </label>
       </div>
       <div id="addTabBrowser" class="tab-panel" hidden>

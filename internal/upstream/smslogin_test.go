@@ -151,6 +151,30 @@ func TestLoginWithSmsFriendlyErrors(t *testing.T) {
 	}
 }
 
+// TestSendSmsCaptchaErrorExplained 发码被人机校验挡住时，要说清「为什么面板做不到」
+// 以及「去哪儿取码」——上游这条失败没有已收录的业务码（官方 web 端也只用一句
+// captchaVerifyFailed），所以按 message 文本判。
+func TestSendSmsCaptchaErrorExplained(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"code":100008,"message":"captcha_verify_error","details":"captcha verify failed"}`)
+	}))
+	defer srv.Close()
+
+	up := New()
+	up.SetAgentHosts(srv.URL, srv.URL)
+
+	err := up.SendSmsCode("86", "13800000001", "")
+	if err == nil {
+		t.Fatal("应当报错")
+	}
+	for _, want := range []string{"人机校验", "官方页面", "不需要滑块"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("错误信息 %q 缺少 %q", err.Error(), want)
+		}
+	}
+}
+
 // TestSmsNationsFallback 区号拉不到时用内置兜底表（不该让登录页不可用）。
 func TestSmsNationsFallback(t *testing.T) {
 	up := New()

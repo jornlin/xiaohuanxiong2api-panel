@@ -2,6 +2,7 @@ package upstream
 
 import (
 	"net/http"
+	"strings"
 
 	"github.com/misakano7545/xiaohuanxiong2api-panel/internal/auth"
 )
@@ -160,8 +161,20 @@ func (c *Client) LoginWithSms(nation, phone, code string) (*auth.Auth, error) {
 // *Error 了，等拿到错误再判类型已经晚了——实测漏翻过一次，面板上只剩英文原话。
 // 业务码认不出来时保留 payloadOf 的原错误（含 HTTP 状态与上游原话）。
 func smsFriendly(resp *apiResponse, err error) error {
-	code, ok := businessCodeOf(resp.Body)
-	if !ok {
+	raw := businessMessageOf(resp.Body)
+	code, hasCode := businessCodeOf(resp.Body)
+
+	// 人机校验（阿里云滑块）单独说清楚：发码这一步上游要 captcha_param，而回执只有
+	// 官方页面里的滑块能拿到（面板是内网地址，不在那个 SceneId 的域白名单里）。
+	// 这条失败**没有**已收录的业务码（官方 web 端也只把它归成一句 captchaVerifyFailed），
+	// 所以按 message 文本判——它是稳定的英文标识。
+	if strings.Contains(raw, "captcha") {
+		return &BusinessError{Code: code, Message: "上游要求人机校验（滑块），面板这边拿不到回执；" +
+			"请到官方页面点「验证码登录」取码（xiaohuanxiong.com/account 或官方客户端），" +
+			"再把手机号 + 验证码填到这里登录（登录这条不需要滑块）"}
+	}
+
+	if !hasCode {
 		return err
 	}
 	msg, known := map[int]string{
@@ -172,7 +185,7 @@ func smsFriendly(resp *apiResponse, err error) error {
 	if !known {
 		return err
 	}
-	if raw := businessMessageOf(resp.Body); raw != "" {
+	if raw != "" {
 		msg += "（上游：" + raw + "）"
 	}
 	return &BusinessError{Code: code, Message: msg}
