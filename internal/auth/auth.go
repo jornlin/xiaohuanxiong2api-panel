@@ -45,10 +45,12 @@ type Auth struct {
 	Data
 	mu       sync.RWMutex
 	FilePath string `json:"-"`
-	// mobileGranted 手机端首登奖励是否已结算。**进程内记忆、不落盘**：上游对同一
-	// 账号幂等（领过回 granted:false），重启后多打一次只是白读一次；为它改账号文件
-	// 格式不值得。
-	mobileGranted bool
+	// desktopGranted / mobileGranted 是两笔一次性新手礼包（各 3000 分）是否已经
+	// **问过上游**（不问 granted 真假：上游对领过的号回 granted=false，那同样是
+	// 「已结算」）。**进程内记忆、不落盘**：上游对同一账号幂等，重启后多打一次只是
+	// 白读一次；为它改账号文件格式不值得。
+	desktopGranted bool
+	mobileGranted  bool
 }
 
 // Data 是可序列化字段（不含锁与路径，避免拷锁）。
@@ -169,6 +171,20 @@ func (a *Auth) CheckedInToday() bool {
 	return a.CheckedIn == time.Now().Format("2006-01-02")
 }
 
+// DesktopGrantDone 桌面端礼包是否已经问过上游（见 Auth.desktopGranted 的口径）。
+func (a *Auth) DesktopGrantDone() bool {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.desktopGranted
+}
+
+// MarkDesktopGrantDone 记一次桌面端礼包已结算（无论 granted 真假）。
+func (a *Auth) MarkDesktopGrantDone() {
+	a.mu.Lock()
+	a.desktopGranted = true
+	a.mu.Unlock()
+}
+
 // MobileGrantDone 手机端首登奖励是否已结算（见 Auth.mobileGranted 的口径）。
 func (a *Auth) MobileGrantDone() bool {
 	a.mu.RLock()
@@ -180,6 +196,15 @@ func (a *Auth) MobileGrantDone() bool {
 func (a *Auth) MarkMobileGrantDone() {
 	a.mu.Lock()
 	a.mobileGranted = true
+	a.mu.Unlock()
+}
+
+// ResetGrantMarks 抹掉两笔礼包的「已问过」记忆，让面板上的手动领取能真问一次上游。
+// 给用户手动点「领新手礼包」用：进程内标记只是省一次幂等请求，不该拦下显式点击。
+func (a *Auth) ResetGrantMarks() {
+	a.mu.Lock()
+	a.desktopGranted = false
+	a.mobileGranted = false
 	a.mu.Unlock()
 }
 

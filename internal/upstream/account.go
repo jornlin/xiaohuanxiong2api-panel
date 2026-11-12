@@ -398,19 +398,34 @@ func (c *Client) DailyGrant(a *auth.Auth) (today, ever bool, err error) {
 	return today, ever, nil
 }
 
+// ClaimDesktopGrant 领桌面端礼包（一次性新手福利之一，与每日 300 分无关）。
+//
+// 与 CheckinClaim 是同一条端点：上游对「还没领的桌面端礼包」和「手动登录领取」
+// 共用 login/points/grant，granted 说的是本次到底发出去了什么（实测首次回
+// granted=true + popup.source=desktop_login，此后恒 false）。所以调用方只需
+// 关心 granted，不必区分是礼包还是每日兜底。
+func (c *Client) ClaimDesktopGrant(a *auth.Auth) (bool, error) {
+	resp, err := c.doJSON(http.MethodPost, c.desktopBase()+PointsGrantPath, map[string]any{}, c.authHeader(a))
+	if err != nil {
+		return false, err
+	}
+	data, err := payloadOf(resp, "桌面端登录领取")
+	if err != nil {
+		return false, err
+	}
+	granted, _ := data["granted"].(bool)
+	return granted, nil
+}
+
 // CheckinClaim 走登录领取接口（上游幂等：今日已发放则 granted=false）。
 // 只有 granted=true 才记本地台账——发放本体是服务端 00:00 做的，这里只是兜住
 // 登录弹窗式的手动领取路径。
 func (c *Client) CheckinClaim(a *auth.Auth) error {
-	resp, err := c.doJSON(http.MethodPost, c.desktopBase()+PointsGrantPath, map[string]any{}, c.authHeader(a))
+	granted, err := c.ClaimDesktopGrant(a)
 	if err != nil {
 		return err
 	}
-	data, err := payloadOf(resp, "登录领取积分")
-	if err != nil {
-		return err
-	}
-	if granted, _ := data["granted"].(bool); granted {
+	if granted {
 		a.MarkCheckedIn()
 	}
 	return nil

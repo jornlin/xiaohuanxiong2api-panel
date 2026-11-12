@@ -495,6 +495,9 @@ type CheckinResult struct {
 	Status   string `json:"status"`            // ok | already | skipped（上游未开）| failed
 	Credits  int64  `json:"credits,omitempty"` // 本次到账（仅 ok 非 0，取上游 status 告知的可领额度）
 	Reason   string `json:"reason,omitempty"`  // 失败原因原文
+	// Grants 是这一轮顺带结算的一次性新手礼包（各 3000 分）。**不计入 Credits**：
+	// Credits 是每日签到的口径，礼包混进去会让面板把一次性收入报成当天签到收益。
+	Grants []NewcomerGrant `json:"grants,omitempty"`
 }
 
 // CheckinUID 签到并按剩余积分解冻单个账号。禁用返回 ErrDisabled。
@@ -612,6 +615,12 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 			}
 		}
 	}
+	// 一次性新手礼包（桌面端/移动端各 3000 分）在这里无条件补一次：
+	// 每日分是上游 00:00 自动发的，上面几乎总走「already」短路，claim 分支
+	// 根本不执行——礼包不能跟着签到结果一起被跳过（见 claimNewcomerGrants）。
+	if grants := s.claimNewcomerGrants(a, false); len(grants) > 0 {
+		res.Grants = grants
+	}
 	if res.Status == "" {
 		res.Status = "failed"
 	}
@@ -667,7 +676,10 @@ func checkinCooldown(err error) (time.Duration, bool) {
 func (s *Scheduler) claimWithRetry(a *auth.Auth) error {
 	err := s.cfg.Upstream.CheckinClaim(a)
 	if err == nil {
-		s.claimMobileGrant(a)
+		// 桌面端那笔（与每日领取决同一条端点）刚打过，记账，
+		// 免得紧随其后的 claimNewcomerGrants 再打一次。
+		a.MarkDesktopGrantDone()
+		s.claimNewcomerGrants(a, false)
 		return nil
 	}
 	if !isNetworkError(err) {
@@ -677,26 +689,99 @@ func (s *Scheduler) claimWithRetry(a *auth.Auth) error {
 	if err := s.cfg.Upstream.CheckinClaim(a); err != nil {
 		return err
 	}
-	s.claimMobileGrant(a)
+	a.MarkDesktopGrantDone()
+	s.claimNewcomerGrants(a, false)
 	return nil
 }
 
-// claimMobileGrant 顺手领手机端首登奖励：一次性福利，与桌面端那笔额度独立。
+// NewcomerGrant 是一笔一次性新手礼包的领取结果（面板如实回报用）。
+// 一笔一次失败：Error 非空时 Granted 无意义，且账号上的「已问过」标记没落，
+// 下一轮签到会自己重试。
+type NewcomerGrant struct {
+	UID     string `json:"uid,omitempty"` // 面板按号回报时填
+	Key     string `json:"key"`           // desktop_login | mobile_login
+	Granted bool   `json:"granted"`       // false = 上游说这个号早领过了
+	Error   string `json:"error,omitempty"`
+}
+
+// claimNewcomerGrants 领两笔一次性新手礼包：桌面端 + 移动端，各 3000 分。
 //
-// 失败只记日志：一笔一次性奖励不该让整轮签到判失败（它跟每日积分无关）。
-// 结算状态只在进程内记（见 auth.Auth.mobileGranted），重启后多打一次上游，
-// 幂等接口回 granted:false 即可。
-func (s *Scheduler) claimMobileGrant(a *auth.Auth) {
-	if a.MobileGrantDone() {
-		return
+// 必须独立成一步、且不依赖签到结果：每日 300 分是上游 00:00 自动入账的，
+// CheckinStatus 几乎总是 checked_in=true，签到流程走「already」短路、根本到不了
+// claim 分支——礼包挂在 claim 成功路径上等于一辈子领不到（uid 7982218 实测：
+// 只有注册礼包 + 桌面端到账，移动端那 3000 从没被试过）。所以每轮签到都无条件
+// 试一次，用账号上的「已问过」标记压住重复请求。
+//
+// force=true 先抹掉标记再问，给面板的手动领取用（显式点击不该被进程内标记拦下）。
+func (s *Scheduler) claimNewcomerGrants(a *auth.Auth, force bool) []NewcomerGrant {
+	if force {
+		a.ResetGrantMarks()
 	}
-	granted, err := s.cfg.Upstream.ClaimMobileGrant(a)
-	if err != nil {
-		log.Printf("mobile-grant %s: %v", a.UID, err)
-		return
+	var out []NewcomerGrant
+	if !a.DesktopGrantDone() {
+		granted, err := s.cfg.Upstream.ClaimDesktopGrant(a)
+		switch {
+		case err != nil:
+			log.Printf("desktop-grant %s: %v", a.UID, err)
+			out = append(out, NewcomerGrant{Key: "desktop_login", Error: err.Error()})
+		default:
+			a.MarkDesktopGrantDone()
+			log.Printf("desktop-grant %s: granted=%v", a.UID, granted)
+			out = append(out, NewcomerGrant{Key: "desktop_login", Granted: granted})
+		}
 	}
-	a.MarkMobileGrantDone()
-	log.Printf("mobile-grant %s: granted=%v", a.UID, granted)
+	if !a.MobileGrantDone() {
+		granted, err := s.cfg.Upstream.ClaimMobileGrant(a)
+		switch {
+		case err != nil:
+			log.Printf("mobile-grant %s: %v", a.UID, err)
+			out = append(out, NewcomerGrant{Key: "mobile_login", Error: err.Error()})
+		default:
+			a.MarkMobileGrantDone()
+			log.Printf("mobile-grant %s: granted=%v", a.UID, granted)
+			out = append(out, NewcomerGrant{Key: "mobile_login", Granted: granted})
+		}
+	}
+	return out
+}
+
+// ClaimNewcomerNow 领单个账号的一次性新手礼包（面板按钮，强制问上游）。
+func (s *Scheduler) ClaimNewcomerNow(uid string) ([]NewcomerGrant, error) {
+	st, ok := s.cfg.Pool.Status(uid)
+	if !ok {
+		return nil, ErrNotFound
+	}
+	if st.Disabled {
+		return nil, ErrDisabled
+	}
+	a := s.cfg.Pool.AuthByUID(uid)
+	if a == nil {
+		return nil, ErrNotFound
+	}
+	grants := s.claimNewcomerGrants(a, true)
+	for i := range grants {
+		grants[i].UID = uid
+	}
+	return grants, nil
+}
+
+// RunNewcomerNow 对全池领一遍一次性新手礼包（面板按钮）。禁用的跳过。
+func (s *Scheduler) RunNewcomerNow() []NewcomerGrant {
+	out := []NewcomerGrant{}
+	for _, st := range s.cfg.Pool.List() {
+		if st.Disabled {
+			continue
+		}
+		a := s.cfg.Pool.AuthByUID(st.UID)
+		if a == nil {
+			continue
+		}
+		for _, g := range s.claimNewcomerGrants(a, true) {
+			g.UID = st.UID
+			out = append(out, g)
+		}
+	}
+	return out
 }
 
 // isNetworkError 判断是否传输层失败：http.Client 会把传输错误包成 *url.Error，
