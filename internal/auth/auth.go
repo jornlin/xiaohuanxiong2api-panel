@@ -301,16 +301,20 @@ func (a *Auth) SaveAtomic() error {
 // snapshotLocked 返回可序列化副本（调用方持锁）。
 func (a *Auth) snapshotLocked() Data {
 	return Data{
-		AccessToken:  a.AccessToken,
-		RefreshToken: a.RefreshToken,
-		ExpiresAt:    a.ExpiresAt,
-		UID:          a.UID,
-		Nickname:     a.Nickname,
-		Email:        a.Email,
-		MachineID:    a.MachineID,
-		Credit:       a.Credit,
-		CreditAt:     a.CreditAt,
-		CheckedIn:    a.CheckedIn,
+		AccessToken:    a.AccessToken,
+		RefreshToken:   a.RefreshToken,
+		ExpiresAt:      a.ExpiresAt,
+		UID:            a.UID,
+		Nickname:       a.Nickname,
+		Email:          a.Email,
+		Phone:          a.Phone,
+		NationCode:     a.NationCode,
+		MachineID:      a.MachineID,
+		Credit:         a.Credit,
+		CreditAt:       a.CreditAt,
+		CheckedIn:      a.CheckedIn,
+		DesktopGrantAt: a.DesktopGrantAt,
+		MobileGrantAt:  a.MobileGrantAt,
 	}
 }
 
