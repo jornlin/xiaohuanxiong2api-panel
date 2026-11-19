@@ -71,9 +71,11 @@ func (f *fakeRaccoon) handler() http.Handler {
 	mux.HandleFunc("/api/web/desktop/v1/login/points/grant", func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, `{"code":0,"data":{"granted":false,"popup":null}}`)
 	})
-	mux.HandleFunc("/bills", func(w http.ResponseWriter, r *http.Request) {
+	bills := func(w http.ResponseWriter, r *http.Request) {
 		_, _ = io.WriteString(w, `{"code":0,"data":{"items":[]}}`)
-	})
+	}
+	mux.HandleFunc("/bills", bills)
+	mux.HandleFunc("/v2/bills", bills) // 签到状态与最近流水已迁到 v2
 	mux.HandleFunc("/refresh", func(w http.ResponseWriter, r *http.Request) {
 		f.refreshCalls++
 		_, _ = io.WriteString(w, `{"code":0,"data":{"access_token":"fresh-access","refresh_token":"fresh-refresh","user_id":"u-1"}}`)

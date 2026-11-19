@@ -27,14 +27,18 @@ func TestCheckinFlow(t *testing.T) {
 				remain = 300
 			}
 			_, _ = io.WriteString(w, `{"code":0,"data":{"available_points":`+fmt.Sprint(remain)+`}}`)
-		case "/bills":
+		case "/bills", "/v2/bills":
 			// 复核口径：流水里今天已有 daily_grant 才算「签到成功」。
+			// 领取前返回**昨天**那条：证明这个号确实有每日积分（否则新版会直接
+			// 判「从未开通」跳过领取，见 TestCheckinSkipsAccountWithoutDailyGrant）。
 			if claimed {
 				today := time.Now().In(time.FixedZone("CST", 8*3600)).Format("2006-01-02")
 				_, _ = io.WriteString(w, `{"code":0,"data":{"items":[{"biz_type":"daily_grant",`+
-					`"points":300,"grant_at":"`+today+`T00:00:00+08:00"}]}}`)
+					`"points":300,"created_at":"`+today+`T00:00:00+08:00"}]}}`)
 			} else {
-				_, _ = io.WriteString(w, `{"code":0,"data":{"items":[]}}`)
+				yesterday := time.Now().AddDate(0, 0, -1).In(time.FixedZone("CST", 8*3600)).Format("2006-01-02")
+				_, _ = io.WriteString(w, `{"code":0,"data":{"items":[{"biz_type":"daily_grant",`+
+					`"points":300,"created_at":"`+yesterday+`T00:00:00+08:00"}]}}`)
 			}
 		case "/api/web/desktop/v1/login/points/grant":
 			claimed = true
@@ -97,7 +101,7 @@ func TestCheckinSkipsAccountWithoutDailyGrant(t *testing.T) {
 		switch r.URL.Path {
 		case "/balance":
 			_, _ = io.WriteString(w, `{"code":0,"data":{"available_points":5968,"daily_points":0,"reward_points":5968}}`)
-		case "/bills":
+		case "/bills", "/v2/bills":
 			// 只有注册礼包与桌面端登录奖励，一条 daily_grant 都没有。
 			_, _ = io.WriteString(w, `{"code":0,"data":{"items":[
 				{"biz_type":"reward_grant","points":3000,"created_at":"2026-10-21T15:22:15+08:00"},
@@ -146,7 +150,7 @@ func TestCheckinPendingForNewAccount(t *testing.T) {
 		switch r.URL.Path {
 		case "/balance":
 			_, _ = io.WriteString(w, `{"code":0,"data":{"available_points":6000,"reward_points":6000}}`)
-		case "/bills":
+		case "/bills", "/v2/bills":
 			// 只有注册礼包与登录奖励，没有 daily_grant。
 			_, _ = io.WriteString(w, `{"code":0,"data":{"items":[
 				{"biz_type":"reward_grant","points":3000,"created_at":"2026-10-21T05:46:03+08:00"},
@@ -185,5 +189,50 @@ func TestCheckinPendingForNewAccount(t *testing.T) {
 	}
 	if p.CheckinCooling("u-9") {
 		t.Error("pending 不该给账号记签到冷却")
+	}
+}
+
+// TestCheckinSkipsStoppedDailyGrant 曾经发过每日积分、最近十几天没再发：
+// 判 skipped，不记签到冷却。老逻辑只要有历史就报「复核未通过」，每轮 5 分钟冷却，
+// 面板长期挂着一片「签到冷却」——这正是「动不动冷却」的主要来源。
+func TestCheckinSkipsStoppedDailyGrant(t *testing.T) {
+	old := time.Now().AddDate(0, 0, -6).In(time.FixedZone("CST", 8*3600)).Format("2006-01-02")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/balance":
+			_, _ = io.WriteString(w, `{"code":0,"data":{"available_points":8000}}`)
+		case "/bills", "/v2/bills":
+			_, _ = io.WriteString(w, `{"code":0,"data":{"has_more":false,"items":[
+				{"biz_type":"daily_grant","points":300,"created_at":"`+old+`T00:00:00+08:00"}]}}`)
+		case "/api/web/desktop/v1/login/points/grant", "/api/web/mobile/v1/login/points/grant":
+			_, _ = io.WriteString(w, `{"code":0,"data":{"granted":false,"popup":null}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	up := upstream.New()
+	up.SetAPIHosts(srv.URL, srv.URL)
+	up.SetAgentHosts(srv.URL, srv.URL)
+	p := pool.New("")
+	p.Add(&auth.Auth{Data: auth.Data{
+		AccessToken: "dt-old", ExpiresAt: time.Now().Add(48 * time.Hour).UnixMilli(),
+		MachineID: "m-8", UID: "u-old",
+	}})
+	s := New(Config{Pool: p, Upstream: up, CheckinEnabled: true, KeepaliveEnabled: true})
+
+	res, err := s.CheckinUID("u-old")
+	if err != nil {
+		t.Fatalf("停发不该报错: %v（status=%q）", err, res.Status)
+	}
+	if res.Status != "skipped" {
+		t.Fatalf("状态 = %q，期望 skipped（reason=%q）", res.Status, res.Reason)
+	}
+	if !strings.Contains(res.Reason, "未再发放") {
+		t.Errorf("skipped 原因没说清停发：%q", res.Reason)
+	}
+	if p.CheckinCooling("u-old") {
+		t.Error("停发不该给账号记签到冷却")
 	}
 }

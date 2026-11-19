@@ -26,7 +26,7 @@ func TestGrantsClaimedWhenCheckinAlreadyDone(t *testing.T) {
 		switch r.URL.Path {
 		case "/balance":
 			_, _ = io.WriteString(w, `{"code":0,"data":{"available_points":6300,"daily_points":300}}`)
-		case "/bills":
+		case "/bills", "/v2/bills":
 			// 今天已有 daily_grant：CheckinStatus 判「已签」，签到流程走 already。
 			today := time.Now().In(time.FixedZone("CST", 8*3600)).Format("2006-01-02")
 			_, _ = io.WriteString(w, `{"code":0,"data":{"items":[{"biz_type":"daily_grant",`+
@@ -113,7 +113,7 @@ func TestGrantsNoDuplicateOnFailure(t *testing.T) {
 				switch r.URL.Path {
 				case "/balance":
 					_, _ = io.WriteString(w, `{"code":0,"data":{"available_points":100,"daily_points":300}}`)
-				case "/bills":
+				case "/bills", "/v2/bills":
 					// 流水里没有 daily_grant → 签到走 claim 分支（要试一次每日领取），
 					// 礼包步骤紧跟在它后面——重复请求就发生在这两处之间。
 					_, _ = io.WriteString(w, `{"code":0,"data":{"items":[]}}`)
@@ -246,7 +246,7 @@ func TestDesktopGrantReportedOnClaimPath(t *testing.T) {
 		switch r.URL.Path {
 		case "/balance":
 			_, _ = io.WriteString(w, `{"code":0,"data":{"available_points":5000,"daily_points":300}}`)
-		case "/bills":
+		case "/bills", "/v2/bills":
 			// 流水空 → 今天还没签、也没有 daily_grant → 走 default 分支（要试每日领取）
 			_, _ = io.WriteString(w, `{"code":0,"data":{"items":[]}}`)
 		case "/api/web/desktop/v1/login/points/grant":

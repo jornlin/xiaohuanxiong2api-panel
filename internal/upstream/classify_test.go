@@ -20,8 +20,9 @@ func TestClassifyNoFalsePenalty(t *testing.T) {
 		{"积分不足", 400, `{"code":14018,"message":"积分不足"}`, ErrPlanLimit},
 		{"credits exhausted", 400, `{"message":"credits exhausted"}`, ErrPlanLimit},
 		{"insufficient credit", 402, `{"message":"insufficient credit balance"}`, ErrPlanLimit},
-		// 403 是权限 ≠ 额度；401 是登录态
-		{"403 forbidden", 403, `{"message":"insufficient permissions to access this resource"}`, ErrSessionDead},
+		// 403 是权限（某接口只对网页会话开放、模型权限不足），不是登录态失效：
+		// 判成 session dead 会让好号在连续三次 403 后被自动禁用（bills v1 的 403 就是实例）。
+		{"403 forbidden", 403, `{"message":"insufficient permissions to access this resource"}`, ErrClient},
 		{"401", 401, `{"message":"unauthorized"}`, ErrSessionDead},
 		// 499 是调用方断开：不能换号重发
 		{"499 abort", 499, `client has aborted request`, ErrClient},

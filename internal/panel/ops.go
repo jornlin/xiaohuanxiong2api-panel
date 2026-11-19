@@ -354,14 +354,19 @@ func (p *Panel) checkinStatus(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		rw := row{UID: st.UID, Nickname: st.Nickname, Realm: st.Realm}
-		ci, credits, enable, err := p.cfg.Upstream.CheckinStatus(a)
+		st, err := p.cfg.Upstream.CheckinStatus(a)
 		switch {
 		case err != nil:
 			rw.Error = publicErr(err)
 			failed++
+		case st.GrantErr != nil:
+			// 流水接口不可用（v1 已废弃 403 / 网络抖动）：签到状态未知，
+			// 既不算已签也不算未签，别让接口问题渲染成一片「未签到」。
+			rw.Error = "积分流水查询失败：" + publicErr(st.GrantErr)
+			failed++
 		default:
-			rw.Checked, rw.Credits, rw.Enable = ci, credits, enable
-			if ci {
+			rw.Checked, rw.Credits, rw.Enable = st.CheckedIn, st.Credits, st.Enable
+			if st.CheckedIn {
 				checked++
 			} else {
 				unchecked++

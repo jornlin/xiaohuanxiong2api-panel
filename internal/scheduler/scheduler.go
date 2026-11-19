@@ -249,6 +249,14 @@ func (s *Scheduler) Run(ctx context.Context) {
 // checkinRefreshSkew 签到前预刷新窗口：access token 剩不到这么久就先换一张。
 const checkinRefreshSkew = 2 * time.Hour
 
+// dailyGrantStaleAfter 「每日积分已停发」的判定窗口：最近一次 daily_grant 超过
+// 这么多天没再出现，就认为上游不再给这个号发每日积分，签到轮次直接 skipped。
+//
+// 实测 2026-11-19：一批老号的最后一次 daily_grant 停在 11-12，之后每天都没有；
+// 老逻辑（有历史就判「复核未通过」）会让它们每轮签到失败并记 5 分钟冷却，
+// 面板长期挂着一片「签到冷却」——那不是账号在冷却，是规则没跟上上游。
+const dailyGrantStaleAfter = 3 * 24 * time.Hour
+
 // checkinGap / checkinGapJitter 多账号签到之间的间隔（基准 + 0..jitter 抖动）。
 // 上游按设备/时段限流，背靠背连签容易吃到 9074「当前参与用户太多」——star620/TraeTools
 // 用的是同一手（账号间 3~6s 随机间隔）。三条号也就多花 ~10s，且这是小时级任务。
@@ -534,7 +542,8 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 			log.Printf("checkin refresh %s: 新票落盘失败: %v", uid, serr)
 		}
 	}
-	checkedIn, reward, enable, serr := s.cfg.Upstream.CheckinStatus(a)
+	cst, serr := s.cfg.Upstream.CheckinStatus(a)
+	checkedIn, reward, enable := cst.CheckedIn, cst.Credits, cst.Enable
 	// token 被别处轮换/提前吊销 → status 报 session 失效：换一张新票再查一次，别把
 	// 「票过期」记成签到失败（这条只重试一次，重试前必须真的换到了新票）。
 	if isSessionDead(serr) {
@@ -545,7 +554,8 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 			if serr := a.SaveAtomic(); serr != nil {
 				log.Printf("checkin token refresh %s: 新票落盘失败: %v", uid, serr)
 			}
-			if checkedIn, reward, enable, serr = s.cfg.Upstream.CheckinStatus(a); serr == nil {
+			if cst, serr = s.cfg.Upstream.CheckinStatus(a); serr == nil {
+				checkedIn, reward, enable = cst.CheckedIn, cst.Credits, cst.Enable
 				log.Printf("checkin status %s: status ok after token refresh", uid)
 			}
 		}
@@ -559,6 +569,13 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 	case serr != nil:
 		checkinErr = serr
 		log.Printf("checkin status %s: %v", uid, serr)
+	case cst.GrantErr != nil:
+		// 流水接口不可用（v1 已废弃返回 403 / 网络抖动）：签到状态**未知**。
+		// 不要判失败、不要记冷却——接口问题不该变成全池的「签到失败 + 冷却」循环
+		// （2026-11-19 实测：13/15 个号因此每轮失败并反复冷却）。
+		res.Status = "skipped"
+		res.Reason = "签到状态查询失败（积分流水接口不可用）：" + cst.GrantErr.Error()
+		log.Printf("checkin %s: skipped（流水查询失败：%v）", uid, cst.GrantErr)
 	case checkedIn:
 		res.Status = "already"
 		log.Printf("checkin %s: already checked in", uid)
@@ -567,6 +584,34 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 		res.Status = "skipped"
 		log.Printf("checkin %s: upstream disabled (enable=false)", uid)
 	default:
+		// 上游已经不给这个号发每日积分：没有「签到」这回事。继续打 grant 端点只会
+		// 每轮白打一次 + 触发风控，复核照样 false。直接如实报 skipped，不记冷却。
+		//
+		// 从未发过还要再分两种：当天新注册的号是 pending（上游 00:00 的批次今天
+		// 还没轮到它），不是「未开通」。只在 ever=false 时查一次注册时间，老号
+		// 不需要多打这一枪。
+		if !cst.EverGranted {
+			if created, ok := s.cfg.Upstream.UserCreatedAt(a); ok && sameDayShanghai(created, time.Now()) {
+				res.Status = "pending"
+				res.Reason = "上游今日尚未发放每日积分（" + created.In(shanghaiTZ).Format("2006-01-02 15:04") +
+					" 注册的新号，首批在次日 00:00 发放）"
+				log.Printf("checkin %s: pending（%s 注册的新号，等次日 00:00 首批每日积分）",
+					uid, created.In(shanghaiTZ).Format("2006-01-02 15:04"))
+			} else {
+				res.Status = "skipped"
+				res.Reason = "上游未给该账号开通每日积分（发放流水里没有 daily_grant），无需签到"
+				log.Printf("checkin %s: skipped（从未有过 daily_grant）", uid)
+			}
+			break
+		}
+		if !cst.LastGrant.IsZero() && time.Since(cst.LastGrant) > dailyGrantStaleAfter {
+			res.Status = "skipped"
+			res.Reason = fmt.Sprintf("上游近期未再发放每日积分（最近一次 %s，已 %d 天）：无需签到",
+				cst.LastGrant.In(shanghaiTZ).Format("2006-01-02"), int(time.Since(cst.LastGrant).Hours()/24))
+			log.Printf("checkin %s: skipped（每日积分已停发，最近一次 %s）",
+				uid, cst.LastGrant.In(shanghaiTZ).Format("2006-01-02"))
+			break
+		}
 		var claimErr error
 		// 桌面端那笔礼包就是被这次"每日登录领取"顺带领掉的：把结果留好，
 		// 否则面板只会看到移动端那笔，看着像漏领。
@@ -594,25 +639,26 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 		// 复核（claim 成功与 9095 两条路径都要走）：只有 status 说 checked_in 才算签上。
 		// claim 回 code 0 不等于真签上（上游偶发只回执不落账）；9095 更是设备维度信息。
 		if checkinErr == nil {
-			if verified, _, _, verr := s.cfg.Upstream.CheckinStatus(a); verr != nil {
+			if vst, verr := s.cfg.Upstream.CheckinStatus(a); verr != nil {
 				checkinErr = fmt.Errorf("签到复核失败：%w", verr)
 				log.Printf("checkin verify %s: %v", uid, verr)
-			} else if !verified {
+			} else if vst.GrantErr != nil {
+				// 复核同样依赖流水：查不到就别判失败（接口问题不是账号问题）。
+				res.Status = "skipped"
+				res.Reason = "签到复核跳过：积分流水接口不可用（" + vst.GrantErr.Error() + "）"
+				log.Printf("checkin verify %s: skipped（流水查询失败：%v）", uid, vst.GrantErr)
+			} else if !vst.CheckedIn {
 				// 当天新注册的号：每日积分发放是上游 00:00 的定时任务，今天这批根本还没发，
 				// bills 里不会有 daily_grant。这不是签到失败（claim 该拿的登录奖励已拿到），
 				// 报 failed 还会给它记一次 5 分钟签到冷却、把面板刷成一脸错。
+				// 「从没发过 / 已经停发」在进 claim 之前就短路成 skipped 了，这里只剩
+				// 「最近还在发、今天暂时没到」的情况。
 				if created, ok := s.cfg.Upstream.UserCreatedAt(a); ok && sameDayShanghai(created, time.Now()) {
 					res.Status = "pending"
 					res.Reason = "上游今日尚未发放每日积分（" + created.In(shanghaiTZ).Format("2006-01-02 15:04") +
 						" 注册的新号，首批在次日 00:00 发放）"
 					log.Printf("checkin %s: pending（%s 注册的新号，等次日 00:00 首批每日积分）",
 						uid, created.In(shanghaiTZ).Format("2006-01-02 15:04"))
-				} else if _, ever, derr := s.cfg.Upstream.DailyGrant(a); derr == nil && !ever {
-					// 上游从没给这个号发过每日积分（流水里一条 daily_grant 都没有）：
-					// 再怎么 claim 也不会有，报 failed 只会每轮刷一条假失败 + 记冷却。
-					res.Status = "skipped"
-					res.Reason = "上游未给该账号开通每日积分（积分流水无 daily_grant，daily_points=0），无需签到"
-					log.Printf("checkin %s: skipped（流水里从来没有 daily_grant，上游未开通每日积分）", uid)
 				} else {
 					checkinErr = &upstream.BusinessError{Message: "签到复核未通过：上游仍报未签到"}
 					log.Printf("checkin verify %s: status still checked_in=false", uid)

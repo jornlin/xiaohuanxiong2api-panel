@@ -31,7 +31,7 @@ func newTestPanel(t *testing.T) (*Panel, *upstream.Client, *pool.Pool) {
 		case "/balance":
 			_, _ = io.WriteString(w, `{"code":0,"data":{"available_points":120,"daily_points":0,
 				"monthly_points":50,"reward_points":10,"topup_points":30}}`)
-		case "/bills":
+		case "/bills", "/v2/bills":
 			_, _ = io.WriteString(w, `{"code":0,"data":{"items":[]}}`)
 		case "/api/web/desktop/v1/login/points/grant":
 			_, _ = io.WriteString(w, `{"code":0,"data":{"granted":false,"popup":null}}`)

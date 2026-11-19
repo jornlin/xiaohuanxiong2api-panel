@@ -92,7 +92,7 @@ func TestPanelSmsLogin(t *testing.T) {
 			_, _ = io.WriteString(w, `{"code":0,"data":{"id":"7982218","name":"RaccoonJayden"}}`)
 		case "/balance":
 			_, _ = io.WriteString(w, `{"code":0,"data":{"available_points":9300,"daily_points":300}}`)
-		case "/bills":
+		case "/bills", "/v2/bills":
 			_, _ = io.WriteString(w, `{"code":0,"data":{"items":[]}}`)
 		default:
 			http.NotFound(w, r)

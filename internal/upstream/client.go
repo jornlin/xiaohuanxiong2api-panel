@@ -45,6 +45,12 @@ const (
 	// 今日 +300 的 daily_grant 挤出前 10 条，签到状态就会误判 false。
 	PointsBillsQuery = "paging.limit=100&type=all&paging.offset=0"
 
+	// 流水查询的现行端点是 **v2**：v1 /points/v1/bills 对 Bearer 令牌一律 403
+	// （2026-11-19 实测，官网前端也早已切到 v2）。v2 用 cursor 分页，type=income
+	// 只取发放记录（每日积分/礼包），不会像 type=all 那样被几百条消耗记录淹没。
+	PointsBillsV2Path  = "/bills" // 拼在 pointsV2Base()（…/points/v2）后面
+	PointsBillsV2Query = "paging.limit=50&type=income"
+
 	// RegionGlobal / RegionCN 保留基线的地区常量：小浣熊只有一个站
 	// （xiaohuanxiong.com），面板上的「地区」选择已注释掉（index.html 的 .realm-row），
 	// login/start 固定按 RegionCN 建会话。等官方出国际版客户端再放开那块 UI，
@@ -199,9 +205,13 @@ func sessionDeadSignal(lower string) bool {
 func Classify(status int, body string) ErrKind {
 	lower := strings.ToLower(body)
 	switch {
-	// 认证类**先判**：403 可能只是权限问题，落到下面的额度文案会白白封号。
-	case status == http.StatusUnauthorized || status == http.StatusForbidden:
+	// 认证类**先判**。401 才是登录态失效；403 是权限/风控（例如某个接口只对网页会话
+	// 开放，或模型权限不足），判成 session dead 会让好号在连续三次 403 后被自动禁用
+	// （bills v1 的 403 就是活例）。403 归「调用方侧」，不罚号。
+	case status == http.StatusUnauthorized:
 		return ErrSessionDead
+	case status == http.StatusForbidden:
+		return ErrClient
 	case status == http.StatusTooManyRequests:
 		return ErrSoftRate
 	case status == http.StatusGatewayTimeout:
@@ -365,6 +375,16 @@ func (c *Client) pointsBase() string {
 	c.hostMu.RLock()
 	defer c.hostMu.RUnlock()
 	return c.points
+}
+
+// pointsV2Base 积分域 v2（流水现行端点）。默认真实地址以 /points/v1 结尾，
+// 换成 /v2；测试/自建镜像把 points 覆盖成裸基址时直接拼 /v2。
+func (c *Client) pointsV2Base() string {
+	base := strings.TrimRight(c.pointsBase(), "/")
+	if strings.HasSuffix(base, "/v1") {
+		return strings.TrimSuffix(base, "/v1") + "/v2"
+	}
+	return base + "/v2"
 }
 
 func (c *Client) originBase() string {

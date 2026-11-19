@@ -306,8 +306,10 @@ func (c *Client) RecentBills(a *auth.Auth, limit int) ([]BillRow, error) {
 	if limit <= 0 || limit > 200 {
 		limit = 100
 	}
-	query := fmt.Sprintf("paging.limit=%d&type=all&paging.offset=0", limit)
-	resp, err := c.doJSON(http.MethodGet, c.pointsBase()+PointsBillsPath+"?"+query, nil, c.authHeader(a))
+	// v1 /bills 对 Bearer 令牌 403（2026-11-19 实测），现行端点是 v2（cursor 分页；
+	// 这里只要最近一页，不需要 cursor）。
+	query := fmt.Sprintf("paging.limit=%d&type=all", limit)
+	resp, err := c.doJSON(http.MethodGet, c.pointsV2Base()+PointsBillsV2Path+"?"+query, nil, c.authHeader(a))
 	if err != nil {
 		return nil, err
 	}
@@ -345,57 +347,134 @@ type BillRow struct {
 	CreatedAt string `json:"created_at"`
 }
 
-// CheckinStatus 查「今日每日发放是否已到账」：口径是 bills 流水里今天有没有
-// daily_grant；流水查不到时退回余额的 daily_points>0。credits=可用积分，
-// enable=账号可用（余额 0 且今日无发放说明额度耗尽，交由调度器判断）。
-func (c *Client) CheckinStatus(a *auth.Auth) (checkedIn bool, credits int64, enable bool, err error) {
-	usage, err := c.UserEntUsageDetail(a)
-	if err != nil {
-		return false, 0, false, err
-	}
-	credits = usage.Remain
-	if today, _, berr := c.DailyGrant(a); berr == nil {
-		checkedIn = today
-	} else {
-		checkedIn = usage.Daily > 0
-	}
-	if checkedIn {
-		a.MarkCheckedIn()
-	}
-	return checkedIn, credits, true, nil
+// CheckinState 是一次签到状态查询的结果。
+type CheckinState struct {
+	CheckedIn   bool      // 今天（东八区）是否已有 daily_grant 入账
+	Credits     int64     // 可用积分
+	Enable      bool      // 上游是否允许该账号使用积分
+	EverGranted bool      // 历史上有没有过 daily_grant
+	LastGrant   time.Time // 最近一次 daily_grant 的时间（零值 = 没有）
+	// GrantErr 非 nil 表示流水查询失败（接口/权限问题）：此时 CheckedIn 不可信，
+	// 调用方不能据此判「签到失败」，更不能记签到冷却。
+	GrantErr error
 }
 
-// DailyGrant 读 bills 流水：今天（东八区）是否已有 daily_grant 入账，以及这个号
-// **历史上有没有过** daily_grant。
+// CheckinStatus 查「今日每日发放是否已到账」：口径是 v2 流水里今天有没有 daily_grant。
 //
-// 后一半是给「上游压根没给这个号开每日积分」用的：实测 2026-10-21，号 7692045
-// 注册 4 天、bills 里只有 reward_grant（注册礼包/桌面端登录奖励），daily_points 恒为 0，
-// 与它的 code_identity 为空一致。这种号 claim 再多轮也不会有 daily_grant，
-// 报「签到复核未通过」是谎报失败。
-func (c *Client) DailyGrant(a *auth.Auth) (today, ever bool, err error) {
-	resp, err := c.doJSON(http.MethodGet,
-		c.pointsBase()+PointsBillsPath+"?"+PointsBillsQuery, nil, c.authHeader(a))
+// 流水查不到时**不再**退回 `usage.Daily > 0`：daily 是「今日剩余额度」，花完就是 0，
+// 拿它当「今天已发放」会把正常号误判成未签到。2026-11-19 实测 v1 bills 全线 403，
+// 回退逻辑导致 13/15 个号每轮签到失败并反复记冷却——那是「动不动冷却」的主要来源。
+func (c *Client) CheckinStatus(a *auth.Auth) (CheckinState, error) {
+	usage, err := c.UserEntUsageDetail(a)
 	if err != nil {
-		return false, false, err
+		return CheckinState{}, err
 	}
-	data, err := payloadOf(resp, "积分流水")
+	st := CheckinState{Credits: usage.Remain, Enable: true}
+	today, ever, last, berr := c.DailyGrant(a)
+	if berr != nil {
+		st.GrantErr = berr
+		return st, nil
+	}
+	st.EverGranted, st.LastGrant, st.CheckedIn = ever, last, today
+	if today {
+		a.MarkCheckedIn()
+	}
+	return st, nil
+}
+
+// DailyGrant 读 v2 发放流水：今天（东八区）是否已有 daily_grant、历史上有没有过、
+// 最近一次是何时。
+//
+// 后两者给「上游压根不给这个号发每日积分」与「曾经发过、后来停发」两种情况用：
+// 实测 2026-11-19，多个号最后一次 daily_grant 停在 11-12，之后每天都是 0；老逻辑
+// 只要有历史就判「签到复核未通过」，于是每轮都失败 + 冷却。看到最近发放时间，
+// 调度器就能把「停发」如实报成 skipped，而不是谎报失败。
+func (c *Client) DailyGrant(a *auth.Auth) (today, ever bool, last time.Time, err error) {
+	items, err := c.IncomeBills(a, 2)
 	if err != nil {
-		return false, false, err
+		return false, false, time.Time{}, err
 	}
 	day := time.Now().In(shanghaiTZ).Format("2006-01-02")
-	items, _ := data["items"].([]any)
-	for _, raw := range items {
-		item, _ := raw.(map[string]any)
-		if item == nil || text(item, "biz_type") != "daily_grant" {
+	for _, item := range items {
+		if item.BizType != "daily_grant" {
 			continue
 		}
 		ever = true
-		grantAt := text(item, "grant_at", "created_at")
-		if len(grantAt) >= 10 && grantAt[:10] == day {
+		at, ok := parseBillTime(item.CreatedAt)
+		if !ok {
+			if len(item.CreatedAt) >= 10 && item.CreatedAt[:10] == day {
+				today = true
+			}
+			continue
+		}
+		if at.In(shanghaiTZ).Format("2006-01-02") == day {
 			today = true
 		}
+		if at.After(last) {
+			last = at
+		}
 	}
-	return today, ever, nil
+	return today, ever, last, nil
+}
+
+// IncomeBills 拉 v2 发放流水（type=income，cursor 分页），最多 pages 页。
+//
+// 只取 income 而不是 all：重度使用一天几十条消耗记录，all 要翻很多页才能碰到一条发放；
+// income 通常总共只有几十条（每日一条 + 几个礼包），两页足够覆盖一个多月。
+func (c *Client) IncomeBills(a *auth.Auth, pages int) ([]BillRow, error) {
+	if pages <= 0 {
+		pages = 1
+	}
+	out := []BillRow{}
+	cursor := ""
+	for i := 0; i < pages; i++ {
+		q := PointsBillsV2Query
+		if cursor != "" {
+			q += "&cursor=" + url.QueryEscape(cursor)
+		}
+		resp, err := c.doJSON(http.MethodGet, c.pointsV2Base()+PointsBillsV2Path+"?"+q, nil, c.authHeader(a))
+		if err != nil {
+			return nil, err
+		}
+		data, err := payloadOf(resp, "积分流水")
+		if err != nil {
+			return nil, err
+		}
+		items, _ := data["items"].([]any)
+		for _, raw := range items {
+			item, _ := raw.(map[string]any)
+			if item == nil {
+				continue
+			}
+			out = append(out, BillRow{
+				BillID:    text(item, "bill_id"),
+				BizID:     text(item, "biz_id"),
+				BizType:   text(item, "biz_type"),
+				EventName: text(item, "event_name"),
+				Points:    mustInt(item["points"]),
+				// v2 用 created_at；v1（以及部分镜像）用 grant_at，两处都认。
+				CreatedAt: text(item, "created_at", "grant_at"),
+			})
+		}
+		more, _ := data["has_more"].(bool)
+		if !more {
+			break
+		}
+		cursor = text(data, "next_cursor")
+		if cursor == "" {
+			break
+		}
+	}
+	return out, nil
+}
+
+// parseBillTime 解析流水时间（上游给 RFC3339，带 +08:00 时区）。
+func parseBillTime(s string) (time.Time, bool) {
+	t, err := time.Parse(time.RFC3339, s)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
 }
 
 // ClaimDesktopGrant 领桌面端礼包（一次性新手福利之一，与每日 300 分无关）。

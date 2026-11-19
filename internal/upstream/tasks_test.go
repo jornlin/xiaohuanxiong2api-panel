@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	"github.com/misakano7545/xiaohuanxiong2api-panel/internal/auth"
 )
@@ -79,6 +80,73 @@ func TestTasksMarketingText(t *testing.T) {
 	}
 	if got.Invite.MarketingText != "春节活动：邀请好友双倍积分" {
 		t.Errorf("marketing_text = %q", got.Invite.MarketingText)
+	}
+}
+
+// TestDailyGrantReadsV2Bills v1 /bills 已 403（2026-11-19），签到口径必须走 v2：
+// 今天/历史/最近发放时间三个字段都要从 v2 的 created_at 正确解析。
+func TestDailyGrantReadsV2Bills(t *testing.T) {
+	cst := time.FixedZone("CST", 8*3600)
+	today := time.Now().In(cst).Format("2006-01-02")
+	old := time.Now().AddDate(0, 0, -5).In(cst).Format("2006-01-02")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v2/bills" {
+			t.Errorf("应走 v2 流水，实际 %s", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		if got := r.URL.Query().Get("type"); got != "income" {
+			t.Errorf("type = %q，期望 income（只要发放行）", got)
+		}
+		_, _ = io.WriteString(w, `{"code":0,"data":{"has_more":false,"items":[
+			{"biz_type":"daily_grant","points":300,"created_at":"`+today+`T00:00:00+08:00"},
+			{"biz_type":"daily_grant","points":300,"created_at":"`+old+`T00:00:00+08:00"},
+			{"biz_type":"reward_grant","points":3000,"created_at":"`+today+`T01:00:00+08:00"}]}}`)
+	}))
+	defer srv.Close()
+
+	up := New()
+	up.SetAPIHosts(srv.URL, srv.URL)
+	up.SetAgentHosts(srv.URL, srv.URL)
+
+	todayHit, ever, last, err := up.DailyGrant(&auth.Auth{Data: auth.Data{AccessToken: "dt", UID: "u-1"}})
+	if err != nil {
+		t.Fatalf("DailyGrant 出错: %v", err)
+	}
+	if !todayHit || !ever {
+		t.Errorf("today=%v ever=%v，期望都为 true", todayHit, ever)
+	}
+	if got := last.In(cst).Format("2006-01-02"); got != today {
+		t.Errorf("最近发放 = %s，期望今天 %s（取最新一条）", got, today)
+	}
+}
+
+// TestDailyGrantDetectsStopped 上游停发：历史有、今天没有、最近一条在很久以前。
+func TestDailyGrantDetectsStopped(t *testing.T) {
+	cst := time.FixedZone("CST", 8*3600)
+	old := time.Now().AddDate(0, 0, -6).In(cst).Format("2006-01-02")
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"code":0,"data":{"has_more":false,"items":[
+			{"biz_type":"daily_grant","points":300,"created_at":"`+old+`T00:00:00+08:00"}]}}`)
+	}))
+	defer srv.Close()
+
+	up := New()
+	up.SetAPIHosts(srv.URL, srv.URL)
+	up.SetAgentHosts(srv.URL, srv.URL)
+
+	todayHit, ever, last, err := up.DailyGrant(&auth.Auth{Data: auth.Data{AccessToken: "dt", UID: "u-1"}})
+	if err != nil {
+		t.Fatalf("DailyGrant 出错: %v", err)
+	}
+	if todayHit {
+		t.Error("今天没有 daily_grant，today 应为 false")
+	}
+	if !ever || last.IsZero() {
+		t.Errorf("ever=%v last=%v，应认得出历史发放", ever, last)
+	}
+	if got := last.In(cst).Format("2006-01-02"); got != old {
+		t.Errorf("最近发放 = %s，期望 %s", got, old)
 	}
 }
 

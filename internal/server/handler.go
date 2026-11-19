@@ -703,7 +703,10 @@ func (h *Handler) noteFailure(uid string, kind upstream.ErrKind) {
 	case upstream.ErrSessionDead:
 		h.cfg.Pool.NoteSessionDead(uid)
 	case upstream.ErrServer:
-		h.cfg.Pool.NoteError(uid)
+		// 上游 5xx 是服务端/模型侧故障（实测 503 毫秒级返回、同一账号随后照常成功），
+		// 与账号健康无关。罚号只会把整池推向熔断——上游抖一轮，面板所有号一起「冷却」，
+		// 而真正的恢复手段（换号重试）本来就在主循环里。只记日志，不记账。
+		_ = uid
 	case upstream.ErrBusy:
 		// 排队/资源受限是模型侧的窗口，与账号健康无关：罚号只会把好号推向熔断。
 		// no-op
