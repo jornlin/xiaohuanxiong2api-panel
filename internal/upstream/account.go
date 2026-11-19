@@ -601,6 +601,32 @@ func (c *Client) FetchProfile(a *auth.Auth) (Profile, error) {
 	}, nil
 }
 
+// ConfirmAttribution 补绑邀请关系（POST /auth/v1/iam/confirm）。
+//
+// 官网注册/登录后用它确认归因；实测对**未绑定**的号可以补 invite_code 并回
+// {"code":0}。是否真正计入邀请人奖励以上游为准（部分注册来源的号会静默不生效，
+// 返回 success 但邀请人计数不变）。
+func (c *Client) ConfirmAttribution(a *auth.Auth, inviteCode string) error {
+	body := map[string]any{
+		"utm_source": "friend_invitation_action",
+		"registration_attribution": map[string]any{
+			"registration_source": "web",
+			"utm_source":          "friend_invitation_action",
+		},
+		"invite_code": inviteCode,
+	}
+	headers := c.authHeader(a)
+	headers["Origin"] = c.originBase()
+	headers["Referer"] = c.originBase() + "/events/refer?code=" + inviteCode +
+		"&utm_source=friend_invitation_action"
+	resp, err := c.doJSON(http.MethodPost, c.authBase()+"/iam/confirm", body, headers)
+	if err != nil {
+		return err
+	}
+	_, err = payloadOf(resp, "邀请关系确认")
+	return err
+}
+
 // ClaimDesktopGrant 领桌面端礼包（一次性新手福利之一，与每日 300 分无关）。
 //
 // 与 CheckinClaim 是同一条端点：上游对「还没领的桌面端礼包」和「手动登录领取」

@@ -1945,7 +1945,9 @@ function renderInvites() {
       '<td class="num">' + (a.remaining_reward_invitees != null ? a.remaining_reward_invitees : '—') + '</td>' +
       '<td>' + bind + '</td>' +
       '<td>' + link + '</td>' +
-      '<td class="c-acts"><button class="xs ghost" data-rec="' + esc(a.uid) + '">记录</button></td>' +
+      '<td class="c-acts">' +
+        (a.invited_by ? '' : '<button class="xs ghost" data-bind="' + esc(a.uid) + '">补绑</button>') +
+        '<button class="xs ghost" data-rec="' + esc(a.uid) + '">记录</button></td>' +
       '</tr>';
   }).join('');
 }
@@ -2542,6 +2544,22 @@ function grantsMsg(gs) {
     if (c) {
       const ok = await copyText(c.dataset.copy, null);
       toast(ok ? '邀请链接已复制' : '复制失败，请手动选择链接', ok ? 'ok' : 'err');
+      return;
+    }
+    const b = ev.target.closest('button[data-bind]');
+    if (b) {
+      const code = prompt('输入邀请码，把账号 ' + b.dataset.bind + ' 绑定到该邀请人：');
+      if (!code || !code.trim()) return;
+      try {
+        const d = await api('accounts/' + encodeURIComponent(b.dataset.bind) + '/bind_invite',
+          { method: 'POST', body: JSON.stringify({ invite_code: code.trim() }) });
+        toast(d.attribution_updated
+          ? '已绑定邀请人 ' + d.invited_by
+          : '上游返回成功，但邀请归因没有落地（该号注册来源可能不支持补绑）',
+          d.attribution_updated ? 'ok' : 'err');
+        invitesData = null;
+        loadInvites();
+      } catch (e) { toast(e.message, 'err'); }
       return;
     }
     const r = ev.target.closest('button[data-rec]');

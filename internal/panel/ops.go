@@ -467,3 +467,61 @@ func (p *Panel) profilesSync(w http.ResponseWriter, r *http.Request) {
 	log.Printf("panel: profiles sync 补全 %d 个账号手机号（失败 %d）", updated, len(out)-updated)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "updated": updated, "results": out})
 }
+
+// bindInvite 给单个账号补绑邀请码（POST /panel/api/accounts/{uid}/bind_invite）。
+//
+// 走网页端同一条 /auth/v1/iam/confirm。注意：上游对部分注册来源的号会**静默不生效**
+// （返回 success 但归因不落地、邀请人计数不变），所以这里回读 user_info 并如实回报
+// attribution_updated，不拿上游的 success 冒充「已绑定」。
+func (p *Panel) bindInvite(w http.ResponseWriter, r *http.Request) {
+	uid, ok := p.uidFrom(w, r)
+	if !ok {
+		return
+	}
+	var body struct {
+		InviteCode string `json:"invite_code"`
+	}
+	if err := json.NewDecoder(io.LimitReader(r.Body, 64<<10)).Decode(&body); err != nil {
+		writeErr(w, http.StatusBadRequest, "请求体不是合法 JSON")
+		return
+	}
+	code := strings.TrimSpace(body.InviteCode)
+	if len(code) < 8 || len(code) > 64 {
+		writeErr(w, http.StatusBadRequest, "邀请码长度不对（8-64 位）")
+		return
+	}
+	a := p.cfg.Pool.AuthByUID(uid)
+	if a == nil {
+		writeErr(w, http.StatusNotFound, "账号不存在: "+uid)
+		return
+	}
+	if cur := a.InvitedByValue(); cur != "" {
+		writeErr(w, http.StatusConflict, "该账号已绑定邀请人: "+cur)
+		return
+	}
+	if err := p.cfg.Upstream.ConfirmAttribution(a, code); err != nil {
+		writeErr(w, http.StatusBadGateway, publicErr(err))
+		return
+	}
+	updated := false
+	invitedBy := ""
+	if pr, perr := p.cfg.Upstream.FetchProfile(a); perr == nil {
+		invitedBy = pr.InvitedBy
+		if pr.InvitedBy != "" {
+			a.SetInvitedBy(pr.InvitedBy)
+			if serr := a.SaveAtomic(); serr != nil {
+				log.Printf("panel: 邀请补绑后落盘失败 uid=%s: %v", uid, serr)
+			}
+			updated = true
+		}
+	}
+	short := code
+	if len(short) > 8 {
+		short = short[:8]
+	}
+	log.Printf("panel: 邀请补绑 uid=%s code=%s… 上游=success 归因落地=%v", uid, short, updated)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "upstream": "success", "attribution_updated": updated,
+		"invited_by": invitedBy,
+	})
+}
