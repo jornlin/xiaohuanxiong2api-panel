@@ -234,18 +234,18 @@ func FileNameFor(uid string) string {
 	return safe + ".json"
 }
 
-// SaveAtomic 原子写回（临时文件 + rename，0600）。FilePath 为空时退到 FileNameFor，
-// 调用方负责给绝对路径；写失败必须让调用方看见——轮换过的 refresh_token 丢了就再也刷不了。
+// SaveAtomic 原子写回（临时文件 + rename，0600）。
+//
+// FilePath 为空 = 内存账号（测试/匿名凭证）：**直接跳过**，不再退到
+// FileNameFor(UID) 写当前目录——那会在测试跑目录里留下 u-1.json 之类的垃圾，
+// 之前就被 git add -A 误提交过。生产账号从 auths/ 加载或入池时都会设置 FilePath。
 func (a *Auth) SaveAtomic() error {
 	a.mu.Lock()
 	path := a.FilePath
-	if path == "" && a.UID != "" {
-		path = FileNameFor(a.UID)
-	}
 	snap := a.snapshotLocked()
 	a.mu.Unlock()
 	if path == "" {
-		return errors.New("账号没有落盘路径")
+		return nil
 	}
 	data, err := json.MarshalIndent(snap, "", "  ")
 	if err != nil {
