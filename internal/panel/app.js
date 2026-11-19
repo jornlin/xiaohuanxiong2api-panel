@@ -420,18 +420,20 @@ function usageCell(u) {
     '<span style="color:var(--ink-3)">—</span></td>';
   if (!u || !u.requests) return none;
   // token 一律走 fmtTok 换算单位（5.3m/84.3M）：裸千分位数字在窄列里读不出量级。
-  const tok = u.total_tokens ? fmtTok(u.total_tokens) : '—';
+  const tok = u.total_tokens ? fmtShortTok(u.total_tokens).replace(/\.0([MBk])/, '$1') : '—';
+  const rate = fmtRate(u.avg_tokens_per_second).replace(' tok/s', '/s');
   const title = '近 ' + usageHours + ' 小时：' + fmtNum(u.requests) + ' 次调用' +
     (u.errors ? '（失败 ' + fmtNum(u.errors) + '）' : '') +
     ' / ' + tok + ' tok / 平均延迟 ' + fmtMs(u.avg_latency_ms) +
     ' / ' + fmtRate(u.avg_tokens_per_second);
   const t = esc(title);
+  // 一行紧凑排布（此前是 4 个带底色的胶囊，横向吃掉 259px，把操作列挤出视口）。
   return '<td class="num usage-cell" title="' + t + '">' +
-    '<span class="usage-line" aria-label="' + t + '">' +
-    '<span class="usage-item usage-count"><b>' + fmtNum(u.requests) + '</b><em>次</em></span>' +
-    '<span class="usage-item usage-total"><b>' + tok + '</b><em>tok</em></span>' +
-    '<span class="usage-item usage-latency"><b>' + fmtMs(u.avg_latency_ms) + '</b></span>' +
-    '<span class="usage-item usage-rate"><b>' + fmtRate(u.avg_tokens_per_second) + '</b></span>' +
+    '<span class="us-line" aria-label="' + t + '">' +
+    '<b class="c-cnt">' + fmtNum(u.requests) + '</b><em>次</em>' +
+    '<b class="c-tok">' + tok + '</b><em>tok</em>' +
+    '<b class="c-lat">' + fmtMs(u.avg_latency_ms) + '</b>' +
+    '<b class="c-rate">' + rate + '</b>' +
     '</span></td>';
 }
 
@@ -491,9 +493,6 @@ const ACC_SORT = {
   last: a => a.last_success || '',
 };
 
-// 展开行的账号 uid（点行展开细节：token / 成功率 / 设备 / 任务）。
-const accOpen = new Set();
-
 // 账号筛选：搜索（昵称/手机号/UID）+ 状态 + 到期，三种条件叠加。
 // 「到期筛选」把原「积分到期提醒」表的用途收进账号池——按 7/30 天内到期筛出该先看的号。
 function accFiltered(list) {
@@ -552,7 +551,7 @@ function credCell2(a) {
 function renderAccounts(list) {
   const tb = $('accBody');
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="10"><div class="empty"><div class="big">账号池是空的</div>' +
+    tb.innerHTML = '<tr><td colspan="13"><div class="empty"><div class="big">账号池是空的</div>' +
       '点击右上角「添加账号」：用<strong>微信扫码</strong>最省事（不用装客户端、也不用复制任何东西），' +
       '也可以切到 refreshToken 页粘贴一条凭证</div></td></tr>';
     return;
@@ -562,7 +561,7 @@ function renderAccounts(list) {
   const cnt = $('accCount');
   if (cnt) cnt.textContent = filtered.length === list.length ? list.length + ' 个账号' : filtered.length + ' / ' + list.length + ' 个账号';
   if (!filtered.length) {
-    tb.innerHTML = '<tr><td colspan="10"><div class="empty">当前搜索 / 筛选条件没有匹配的账号</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="13"><div class="empty">当前搜索 / 筛选条件没有匹配的账号</div></td></tr>';
     return;
   }
   const rows = sortApply('acc', filtered, ACC_SORT, 'credits', -1);
@@ -572,7 +571,6 @@ function renderAccounts(list) {
   tb.innerHTML = page.map(a => {
     const uid = String(a.uid);
     const cls = a.disabled ? 'off' : (a.cooling ? 'cool' : '');
-    const open = accOpen.has(uid);
     const st = [];
     if (a.disabled) st.push(tag('bad', '已禁用'));
     else if (a.cooling) st.push(tag('warn', '冷却中', a.reason));
@@ -598,33 +596,27 @@ function renderAccounts(list) {
       ? '<button class="xs ghost" data-a="enable" data-u="' + esc(uid) + '">启用账号</button>'
       : '<button class="xs ghost danger" data-a="disable" data-u="' + esc(uid) + '">禁用账号</button>');
     more.push('<button class="xs ghost danger" data-a="remove" data-u="' + esc(uid) + '">移除账号</button>');
-    const det = '<div class="acc-det-in">' +
-      '<span class="kv"><i>Token</i><b>' + (a.token_expires_at ? esc(expCellText(a.token_expires_at)) : '—') + '</b></span>' +
-      '<span class="kv' + (a.err_count ? ' err' : '') + '"><i>连续错误</i><b>' + (a.err_count || 0) + '</b></span>' +
-      '<span class="kv"><i>设备</i><b>' + esc(a.machine_id || '—') + '</b></span>' +
-      (a.checkin_cooling ? '<span class="kv err"><i>签到</i><b>' + esc(a.checkin_reason || '冷却中') + '</b></span>' : '') +
-      (checkinState[uid] !== undefined ? '<span class="kv"><i>今日签到</i><b>' + (checkinState[uid] ? '已签' : '未签') + '</b></span>' : '') +
-      '</div>';
-    return '<tr class="' + cls + ' acc-row' + (open ? ' sel' : '') + '" data-row="' + esc(uid) + '">' +
+    return '<tr class="' + cls + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><svg class="chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 3.5l5 4.5-5 4.5"/></svg>' +
-        '<div class="wtxt"><div class="nm">' + (a.realm !== 'cn' ? '<span class="tag mute">国际</span> ' : '') + esc(a.nickname || uid) + '</div>' +
+      '<td class="who"><div class="wtxt"><div class="nm">' + (a.realm !== 'cn' ? '<span class="tag mute">国际</span> ' : '') + esc(a.nickname || uid) + '</div>' +
         '<div class="id">' + (a.phone ? esc(a.phone) + ' · ' : '') + esc(uid) + '</div></div></td>' +
       '<td>' + st.join(' ') + '</td>' +
       '<td class="cred2" title="' + esc(credTitle(a)) + '">' + credCell2(a) + '</td>' +
       '<td>' + expCellRich(a) + '</td>' +
+      '<td class="num" style="color:var(--ink-3)">' + (a.token_expires_at ? esc(expCellText(a.token_expires_at)) : '—') + '</td>' +
       usageCell(a.usage) +
       '<td class="num">' + (a.in_flight || 0) + '</td>' +
       '<td class="num" title="累计成功 / 失败（自记录起）">' + (a.success_count || 0) +
         ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (a.err_total || 0) + '</span></td>' +
+      '<td class="num"' + (a.err_count ? ' style="color:var(--bad)"' : ' style="color:var(--ink-3)"') + '>' + (a.err_count || 0) + '</td>' +
+      '<td><span class="dev" title="' + esc(a.machine_id || '') + '">' + esc(a.machine_id || '—') + '</span></td>' +
       '<td class="num" style="color:var(--ink-3)">' + ago(a.last_success) + '</td>' +
       '<td class="c-acts"><div class="acts">' +
         '<button class="xs" data-a="checkin" data-u="' + esc(uid) + '">签到</button>' +
         '<button class="xs" data-a="balance" data-u="' + esc(uid) + '">刷新</button>' +
         '<details class="menu rowmenu"><summary class="xs more">⋯</summary><div class="menu-pop">' +
           more.join('') + '</div></details>' +
-      '</div></td></tr>' +
-      '<tr class="acc-det" data-det="' + esc(uid) + '"' + (open ? '' : ' hidden') + '><td></td><td colspan="9">' + det + '</td></tr>';
+      '</div></td></tr>';
   }).join('');
 }
 PG_RENDER.acc = () => renderAccounts((overviewData && overviewData.accounts) || []);
@@ -636,8 +628,9 @@ function expCellText(ts) {
   const d = new Date(ms);
   if (isNaN(d)) return '—';
   const days = Math.round((ms - Date.now()) / 86400000);
-  return d.toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) +
-    (days < 0 ? '（已过期）' : '（' + days + ' 天后）');
+  const md = (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0') + ' ' +
+    String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+  return md + (days < 0 ? '（已过期）' : days <= 3 ? '（剩 ' + days + ' 天）' : '');
 }
 
 // renderExpiry 积分到期提醒：按「最近到期日」给每号一行，回答「哪天会作废多少、
@@ -2896,18 +2889,6 @@ function grantsMsg(gs) {
     $('accQ').value = ''; $('accStatus').value = 'all'; $('accExpFilter').value = 'all';
     renderAccounts((overviewData && overviewData.accounts) || []);
   };
-  // 点整行展开只读细节；按钮/下拉/链接不触发展开。
-  $('accBody').addEventListener('click', ev => {
-    if (ev.target.closest('button, summary, input, select, a, .menu-pop')) return;
-    const tr = ev.target.closest('tr.acc-row');
-    if (!tr) return;
-    const uid = tr.dataset.row;
-    accOpen.has(uid) ? accOpen.delete(uid) : accOpen.add(uid);
-    const det = document.querySelector('tr.acc-det[data-det="' + CSS.escape(uid) + '"]');
-    const open = accOpen.has(uid);
-    tr.classList.toggle('sel', open);
-    if (det) det.hidden = !open;
-  });
   // 邀请页：复制链接 / 查看邀请记录 / 筛选 / 刷新
   $('invBody').addEventListener('click', async ev => {
     const c = ev.target.closest('button[data-copy]');
