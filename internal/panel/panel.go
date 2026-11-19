@@ -76,6 +76,13 @@ type Panel struct {
 	invitesMu   sync.Mutex
 	invitesAt   time.Time
 	invitesJSON []byte
+
+	// 积分对账（逐号查上游流水）是 N 次网络请求：打开「请求记录」时同步跑会把
+	// 页面拖到几十秒（138 个号实测 33–55s），再加前端 5s 轮询就是持续打满。
+	// 改成后台跑 + 最短间隔，接口本身只读归档/内存，立刻返回。
+	reconcileMu   sync.Mutex
+	reconcileAt   time.Time
+	reconcileBusy bool
 }
 
 // New 构建面板。Logs 为空时自建一个环，但 main 应传入和标准日志共用的那个。
@@ -462,6 +469,27 @@ const reqIDMarker = "req-"
 //
 // 只在面板打开「请求记录」时跑一次（每账号一次只读流水请求），不做后台轮询：
 // 流水本身滞后 1~3 分钟，用户看的时候对一次就够了。
+// reconcileCreditsAsync 触发一次后台对账：最短间隔 2 分钟、同一时刻只跑一轮。
+// 打开/轮询「请求记录」只排队，不等它——回填结果在下一轮读取时自然出现。
+func (p *Panel) reconcileCreditsAsync() {
+	p.reconcileMu.Lock()
+	if p.reconcileBusy || time.Since(p.reconcileAt) < 2*time.Minute {
+		p.reconcileMu.Unlock()
+		return
+	}
+	p.reconcileBusy = true
+	p.reconcileAt = time.Now()
+	p.reconcileMu.Unlock()
+	go func() {
+		defer func() {
+			p.reconcileMu.Lock()
+			p.reconcileBusy = false
+			p.reconcileMu.Unlock()
+		}()
+		p.reconcileCredits()
+	}()
+}
+
 func (p *Panel) reconcileCredits() int {
 	if p.cfg.RequestLog == nil || p.cfg.Upstream == nil || p.cfg.Pool == nil {
 		return 0
@@ -528,7 +556,7 @@ func requestIDFromBillEvent(name string) string {
 // 读之前先对一次账：上游扣费流水滞后 1~3 分钟，用户打开这一页通常就是想看「刚才那次扣了多少」，
 // 顺手回填比让用户等后台轮询更直接（每账号一次只读流水请求）。
 func (p *Panel) requestLogs(w http.ResponseWriter, r *http.Request) {
-	p.reconcileCredits()
+	p.reconcileCreditsAsync()
 	if p.cfg.RequestLog == nil {
 		writeErr(w, http.StatusNotImplemented, "request logger not available")
 		return

@@ -1234,26 +1234,34 @@ function bindRequestLogControls() {
 }
 
 /* ── 日志（频道：全部/任务/对话/系统）─────────────────────────────── */
-async function loadLogs() {
+// logsBusy 防重叠：轮询与手动刷新撞在一起时，上一次没回来就跳过这一轮。
+let logsBusy = false;
+let logsTick = 0;
+// loadLogs(withRequests=false) 只刷运行日志文本，不碰请求记录。
+// 后台轮询走这条：请求记录是归档全量读，没必要每 5 秒拉一次。
+async function loadLogs(withRequests) {
+  if (logsBusy) return;
+  logsBusy = true;
+  const withReq = withRequests !== false;
   const box = $('logBox');
   const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
   const limit = ($('reqLimit') && $('reqLimit').value) || 100;
   // 时间范围由归档侧过滤（不是前端筛已拉取的条目）：区间落在更早的时间段时，
-  // 「最近 N 条」里根本不会有那些记录，必须让服务端按时间取。
+  // 「最近 N 条」里根本不会有那些记录，只能让服务端按时间取。
   const rq = trangeQuery('reqRange');
   rq.set('limit', limit);
   try {
     const [d, requestRows] = await Promise.all([
       api('logs'),
-      api('request_logs?' + rq.toString()).catch(() => ({ metrics: {}, entries: [] })),
+      withReq ? api('request_logs?' + rq.toString()).catch(() => ({ metrics: {}, entries: [] })) : Promise.resolve(null),
     ]);
     // 条目一律用服务端这一次返回的 entries：本仓 /panel/api/request_logs 在归档关闭时
     // 会**自己**回落到进程内最近事件并按同一套条件筛选（见 internal/panel/panel.go）。
     // 与 WB 面板唯一的差别就在这里——WB 的后端在归档关闭时不回落（回空），所以它必须
     // 自己改读 metrics.recent；本仓读了就会把筛选条件之外的请求显示出来。
-    const metrics = requestRows.metrics || {};
-    const recent = requestRows.entries || [];
-    renderRequestMetrics(metrics, recent);
+    if (requestRows) {
+      renderRequestMetrics(requestRows.metrics || {}, requestRows.entries || []);
+    }
     const all = d.entries || [];
     const entries = all.filter(e => logCh === 'all' || e.ch === logCh);
     box.innerHTML = entries.length
@@ -1273,6 +1281,7 @@ async function loadLogs() {
       ? '任务 ' + (counts.task || 0) + ' · 对话 ' + (counts.chat || 0) + ' · 系统 ' + (counts.sys || 0)
       : ({ task: '任务', chat: '对话', sys: '系统' }[logCh] || logCh) + ' ' + entries.length + ' 行';
   } catch (e) { /* 概览已提示 */ }
+  finally { logsBusy = false; }
 }
 
 /* ── 用量 ─────────────────────────────────────────────────────────── */
@@ -2600,7 +2609,10 @@ function start() {
     if (document.hidden) return;
     if (view === 'accounts') loadOverview(true);
     if (view === 'usage') loadUsage(true);
-    if (view === 'logs') loadLogs();
+    // 运行日志 15 秒刷一次（只刷新文本）；请求记录只在进入页面/手动刷新时取，
+    // 否则每 5 秒重读一遍归档 + 重渲染两张表，页面会一直发卡。
+    if (view === 'logs' && (++logsTick % 3 === 0)) loadLogs(false);
+    if (view !== 'logs') logsTick = 0;
   }, 5000);
 }
 
