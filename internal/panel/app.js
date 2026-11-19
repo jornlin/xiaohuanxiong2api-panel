@@ -552,7 +552,7 @@ function credCell2(a) {
 function renderAccounts(list) {
   const tb = $('accBody');
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="8"><div class="empty"><div class="big">账号池是空的</div>' +
+    tb.innerHTML = '<tr><td colspan="10"><div class="empty"><div class="big">账号池是空的</div>' +
       '点击右上角「添加账号」：用<strong>微信扫码</strong>最省事（不用装客户端、也不用复制任何东西），' +
       '也可以切到 refreshToken 页粘贴一条凭证</div></td></tr>';
     return;
@@ -562,7 +562,7 @@ function renderAccounts(list) {
   const cnt = $('accCount');
   if (cnt) cnt.textContent = filtered.length === list.length ? list.length + ' 个账号' : filtered.length + ' / ' + list.length + ' 个账号';
   if (!filtered.length) {
-    tb.innerHTML = '<tr><td colspan="8"><div class="empty">当前搜索 / 筛选条件没有匹配的账号</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="10"><div class="empty">当前搜索 / 筛选条件没有匹配的账号</div></td></tr>';
     return;
   }
   const rows = sortApply('acc', filtered, ACC_SORT, 'credits', -1);
@@ -600,9 +600,7 @@ function renderAccounts(list) {
     more.push('<button class="xs ghost danger" data-a="remove" data-u="' + esc(uid) + '">移除账号</button>');
     const det = '<div class="acc-det-in">' +
       '<span class="kv"><i>Token</i><b>' + (a.token_expires_at ? esc(expCellText(a.token_expires_at)) : '—') + '</b></span>' +
-      '<span class="kv"><i>成功 / 失败</i><b>' + (a.success_count || 0) + ' / ' + (a.err_total || 0) + '</b></span>' +
       '<span class="kv' + (a.err_count ? ' err' : '') + '"><i>连续错误</i><b>' + (a.err_count || 0) + '</b></span>' +
-      '<span class="kv"><i>在途</i><b>' + (a.in_flight || 0) + '</b></span>' +
       '<span class="kv"><i>设备</i><b>' + esc(a.machine_id || '—') + '</b></span>' +
       (a.checkin_cooling ? '<span class="kv err"><i>签到</i><b>' + esc(a.checkin_reason || '冷却中') + '</b></span>' : '') +
       (checkinState[uid] !== undefined ? '<span class="kv"><i>今日签到</i><b>' + (checkinState[uid] ? '已签' : '未签') + '</b></span>' : '') +
@@ -616,6 +614,9 @@ function renderAccounts(list) {
       '<td class="cred2" title="' + esc(credTitle(a)) + '">' + credCell2(a) + '</td>' +
       '<td>' + expCellRich(a) + '</td>' +
       usageCell(a.usage) +
+      '<td class="num">' + (a.in_flight || 0) + '</td>' +
+      '<td class="num" title="累计成功 / 失败（自记录起）">' + (a.success_count || 0) +
+        ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (a.err_total || 0) + '</span></td>' +
       '<td class="num" style="color:var(--ink-3)">' + ago(a.last_success) + '</td>' +
       '<td class="c-acts"><div class="acts">' +
         '<button class="xs" data-a="checkin" data-u="' + esc(uid) + '">签到</button>' +
@@ -623,7 +624,7 @@ function renderAccounts(list) {
         '<details class="menu rowmenu"><summary class="xs more">⋯</summary><div class="menu-pop">' +
           more.join('') + '</div></details>' +
       '</div></td></tr>' +
-      '<tr class="acc-det" data-det="' + esc(uid) + '"' + (open ? '' : ' hidden') + '><td></td><td colspan="7">' + det + '</td></tr>';
+      '<tr class="acc-det" data-det="' + esc(uid) + '"' + (open ? '' : ' hidden') + '><td></td><td colspan="9">' + det + '</td></tr>';
   }).join('');
 }
 PG_RENDER.acc = () => renderAccounts((overviewData && overviewData.accounts) || []);
