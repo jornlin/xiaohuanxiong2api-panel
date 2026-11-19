@@ -703,8 +703,10 @@ th.sorted[data-dir="desc"]::after { content: " ▼"; font-size: 10px; }
 .acc.pool tbody tr.acc-row.sel { background: var(--accent-soft); }
 .acc .chev { width: 14px; height: 14px; opacity: .45; transition: transform .15s; flex: none; }
 .acc tr.acc-row.sel .chev { transform: rotate(90deg); opacity: .9; }
-.acc .who { display: flex; align-items: flex-start; gap: 7px; }
-.acc .who .wtxt { min-width: 0; }
+/* 只作用于账号池：模型表的 <td class="who"> 是多行块（模型 ID + 名称 + 能力标签），
+   套上 flex 会把三行拍平成一排，ID 被挤成 "cn:rac…"。 */
+.acc.pool .who { display: flex; align-items: flex-start; gap: 7px; }
+.acc.pool .who .wtxt { min-width: 0; }
 .cred2 { min-width: 120px; }
 .cred2 .n { font: 600 13.5px/1.25 var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .cred2 .n .tot { color: var(--ink-3); font-size: 11px; font-weight: 400; }
