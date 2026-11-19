@@ -28,6 +28,9 @@ const (
 
 var errLoginSession = errors.New("登录链接已失效，请回面板重新点「添加账号」")
 
+// errLoginSave 换票成功但凭证落盘失败：授权码已经花掉，重试换票没有意义。
+var errLoginSave = errors.New("登录成功但账号凭证保存失败")
+
 // loginDone 是一次已完成会话的结果（state → 账号）。只服务「同一条回调被重复提交」这一种情况：
 // 授权码一次性，重复提交得幂等回应成功，而不是甩一句「链接失效」把人吓回去重开登录。
 type loginDone struct {
@@ -77,8 +80,8 @@ func newMachineID() string {
 
 // authCallback 接官方授权页的回调（无需 API key：这是浏览器跳转，不是面板前端调用）。
 //
-// 只做两件事：核对 state 属于哪个未完成的登录会话、把 code 交给它。换票在 login/poll 里做，
-// 这样浏览器那边一提交就能立刻回一个干净的成功页，网络慢也不拖住页面。
+// 只做三件事：核对 state 属于哪个未完成的登录会话、把 code 交给它、后台主动换票
+// （不再等前端轮询）。浏览器那边一提交就立刻回一个干净的成功页，换票在后台跑。
 //
 // 安全边界：state 是 32 字节随机数，只存在内存里、5~15 分钟内一次性有效；code 本身也是
 // 一次性授权码（上游 300 秒过期）。就算有人扫到这个端点，没有 state 也塞不进账号。
@@ -97,7 +100,7 @@ func (p *Panel) authCallback(w http.ResponseWriter, r *http.Request) {
 	p.loginMu.Lock()
 	sess, ok := p.logins[state]
 	p.loginMu.Unlock()
-	if !ok || time.Since(sess.At) > loginTTL {
+	if !ok || sess.Login == nil || time.Since(sess.At) > loginTTL {
 		writeCallbackPage(w, http.StatusGone, "登录会话已失效", "请回到面板重新点「添加账号」")
 		return
 	}
@@ -107,11 +110,17 @@ func (p *Panel) authCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if duplicate {
-		// 与「粘贴回调」撞车：同一个码已经被收下，换票正在进行，这里照样回成功页。
+		// 与「粘贴回调」撞车：同一个码已经被收下，换票可能正在进行；这里再推一次
+		// （finishLoginSession 有 Busy 闸门，重复调用是安全的），照样回成功页。
+		go p.autoFinishLogin(state)
 		writeCallbackPage(w, http.StatusOK, "这条回调已经收到过了", "换票正在进行，回到面板即可（账号会自动出现）")
 		return
 	}
 	log.Printf("panel: 收到浏览器授权回调 state=%.8s…", state)
+	// 换票不能只靠前端轮询：面板页面可能已刷新/关闭（loginID 丢了就再没人 poll），
+	// 那样授权码会一直躺在会话里，账号永远不入池。这里后台主动换一次；前端轮询仍然
+	// 幂等（finishLoginSession 会先看 Busy/已完成）。
+	go p.autoFinishLogin(state)
 	writeCallbackPage(w, http.StatusOK, "授权成功", "可以关闭这个页面，回到面板即可（账号会自动出现）")
 }
 
@@ -151,8 +160,9 @@ func isLoopbackRequest(r *http.Request) bool {
 // 浏览器到不了（地址是写死的），用户把地址栏整条链接（或 office-raccoon:// 链接、裸 code）
 // 粘进来即可，效果与环回回调完全一样。
 //
-// 两条路径：state 命中未完成会话 → 交回该会话（前端现有轮询继续跑，UI 行为一致）；
-// 命中不了（换机/会话过期/只有 code）→ 直接换票入池。
+// 两条路径都**由服务端自己换票**（不再把换票责任交给前端轮询）：
+// state 命中未完成会话 → 把码交给该会话并当场换票；命中不了（换机/会话过期/只有 code）
+// → 直接换票入池。换票失败（网络抖动）才退回 action=session 让前端轮询重试。
 func (p *Panel) loginCode(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		URL string `json:"url"`
@@ -172,7 +182,7 @@ func (p *Panel) loginCode(w http.ResponseWriter, r *http.Request) {
 		p.loginMu.Lock()
 		sess, found := p.logins[state]
 		p.loginMu.Unlock()
-		if found && time.Since(sess.At) <= loginTTL {
+		if found && sess.Login != nil && time.Since(sess.At) <= loginTTL {
 			// 这次提交之前会话手上是不是已经有码了：有 = 同一链接被点了第二次。
 			duplicate := sess.Login.Pending()
 			if err := sess.Login.AcceptCallback(state, code); err != nil {
@@ -184,8 +194,29 @@ func (p *Panel) loginCode(w http.ResponseWriter, r *http.Request) {
 			} else {
 				log.Printf("panel: 重复提交同一条回调 state=%.8s…（幂等放行）", state)
 			}
-			// 交回会话后由前端轮询换票，这里只报告已接收。
-			// duplicate 让前端说「这条链接已经提交过了，正在处理」，而不是让人以为没反应。
+			// 服务端自己换票，不再把换票责任交给前端轮询：页面刷新过（loginID 清空）
+			// 或轮询对象不是这条会话时，前端根本不会来 poll —— 以前这里只回「已接收」，
+			// 码就一直躺着，账号永远不入池（用户看到的是「提交了没反应，再点提示正在处理」）。
+			// 换票通常不到 1 秒，同步做掉最直接；失败再交回轮询重试。
+			uid, nick, done, retryable, ferr := p.finishLoginSession(state)
+			if done {
+				writeJSON(w, http.StatusOK, map[string]any{
+					"ok": true, "action": "imported", "uid": uid, "nickname": nick, "duplicate": duplicate,
+				})
+				return
+			}
+			if ferr != nil && !retryable {
+				if errors.Is(ferr, errLoginSave) {
+					writeErr(w, http.StatusInternalServerError, ferr.Error())
+					return
+				}
+				writeErr(w, http.StatusGone,
+					"授权码无效或已被使用（一次性码，同一条链接提交两次就会这样）：请回面板重新发起登录")
+				return
+			}
+			if ferr != nil {
+				log.Printf("panel: 会话 %.8s 粘贴回调换票暂时失败（交回轮询重试）：%v", state, ferr)
+			}
 			writeJSON(w, http.StatusOK, map[string]any{
 				"ok": true, "action": "session", "id": state, "duplicate": duplicate,
 			})
@@ -234,7 +265,7 @@ func (p *Panel) completedLogin(state string) (uid, nickname string, ok bool) {
 	return done.UID, done.Nickname, true
 }
 
-// markLoginDone 记一次会话成功（loginPoll 换票入池后调用）。
+// markLoginDone 记一次会话成功（finishLoginSession 换票入池后调用）。
 func (p *Panel) markLoginDone(state, uid, nickname string) {
 	if state == "" {
 		return
@@ -356,6 +387,49 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	id := r.URL.Query().Get("id")
 	p.loginMu.Lock()
 	sess, ok := p.logins[id]
+	p.loginMu.Unlock()
+	if !ok {
+		// 会话已经换票入池（被 loginCode / 浏览器回调主动完成）：重复轮询按幂等回报成功。
+		if uid, nick, done := p.completedLogin(id); done {
+			writeJSON(w, http.StatusOK, map[string]any{"done": true, "ok": true, "uid": uid, "nickname": nick})
+			return
+		}
+		writeErr(w, http.StatusGone, errLoginSession.Error())
+		return
+	}
+	// 扫码会话有自己的状态机（等待扫码 / 已扫待确认），与「授权码换票」分开处理。
+	if sess.Qr != nil {
+		p.pollQrSession(w, r, id)
+		return
+	}
+	uid, nick, done, _, err := p.finishLoginSession(id)
+	if err != nil {
+		// 换票被「业务层面」拒绝 = 这个码废了（一次性码重复使用、过期、伪造），
+		// 再轮询也是白轮。会话已被 finishLoginSession 删掉，前端据此停轮询。
+		// 只有网络层/5xx 才交给前端继续重试——那种情况授权可能已在浏览器侧完成。
+		if errors.Is(err, errLoginSave) {
+			writeErr(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		var be *upstream.BusinessError
+		if errors.Is(err, upstream.ErrCodeExpired) || errors.As(err, &be) || errors.Is(err, errLoginSession) {
+			writeErr(w, http.StatusGone, "授权码无效或已被使用（一次性码，同一条链接提交两次就会这样）：请回面板重新发起登录")
+			return
+		}
+		writeErr(w, http.StatusBadGateway, err.Error())
+		return
+	}
+	if !done {
+		writeJSON(w, http.StatusOK, map[string]any{"done": false})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"done": true, "ok": true, "uid": uid, "nickname": nick})
+}
+
+// pollQrSession 处理扫码会话的一轮轮询（与「授权码换票」分开：状态机在 QrLogin 里）。
+func (p *Panel) pollQrSession(w http.ResponseWriter, r *http.Request, id string) {
+	p.loginMu.Lock()
+	sess, ok := p.logins[id]
 	if ok && sess.Busy {
 		// 上一次查询还没回来（上游慢）：本轮直接说「没完成」，避免并发打同一个 nonce。
 		p.loginMu.Unlock()
@@ -381,47 +455,22 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 		p.loginMu.Unlock()
 	}()
 
-	var creds *auth.Auth
-	var done bool
-	var err error
-	if sess.Qr != nil {
-		creds, done, err = sess.Qr.Poll(r.Context())
-		if errors.Is(err, upstream.ErrQrCanceled) {
-			// 用户取消/二维码过期：这是终态，停掉前端轮询比一直转圈诚实。
-			p.loginMu.Lock()
-			delete(p.logins, id)
-			p.loginMu.Unlock()
-			writeErr(w, http.StatusGone, err.Error())
-			return
-		}
-	} else {
-		creds, done, err = sess.Login.Poll(r.Context())
+	creds, done, err := sess.Qr.Poll(r.Context())
+	if errors.Is(err, upstream.ErrQrCanceled) {
+		// 用户取消/二维码过期：这是终态，停掉前端轮询比一直转圈诚实。
+		p.loginMu.Lock()
+		delete(p.logins, id)
+		p.loginMu.Unlock()
+		writeErr(w, http.StatusGone, err.Error())
+		return
 	}
 	if err != nil {
-		// 换票被「业务层面」拒绝 = 这个码废了（一次性码重复使用、过期、伪造），
-		// 再轮询也是白轮。删掉会话、如实回报，前端据此停轮询（此前只会一直转圈，
-		// 用户干等一阵后重复提交，再被同样的错误打回来）。
-		// 只有网络层/5xx 才交给前端继续重试——那种情况授权可能已在浏览器侧完成。
-		var be *upstream.BusinessError
-		if errors.Is(err, upstream.ErrCodeExpired) || errors.As(err, &be) {
-			p.loginMu.Lock()
-			delete(p.logins, id)
-			p.loginMu.Unlock()
-			log.Printf("panel: 会话 %.8s 换票被拒（%v），结束该会话", id, err)
-			writeErr(w, http.StatusGone, "授权码无效或已被使用（一次性码，同一条链接提交两次就会这样）：请回面板重新发起登录")
-			return
-		}
-		// 其余（5xx/超时）交给前端继续重试：授权可能已在浏览器侧完成，停掉就永远不入池。
 		writeErr(w, http.StatusBadGateway, err.Error())
 		return
 	}
 	if !done {
-		out := map[string]any{"done": false}
-		if sess.Qr != nil {
-			// 扫码没有回调事件：把上游状态（等待扫码 / 已扫码待确认）当进度显示。
-			out["qr_status"] = sess.Qr.LastStatus()
-		}
-		writeJSON(w, http.StatusOK, out)
+		// 扫码没有回调事件：把上游状态（等待扫码 / 已扫码待确认）当进度显示。
+		writeJSON(w, http.StatusOK, map[string]any{"done": false, "qr_status": sess.Qr.LastStatus()})
 		return
 	}
 	uid, nick, err := p.saveAccount(creds)
@@ -432,10 +481,104 @@ func (p *Panel) loginPoll(w http.ResponseWriter, r *http.Request) {
 	p.loginMu.Lock()
 	delete(p.logins, id)
 	p.loginMu.Unlock()
+	p.markLoginDone(id, uid, nick)
+	writeJSON(w, http.StatusOK, map[string]any{"done": true, "ok": true, "uid": uid, "nickname": nick})
+}
+
+// finishLoginSession 主动把会话手上的授权码换成凭证并入池。
+//
+// 这是「换票不再依赖前端轮询」的核心：浏览器回调 / 粘贴回调收到码后就由服务端自己
+// 换票，前端的 login/poll 只是幂等兜底。以前换票只发生在前端轮询里——页面一刷新
+// （loginID 清空）或轮询对象不是这条会话，码就永远躺在服务端，账号永远不入池，
+// 用户只看到「正在换票」却等不到结果，只能重走一遍授权。
+//
+// 返回语义：
+//   - done=true：已入池，uid/nickname 有效；
+//   - err != nil 且 retryable=false：终态（码已废/会话没了），会话已删；
+//   - err != nil 且 retryable=true：暂时失败，码保留，可再试；
+//   - 三者皆空：已有一次 poll 在飞（Busy），等那一轮。
+func (p *Panel) finishLoginSession(id string) (uid, nick string, done bool, retryable bool, err error) {
+	p.loginMu.Lock()
+	sess, ok := p.logins[id]
+	if ok && time.Since(sess.At) > loginTTL {
+		delete(p.logins, id)
+		ok = false
+	}
+	if !ok {
+		p.loginMu.Unlock()
+		if uid, nick, ok := p.completedLogin(id); ok {
+			return uid, nick, true, false, nil
+		}
+		return "", "", false, false, errLoginSession
+	}
+	if sess.Busy {
+		p.loginMu.Unlock()
+		return "", "", false, true, nil
+	}
+	if sess.Qr != nil || sess.Login == nil {
+		// 扫码会话由 login/poll 的状态机驱动，不在这里换票。
+		p.loginMu.Unlock()
+		return "", "", false, true, nil
+	}
+	sess.Busy = true
+	p.logins[id] = sess
+	p.loginMu.Unlock()
+	// 失败路径复位闸门，供下一次轮询/提交继续（成功路径已 delete 掉会话）。
+	defer func() {
+		p.loginMu.Lock()
+		if s, still := p.logins[id]; still {
+			s.Busy = false
+			p.logins[id] = s
+		}
+		p.loginMu.Unlock()
+	}()
+
+	creds, exchanged, perr := sess.Login.Poll(context.Background())
+	if perr != nil {
+		var be *upstream.BusinessError
+		if errors.Is(perr, upstream.ErrCodeExpired) || errors.As(perr, &be) {
+			p.loginMu.Lock()
+			delete(p.logins, id)
+			p.loginMu.Unlock()
+			log.Printf("panel: 会话 %.8s 换票被拒（%v），结束该会话", id, perr)
+			return "", "", false, false, perr
+		}
+		// 网络层/5xx：码保留，交给下一次重试（授权可能已在浏览器侧完成）。
+		return "", "", false, true, perr
+	}
+	if !exchanged {
+		return "", "", false, true, nil
+	}
+	uid, nick, serr := p.saveAccount(creds)
+	if serr != nil {
+		// 票已经换掉了（Poll 内部已置 spent、码已清）：再重试换票没有意义。
+		// 按终态回报「落盘失败」，让用户看到真实原因并重新授权，而不是一直转圈。
+		p.loginMu.Lock()
+		delete(p.logins, id)
+		p.loginMu.Unlock()
+		return "", "", false, false, fmt.Errorf("%w：%v", errLoginSave, serr)
+	}
+	p.loginMu.Lock()
+	delete(p.logins, id)
+	p.loginMu.Unlock()
 	// 记下这次会话的结果：同一 state 的回调再被提交（用户点了第二次、或浏览器回调与
 	// 手工粘贴同时到达）时，loginCode 直接幂等回报这个账号，而不是报「已经用过了」。
 	p.markLoginDone(id, uid, nick)
-	writeJSON(w, http.StatusOK, map[string]any{"done": true, "ok": true, "uid": uid, "nickname": nick})
+	return uid, nick, true, false, nil
+}
+
+// autoFinishLogin 在后台把会话手上的授权码换掉（浏览器回调路径）。
+// 失败只打日志：前端轮询还会再试，用户在弹窗里也能看到最终错误。
+func (p *Panel) autoFinishLogin(state string) {
+	uid, _, done, retryable, err := p.finishLoginSession(state)
+	switch {
+	case done:
+		log.Printf("panel: 会话 %.8s 已在服务端换票入池 uid=%s", state, uid)
+	case err != nil && !retryable:
+		log.Printf("panel: 会话 %.8s 换票失败（终态）：%v", state, err)
+	case err != nil:
+		log.Printf("panel: 会话 %.8s 换票暂时失败（保留授权码等重试）：%v", state, err)
+	}
 }
 
 // saveAccount 把一个已确认的凭证落盘并入池（同一 uid 直接覆盖旧文件）。

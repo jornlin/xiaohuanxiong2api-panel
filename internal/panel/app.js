@@ -1995,10 +1995,13 @@ async function submitCallback() {
   try {
     const d = await api('login/code', { method: 'POST', body: JSON.stringify({ url: raw }) });
     if (d.action === 'session') {
-      // 交回了本次登录会话：**先给反馈再轮询**。以前这里直接 await pollLogin()，
-      // 换票没在这一次轮询里完成就什么都不显示，看起来像「点了没反应」，
-      // 于是用户重复提交、被授权码一次性打回，以为链接坏了。
-      toast(d.duplicate ? '这条链接已经提交过了，正在换票…' : '授权码已收到，正在换票…', 'ok');
+      // 服务端已收下授权码，但换票暂时没完成（网络抖动/已有轮询在飞）：交回会话继续轮询。
+      // 关键是用服务端回报的 state 覆盖 loginID —— 页面刷新过或重开过「添加账号」时，
+      // 前端手里的 loginID 可能已经换成了别的会话，轮询它会永远等不到结果。
+      // （正常情况下服务端会同步换票并直接回 action=imported，走不到这里。）
+      if (d.id) loginID = d.id;
+      if (!loginTimer) loginTimer = setInterval(pollLogin, 3000);
+      toast(d.duplicate ? '这条链接已经提交过了，服务端正在换票…' : '授权码已收到，正在换票…', 'ok');
       $('addErr').hidden = true;
       // 立刻问一次，别等下一个 3s tick。
       await pollLogin();
@@ -2021,7 +2024,13 @@ function stopLoginPoll() { if (loginTimer) { clearInterval(loginTimer); loginTim
 // 停掉轮询账号就永远不入池。
 const POLL_MAX_FAILS = 20;
 async function pollLogin() {
-  if (!loginID) return;
+  // 以前这里静默 return：页面刷新过（loginID 清空）时轮询什么也不做，用户看到的是
+  // 「提交了没反应」。服务端现在会主动换票，但轮询兜底也要把这种情况说清楚。
+  if (!loginID) {
+    $('addErr').hidden = false;
+    $('addErr').textContent = '登录会话已丢失（页面刷新过？）：请回面板重新点「添加账号」发起登录';
+    return;
+  }
   try {
     const d = await api('login/poll?id=' + encodeURIComponent(loginID));
     pollFails = 0;

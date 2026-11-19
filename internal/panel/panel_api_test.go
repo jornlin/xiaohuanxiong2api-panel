@@ -283,22 +283,25 @@ func TestQrLoginImage(t *testing.T) {
 }
 
 // 跨机/服务器部署：官方回调地址写死 127.0.0.1，浏览器到不了，靠粘贴链接回填。
-// 三条路径都要能用：命中会话（交回轮询）、没有会话（直接换票入池）、裸授权码。
+// 三条路径都要能用：命中会话（服务端直接换票入池）、没有会话（直接换票入池）、裸授权码。
 func TestLoginCodePaste(t *testing.T) {
 	pn, _, p := newTestPanel(t)
 
-	// 1) 命中本次会话：与环回回调等价，poll 能收到号。
+	// 1) 命中本次会话：服务端收到码就自己换票入池，不等前端轮询。
+	// 回归的是「提交了没反应」：页面刷新过（loginID 清空）或轮询对象不是这条会话时，
+	// 换票若只发生在前端 poll 里，账号就永远不入池。
 	_, body := call(t, pn, http.MethodPost, "/panel/api/login/start", `{"realm":"cn"}`)
 	state := fmt.Sprint(body["id"])
 	pasted := "http://127.0.0.1:17867/auth/callback?code=ac_paste&state=" + state
 	code, res := call(t, pn, http.MethodPost, "/panel/api/login/code",
 		`{"url":`+strconv.Quote(pasted)+`}`)
-	if code != http.StatusOK || res["action"] != "session" {
-		t.Fatalf("粘贴会话链接 = %d %v", code, res)
+	if code != http.StatusOK || res["action"] != "imported" || res["uid"] != "u-9" {
+		t.Fatalf("粘贴会话链接应在服务端直接换票入池 = %d %v", code, res)
 	}
+	// 轮询依旧幂等：会话已被删，但 loginDone 记得这次结果。
 	code, res = call(t, pn, http.MethodGet, "/panel/api/login/poll?id="+state, "")
 	if code != http.StatusOK || res["done"] != true || res["uid"] != "u-9" {
-		t.Fatalf("粘回链接后 poll = %d %v", code, res)
+		t.Fatalf("会话完成后 poll 应幂等回报成功 = %d %v", code, res)
 	}
 
 	// 2) 没有对应会话（换机/会话过期）：直接换票入池。
@@ -432,9 +435,9 @@ func TestRequestIDFromBillEvent(t *testing.T) {
 
 // TestLoginCodeDuplicateSubmit 同一条回调链接重复提交必须幂等成功。
 //
-// 踩过的坑：第一次提交把授权码交给会话后，界面在换票完成前什么都不显示（看起来像
-// 没反应），用户再点一次 —— 老实现回 400「这个登录会话已经用过了」，把正常操作
-// 说成链接失效，于是重开登录反复折腾两三次。现在第二次返回 duplicate:true 的成功。
+// 踩过的坑：第一次提交后界面在换票完成前什么都不显示（看起来像没反应），用户再点一次 ——
+// 老实现回 400「这个登录会话已经用过了」，把正常操作说成链接失效，于是重开登录反复折腾
+// 两三次。现在首次提交就同步换票入池，重复提交幂等回报同一个账号。
 func TestLoginCodeDuplicateSubmit(t *testing.T) {
 	pn, _, _ := newTestPanel(t)
 	_, body := call(t, pn, http.MethodPost, "/panel/api/login/start", `{"realm":"cn"}`)
@@ -442,19 +445,11 @@ func TestLoginCodeDuplicateSubmit(t *testing.T) {
 	pasted := "http://127.0.0.1:17867/auth/callback?code=ac_dup&state=" + state
 
 	code, res := call(t, pn, http.MethodPost, "/panel/api/login/code", `{"url":`+strconv.Quote(pasted)+`}`)
-	if code != http.StatusOK || res["action"] != "session" {
-		t.Fatalf("首次提交 = %d %v", code, res)
+	if code != http.StatusOK || res["action"] != "imported" || res["uid"] != "u-9" {
+		t.Fatalf("首次提交应直接换票入池 = %d %v", code, res)
 	}
 	if res["duplicate"] == true {
 		t.Error("首次提交不该标成 duplicate")
-	}
-
-	code, res = call(t, pn, http.MethodPost, "/panel/api/login/code", `{"url":`+strconv.Quote(pasted)+`}`)
-	if code != http.StatusOK {
-		t.Fatalf("重复提交应当幂等成功，得到 %d %v", code, res)
-	}
-	if res["action"] != "session" || res["duplicate"] != true {
-		t.Errorf("重复提交应回报 action=session duplicate=true，得到 %v", res)
 	}
 
 	// 换票完成、会话被删之后，再提交同一条链接：回报上次的账号，而不是「无会话」直接换票。
@@ -467,7 +462,7 @@ func TestLoginCodeDuplicateSubmit(t *testing.T) {
 	}
 }
 
-// TestLoginPollTerminalOnBadCode 换票被业务层拒绝是终态：停轮询并说明原因，
+// TestLoginPollTerminalOnBadCode 换票被业务层拒绝是终态：提交时就如实回报并说明原因，
 // 不能让前端一直转圈（用户干等之后只会重复提交）。
 func TestLoginPollTerminalOnBadCode(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -490,12 +485,10 @@ func TestLoginPollTerminalOnBadCode(t *testing.T) {
 	_, body := call(t, pn, http.MethodPost, "/panel/api/login/start", `{"realm":"cn"}`)
 	state := fmt.Sprint(body["id"])
 	pasted := "http://127.0.0.1:17867/auth/callback?code=ac_bad&state=" + state
-	if code, _ := call(t, pn, http.MethodPost, "/panel/api/login/code", `{"url":`+strconv.Quote(pasted)+`}`); code != http.StatusOK {
-		t.Fatalf("提交回调 = %d", code)
-	}
-	code, res := call(t, pn, http.MethodGet, "/panel/api/login/poll?id="+state, "")
+	// 提交时就换票：业务拒绝要当场报 410，而不是先回「已收到」再等前端轮询。
+	code, res := call(t, pn, http.MethodPost, "/panel/api/login/code", `{"url":`+strconv.Quote(pasted)+`}`)
 	if code != http.StatusGone {
-		t.Fatalf("业务拒绝后 poll 应当 410（终态），得到 %d %v", code, res)
+		t.Fatalf("业务拒绝后提交应当 410（终态），得到 %d %v", code, res)
 	}
 	if msg, _ := res["error"].(string); !strings.Contains(msg, "重新发起") {
 		t.Errorf("终态原因要说清怎么办：%q", msg)
