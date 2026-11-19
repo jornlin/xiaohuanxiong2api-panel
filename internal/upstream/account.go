@@ -175,7 +175,15 @@ func (c *Client) EnsureWebSession(a *auth.Auth) (refreshed bool, popupPoints int
 	}
 	data, err = c.OfficeSettingInfo(a)
 	if err != nil {
-		return true, 0, err
+		// 并发普通续期可能抢到了单飞，拿回的是桌面会话票 → 再 web 续期一次。
+		// refresh_token 已轮换，这一次拿到的一定是 web 会话。
+		if _, rerr2 := c.refreshWeb(a); rerr2 != nil {
+			return true, 0, rerr2
+		}
+		data, err = c.OfficeSettingInfo(a)
+		if err != nil {
+			return true, 0, err
+		}
 	}
 	return true, popupPointsOf(data), nil
 }

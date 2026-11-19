@@ -443,6 +443,17 @@ func contains(hours []int, h int) bool {
 //
 // 返回逐账号结果（面板据此回报「本次 +N 分 / 已签 / 失败原因」）与失败列表（日志与 HTTP 状态码用）。
 func (s *Scheduler) RunCheckinNow() ([]CheckinResult, []error) {
+	return s.runCheckinNow(false)
+}
+
+// RunCheckinNowManual 面板「全部签到」：用户显式点击，强制重问礼包端点。
+// 自动轮次（整点/补签/启动补跑）不重置限频标记——两轮/天各问一次已经足够，
+// 桌面 grant 是网关最敏感的端点，重复问会把风控打出来。
+func (s *Scheduler) RunCheckinNowManual() ([]CheckinResult, []error) {
+	return s.runCheckinNow(true)
+}
+
+func (s *Scheduler) runCheckinNow(manual bool) ([]CheckinResult, []error) {
 	// 单飞：整点、补签 ticker、面板按钮、启动补跑四路并发时只放一轮进来。
 	if !s.checkinLock.TryLock() {
 		log.Printf("[checkin] 上一轮还在跑，跳过这一轮")
@@ -455,10 +466,12 @@ func (s *Scheduler) RunCheckinNow() ([]CheckinResult, []error) {
 		if i > 0 {
 			time.Sleep(checkinPace()) // 第一个不等；最后一个签完也不用再等
 		}
-		// 面板「全部签到」也是用户主动点击：清掉当天限频标记，未领成功的礼包重问一次
-		// （已领的号有 Granted 终态，不会重复打上游）。
-		if a := s.cfg.Pool.AuthByUID(uid); a != nil {
-			a.ResetGrantMarks()
+		if manual {
+			// 面板「全部签到」是用户主动点击：清掉当天限频标记，未领成功的礼包重问一次
+			// （已领的号有 Granted 终态，不会重复打上游）。
+			if a := s.cfg.Pool.AuthByUID(uid); a != nil {
+				a.ResetGrantMarks()
+			}
 		}
 		res, err := s.CheckinUID(uid)
 		results = append(results, res)
@@ -565,6 +578,7 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 			log.Printf("checkin refresh %s: 新票落盘失败: %v", uid, serr)
 		}
 	}
+	checkinStarted := time.Now()
 	cst, serr := s.cfg.Upstream.CheckinStatus(a)
 	checkedIn, reward, enable := cst.CheckedIn, cst.Credits, cst.Enable
 	// 收尾落池用的余额：默认复用签到前的状态查询，复核拿到更新的快照时覆盖。
@@ -574,27 +588,34 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 	var triggeredPoints int64
 	// 今日 daily_grant 是刚刚（10 分钟内）才入账的 → 这就是本次签到触发的，
 	// 面板应按「+300」回报，而不是冷冰冰的「已签」。
+	// 只认「本次调用开始之后」入账的：避免同一笔 300 分在 10 分钟内被
+	// 多次手动点击重复报成 +300，也避免把用户浏览器触发的入账算到面板头上。
+	// created_at 是服务器时间，留 2s 时钟容差。
 	if serr == nil && checkedIn && cst.TodayPoints > 0 && !cst.TodayGrantAt.IsZero() &&
+		cst.TodayGrantAt.After(checkinStarted.Add(-2*time.Second)) &&
 		time.Since(cst.TodayGrantAt) < 10*time.Minute {
 		triggeredPoints = cst.TodayPoints
 	}
 	if serr == nil && !checkedIn && enable {
-		if refreshed, pts, gerr := s.cfg.Upstream.EnsureWebSession(a); gerr == nil {
-			if refreshed {
-				if serr := a.SaveAtomic(); serr != nil {
-					log.Printf("checkin web session %s: 新票落盘失败: %v", uid, serr)
-				}
+		refreshed, _, gerr := s.cfg.Upstream.EnsureWebSession(a)
+		// refresh_token 一旦轮换就必须落盘——即使后面的 setting_info 重试失败。
+		if refreshed {
+			if serr := a.SaveAtomic(); serr != nil {
+				log.Printf("checkin web session %s: 新票落盘失败: %v", uid, serr)
 			}
-			triggeredPoints = pts
-			if cst2, err2 := s.cfg.Upstream.CheckinStatus(a); err2 == nil {
-				cst = cst2
-				checkedIn, reward, enable = cst.CheckedIn, cst.Credits, cst.Enable
-				finalCredits, finalKnown = cst.Credits, cst.CreditsKnown
-				triggeredPoints = cst.TodayPoints
-				log.Printf("checkin %s: web setting_info 触发每日积分（今日已入账 %d）", uid, cst.TodayPoints)
-			}
-		} else if gerr != nil {
+		}
+		if gerr != nil {
 			log.Printf("checkin web session %s: %v", uid, gerr)
+		} else if cst2, err2 := s.cfg.Upstream.CheckinStatus(a); err2 == nil {
+			cst = cst2
+			checkedIn, reward, enable = cst.CheckedIn, cst.Credits, cst.Enable
+			finalCredits, finalKnown = cst.Credits, cst.CreditsKnown
+			// 复核成功才按流水里的真实入账额回报；popup 里可能混着 3000 分礼包，
+			// 不能用它当「本次签到收益」。
+			if cst.TodayGrantAt.After(checkinStarted.Add(-2 * time.Second)) {
+				triggeredPoints = cst.TodayPoints
+			}
+			log.Printf("checkin %s: web setting_info 触发每日积分（今日已入账 %d）", uid, cst.TodayPoints)
 		}
 	}
 	// token 被别处轮换/提前吊销 → status 报 session 失效：换一张新票再查一次，别把

@@ -735,7 +735,7 @@ func (p *Panel) checkinAll(w http.ResponseWriter, r *http.Request) {
 		writeErr(w, http.StatusNotImplemented, "scheduler unavailable")
 		return
 	}
-	results, errs := p.cfg.Scheduler.RunCheckinNow()
+	results, errs := p.cfg.Scheduler.RunCheckinNowManual()
 	if len(errs) != 0 {
 		writeErr(w, checkinErrorStatus(errs[0]), publicErr(errs[0]))
 		return

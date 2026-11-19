@@ -39,13 +39,13 @@ type Config struct {
 		// PlanCredit 额度不足/套餐不支持时的硬冷却时长。
 		PlanCredit string `json:"plan_credit"` // "12h"
 		// SoftRate 软限流（429/404）冷却基数；SoftRateMax 是反复触发时指数退避的封顶。
-		SoftRate    string `json:"soft_rate"`     // "60s"
-		SoftRateMax string `json:"soft_rate_max"` // "2h"
+		SoftRate    string `json:"soft_rate"`     // "10s"
+		SoftRateMax string `json:"soft_rate_max"` // "60s"
 	} `json:"cooldown"`
 
 	Schedule struct {
 		// CheckinHours 每日签到时点；KeepaliveHours token 保活时点（每日无条件全账号刷一遍，均在 0-23）。
-		CheckinHours   []int `json:"checkin_hours"`   // [9]
+		CheckinHours   []int `json:"checkin_hours"`   // [0, 9]
 		KeepaliveHours []int `json:"keepalive_hours"` // [3]
 		// 开关缺省 true：键缺席保留默认，空数组仍回落默认时点——「禁用」只走开关，语义不混。
 		CheckinEnabled   bool `json:"checkin_enabled"`
@@ -145,9 +145,9 @@ func Default() *Config {
 		DefaultModel: "Auto",
 	}
 	c.Cooldown.PlanCredit = "12h"
-	c.Cooldown.SoftRate = "60s"
-	c.Cooldown.SoftRateMax = "2h"
-	c.Schedule.CheckinHours = []int{9}
+	c.Cooldown.SoftRate = "10s"
+	c.Cooldown.SoftRateMax = "60s"
+	c.Schedule.CheckinHours = []int{0, 9}
 	c.Schedule.KeepaliveHours = []int{3}
 	// 开关「缺省 true」靠这几行：Load 先取 Default() 再被 JSON 覆盖，键缺席即保留 true。
 	c.Schedule.CheckinEnabled = true

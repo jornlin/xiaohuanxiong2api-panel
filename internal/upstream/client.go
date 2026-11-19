@@ -890,6 +890,11 @@ func throttleSignal(raw string) bool {
 // 最多 1 次/秒，尖峰被摊平，账号就不会成批冷却。
 const minSendGap = time.Second
 
+// maxSendSlotWait 是单个出站名额的最长排队时间：重启后 138 个请求同时到达时，
+// 严格按 1s 排队会让最后一个等 2 分多钟，超过客户端/代理超时。到 30s 就先放行
+// （宁可让 429 闸门再兜底，也不能把请求挂死）。
+const maxSendSlotWait = 30 * time.Second
+
 // WaitSendSlot 按全局最小间隔排一个出站名额（调用方在每次 attempt 前调用）。
 // 名额先占后等：并发调用者按到达顺序排队，不会一起醒来再撞一次。
 func (c *Client) WaitSendSlot(ctx context.Context) {
@@ -903,6 +908,9 @@ func (c *Client) WaitSendSlot(ctx context.Context) {
 	c.throttleMu.Unlock()
 	if wait <= 0 {
 		return
+	}
+	if wait > maxSendSlotWait {
+		wait = maxSendSlotWait
 	}
 	timer := time.NewTimer(wait)
 	select {
