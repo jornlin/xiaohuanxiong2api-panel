@@ -148,6 +148,17 @@ function sortMark(tbId, key) {
     else th.removeAttribute('data-dir');
   });
 }
+// 点空白处收起所有 <details> 操作菜单（原生 details 默认不会自己关）。
+document.addEventListener('click', ev => {
+  document.querySelectorAll('details.menu[open]').forEach(d => {
+    if (!d.contains(ev.target)) d.open = false;
+  });
+  const mb = ev.target.closest('.menu-pop > button');
+  if (mb) {
+    const d = mb.closest('details.menu');
+    if (d) setTimeout(() => { d.open = false; }, 0);
+  }
+});
 document.addEventListener('click', ev => {
   const th = ev.target.closest('th[data-sort]');
   if (th) {
@@ -378,40 +389,6 @@ function credTitle(a) {
   }
   return tip;
 }
-// credCell 额度列单元格：只给一行「剩余 / 总额」；已用量与百分比在悬停提示（credTitle）里，
-// 单元格再压一行小字是重复。
-function credCell(a) {
-  a = a || {}; // 兜底：坏输入宁可渲染成 0/—，也不要抛异常把整张表打空
-  if (isUSD(a)) {
-    const limit = Number(a.limit_usd || 0);
-    return '<div class="n">' + esc(fmtUSD(usdRemain(a))) +
-      (limit > 0 ? '<span class="tot">/' + esc(fmtUSD(limit)) + '</span>' : '') + '</div>';
-  }
-  // 余额接口 403 期间新号从没拿到过快照：显示「—」而不是 0。
-  // 显示 0 会让人以为「领的 9000 分丢了」，实际积分在流水里（v2 income 可查）。
-  if (a.credits_known === false) {
-    return '<div class="n" title="余额接口（v1 balance 与工作台 setting_info）暂不可用；积分/礼包到账以 v2 积分流水为准">—</div>';
-  }
-  // 每日/永久拆分来自 v1 balance；拿不到拆分时只显示总额（不猜）。
-  const perm = (a.monthly || 0) + (a.reward || 0) + (a.topup || 0);
-  const tip = (a.daily || perm)
-    ? '每日/限时 ' + fmtNum(a.daily || 0) + ' · 永久 ' + fmtNum(perm)
-    : '';
-  return '<div class="n"' + (tip ? ' title="' + esc(tip) + '"' : '') + '>' + (a.credits || 0) +
-    (a.credits_total ? '<span class="tot">/' + a.credits_total + '</span>' : '') + '</div>';
-}
-
-// expCell 到期列：0 = 上游没给到期信息，不猜。临近/已过期才上标签，正常不动声色。
-function expCell(unix) {
-  if (!unix) return '<span style="color:var(--ink-3)">—</span>';
-  const d = new Date(unix * 1000);
-  const days = Math.ceil((d - Date.now()) / 86400000);
-  const md = (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0');
-  let s = '<span class="num">' + md + '</span>';
-  if (days < 0) s += ' ' + tag('bad', '已过期');
-  else if (days <= 3) s += ' ' + tag('warn', '剩 ' + days + ' 天');
-  return s;
-}
 
 // expCellRich 账号池「到期」列（原「积分到期提醒」表并入）：
 // 第一行日期 + 相对天数标签，第二行「该日到期 X 分」（只算每日批次；奖励/充值不会过期）。
@@ -514,12 +491,26 @@ const ACC_SORT = {
   last: a => a.last_success || '',
 };
 
-// 到期筛选：把原「积分到期提醒」表的用途收进账号池——按「7/30 天内到期」筛出该先看的号。
-function accExpFiltered(list) {
+// 展开行的账号 uid（点行展开细节：token / 成功率 / 设备 / 任务）。
+const accOpen = new Set();
+
+// 账号筛选：搜索（昵称/手机号/UID）+ 状态 + 到期，三种条件叠加。
+// 「到期筛选」把原「积分到期提醒」表的用途收进账号池——按 7/30 天内到期筛出该先看的号。
+function accFiltered(list) {
+  const q = ($('accQ') ? $('accQ').value.trim().toLowerCase() : '');
+  const st = $('accStatus') ? $('accStatus').value : 'all';
   const f = $('accExpFilter') ? $('accExpFilter').value : 'all';
-  if (f === 'all') return list;
   const now = Date.now();
   return list.filter(a => {
+    if (q) {
+      const hay = ((a.nickname || '') + ' ' + (a.phone || '') + ' ' + a.uid).toLowerCase();
+      if (!hay.includes(q)) return false;
+    }
+    if (st === 'ok' && (a.disabled || a.cooling)) return false;
+    if (st === 'cool' && !a.cooling) return false;
+    if (st === 'disabled' && !a.disabled) return false;
+    if (st === 'checkin' && !a.checkin_cooling) return false;
+    if (f === 'all') return true;
     const u = Number(a.expire || 0);
     if (f === 'none') return !u;
     if (!u) return false;
@@ -531,18 +522,47 @@ function accExpFiltered(list) {
   });
 }
 
+// credCell2 账号池积分列：主数字是「可用合计」，下行给出每日/永久构成条与拆分。
+// 与 Loomy 面板同口径——每日额度当天会作废，永久积分不会；混成一个数就看不出该先花谁。
+function credCell2(a) {
+  a = a || {};
+  if (isUSD(a)) {
+    const limit = Number(a.limit_usd || 0);
+    return '<div class="n">' + esc(fmtUSD(usdRemain(a))) +
+      (limit > 0 ? '<span class="tot">/' + esc(fmtUSD(limit)) + '</span>' : '') + '</div>';
+  }
+  if (a.credits_known === false) {
+    return '<div class="n" title="余额接口暂不可用；积分/礼包到账以积分流水为准">—</div>';
+  }
+  const daily = Number(a.daily || 0);
+  const perm = Number(a.monthly || 0) + Number(a.reward || 0) + Number(a.topup || 0);
+  const total = Number(a.credits || 0);
+  const denom = daily + perm;
+  let out = '<div class="n">' + fmtNum(total) +
+    (a.credits_total ? '<span class="tot">/' + fmtNum(a.credits_total) + '</span>' : '') + '</div>';
+  if (denom > 0) {
+    const wd = Math.max(0, Math.min(100, Math.round(daily / denom * 100)));
+    out += '<div class="mix"><i class="d" style="width:' + wd + '%"></i>' +
+      '<i class="p" style="width:' + (100 - wd) + '%"></i></div>' +
+      '<div class="sub">每日 ' + fmtNum(daily) + ' · 永久 ' + fmtNum(perm) + '</div>';
+  }
+  return out;
+}
+
 function renderAccounts(list) {
   const tb = $('accBody');
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="11"><div class="empty"><div class="big">账号池是空的</div>' +
+    tb.innerHTML = '<tr><td colspan="8"><div class="empty"><div class="big">账号池是空的</div>' +
       '点击右上角「添加账号」：用<strong>微信扫码</strong>最省事（不用装客户端、也不用复制任何东西），' +
       '也可以切到 refreshToken 页粘贴一条凭证</div></td></tr>';
     return;
   }
-  const filtered = accExpFiltered(list);
-  pgSig('acc', $('accExpFilter') ? $('accExpFilter').value : 'all');
+  const filtered = accFiltered(list);
+  pgSig('acc', ['accQ', 'accStatus', 'accExpFilter'].map(id => $(id) ? $(id).value : '').join('|'));
+  const cnt = $('accCount');
+  if (cnt) cnt.textContent = filtered.length === list.length ? list.length + ' 个账号' : filtered.length + ' / ' + list.length + ' 个账号';
   if (!filtered.length) {
-    tb.innerHTML = '<tr><td colspan="11"><div class="empty">当前到期筛选没有匹配的账号</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="8"><div class="empty">当前搜索 / 筛选条件没有匹配的账号</div></td></tr>';
     return;
   }
   const rows = sortApply('acc', filtered, ACC_SORT, 'credits', -1);
@@ -550,7 +570,9 @@ function renderAccounts(list) {
   const page = pgApply('accBody', 'acc', rows);
   sortMark('accBody', 'acc');
   tb.innerHTML = page.map(a => {
+    const uid = String(a.uid);
     const cls = a.disabled ? 'off' : (a.cooling ? 'cool' : '');
+    const open = accOpen.has(uid);
     const st = [];
     if (a.disabled) st.push(tag('bad', '已禁用'));
     else if (a.cooling) st.push(tag('warn', '冷却中', a.reason));
@@ -560,45 +582,62 @@ function renderAccounts(list) {
       st.push(tag('warn', '签到冷却', a.checkin_reason || '签到失败，已暂停自动签到'));
     }
     // 今日签到状态：只读查询过一次才显示（按需拉取，不点就没标记，也没额外上游请求）。
-    const cs = checkinState[String(a.uid)];
+    const cs = checkinState[uid];
     if (!a.disabled && cs === true) st.push(tag('mute', '今日已签'));
     else if (!a.disabled && cs === false) st.push(tag('warn', '今日未签'));
-    // 新手任务：同样按需拉取（点「新手任务」才有），标记里带完成度与礼包欠账。
-    if (!a.disabled && taskState[String(a.uid)]) st.push(taskTags(taskState[String(a.uid)]));
-    const acts = ['<button class="xs" data-a="checkin" data-u="' + esc(a.uid) + '">签到</button>',
-      // 一次性新手礼包（桌面端 + 移动端各 3000）：与签到解耦，领过的号上游回「已领过」。
-      '<button class="xs" data-a="grants" data-u="' + esc(a.uid) +
-        '" title="领这个号的一次性新手礼包（桌面端 + 移动端，各 3000 分）">领礼包</button>',
-      '<button class="xs" data-a="balance" data-u="' + esc(a.uid) + '">刷新</button>',
-      // 单号刷票：只动这个号，省掉整池保活。
-      '<button class="xs" data-a="refresh" data-u="' + esc(a.uid) +
-        '" title="只给这个号换一张新 token（不动其它账号）">刷 token</button>',
-      // 凭证预览：只回 token 前缀与长度，用来确认「盘上这份是谁、什么时候过期」。
-      '<button class="xs" data-a="cred" data-u="' + esc(a.uid) +
-        '" title="看盘上这份凭证（脱敏）">凭证</button>',
-      // 换指纹 = 换 cosy-machineid（设备维度风控）。当前值直接挂 tooltip。
-      '<button class="xs" data-a="rotate-device" data-u="' + esc(a.uid) +
-        '" title="换一套设备指纹（cosy-machineid）；当前 ' + esc(a.machine_id || '—') + '">换指纹</button>'];
-    if (a.cooling) acts.push('<button class="xs" data-a="clear-cooldown" data-u="' + esc(a.uid) + '">解除冷却</button>');
-    if (a.disabled) acts.push('<button class="xs" data-a="enable" data-u="' + esc(a.uid) + '">启用</button>');
-    if (!a.disabled) acts.push('<button class="xs danger" data-a="disable" data-u="' + esc(a.uid) + '">禁用</button>');
-    acts.push('<button class="xs danger" data-a="remove" data-u="' + esc(a.uid) + '">移除</button>');
-    return '<tr class="' + cls + '"><td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + (a.realm !== 'cn' ? '<span class="tag mute">国际</span> ' : '') + esc(a.nickname || a.uid) + '</div><div class="id">' + (a.phone ? esc(a.phone) + ' · ' : '') + esc(a.uid) + '</div></td>' +
+    if (!a.disabled && taskState[uid]) st.push(taskTags(taskState[uid]));
+    const more = [
+      '<button class="xs ghost" data-a="grants" data-u="' + esc(uid) + '">领新手礼包</button>',
+      '<button class="xs ghost" data-a="refresh" data-u="' + esc(uid) + '">刷 token</button>',
+      '<button class="xs ghost" data-a="cred" data-u="' + esc(uid) + '">查看凭证</button>',
+      '<button class="xs ghost" data-a="rotate-device" data-u="' + esc(uid) + '">换设备指纹</button>',
+    ];
+    if (a.cooling) more.push('<button class="xs ghost" data-a="clear-cooldown" data-u="' + esc(uid) + '">解除冷却</button>');
+    more.push('<div class="menu-sep"></div>');
+    more.push(a.disabled
+      ? '<button class="xs ghost" data-a="enable" data-u="' + esc(uid) + '">启用账号</button>'
+      : '<button class="xs ghost danger" data-a="disable" data-u="' + esc(uid) + '">禁用账号</button>');
+    more.push('<button class="xs ghost danger" data-a="remove" data-u="' + esc(uid) + '">移除账号</button>');
+    const det = '<div class="acc-det-in">' +
+      '<span class="kv"><i>Token</i><b>' + (a.token_expires_at ? esc(expCellText(a.token_expires_at)) : '—') + '</b></span>' +
+      '<span class="kv"><i>成功 / 失败</i><b>' + (a.success_count || 0) + ' / ' + (a.err_total || 0) + '</b></span>' +
+      '<span class="kv' + (a.err_count ? ' err' : '') + '"><i>连续错误</i><b>' + (a.err_count || 0) + '</b></span>' +
+      '<span class="kv"><i>在途</i><b>' + (a.in_flight || 0) + '</b></span>' +
+      '<span class="kv"><i>设备</i><b>' + esc(a.machine_id || '—') + '</b></span>' +
+      (a.checkin_cooling ? '<span class="kv err"><i>签到</i><b>' + esc(a.checkin_reason || '冷却中') + '</b></span>' : '') +
+      (checkinState[uid] !== undefined ? '<span class="kv"><i>今日签到</i><b>' + (checkinState[uid] ? '已签' : '未签') + '</b></span>' : '') +
+      '</div>';
+    return '<tr class="' + cls + ' acc-row' + (open ? ' sel' : '') + '" data-row="' + esc(uid) + '">' +
+      '<td class="mark" aria-hidden="true"><i></i></td>' +
+      '<td class="who"><svg class="chev" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M6 3.5l5 4.5-5 4.5"/></svg>' +
+        '<div class="wtxt"><div class="nm">' + (a.realm !== 'cn' ? '<span class="tag mute">国际</span> ' : '') + esc(a.nickname || uid) + '</div>' +
+        '<div class="id">' + (a.phone ? esc(a.phone) + ' · ' : '') + esc(uid) + '</div></div></td>' +
       '<td>' + st.join(' ') + '</td>' +
-      '<td class="cred" title="' + esc(credTitle(a)) + '">' + credCell(a) + '</td>' +
+      '<td class="cred2" title="' + esc(credTitle(a)) + '">' + credCell2(a) + '</td>' +
       '<td>' + expCellRich(a) + '</td>' +
-      '<td>' + expCell(a.token_expires_at) + '</td>' +
-      '<td class="num">' + (a.err_count || 0) + '</td>' +
-      '<td class="num" title="累计成功 / 失败（自记录起）">' + (a.success_count || 0) +
-        ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (a.err_total || 0) + '</span></td>' +
-      '<td class="num">' + (a.in_flight || 0) + '</td>' +
       usageCell(a.usage) +
       '<td class="num" style="color:var(--ink-3)">' + ago(a.last_success) + '</td>' +
-      '<td class="c-acts"><div class="acts">' + acts.join('') + '</div></td></tr>';
+      '<td class="c-acts"><div class="acts">' +
+        '<button class="xs" data-a="checkin" data-u="' + esc(uid) + '">签到</button>' +
+        '<button class="xs" data-a="balance" data-u="' + esc(uid) + '">刷新</button>' +
+        '<details class="menu rowmenu"><summary class="xs more">⋯</summary><div class="menu-pop">' +
+          more.join('') + '</div></details>' +
+      '</div></td></tr>' +
+      '<tr class="acc-det" data-det="' + esc(uid) + '"' + (open ? '' : ' hidden') + '><td></td><td colspan="7">' + det + '</td></tr>';
   }).join('');
 }
 PG_RENDER.acc = () => renderAccounts((overviewData && overviewData.accounts) || []);
+
+// expCellText 纯文本到期（展开行里用）。上游这两类时间戳单位不统一：
+// 积分到期是 Unix 秒，access_token 到期历史上有毫秒（1797060088000），按量级归一。
+function expCellText(ts) {
+  const ms = Number(ts) > 1e12 ? Number(ts) : Number(ts) * 1000;
+  const d = new Date(ms);
+  if (isNaN(d)) return '—';
+  const days = Math.round((ms - Date.now()) / 86400000);
+  return d.toLocaleString('zh-CN', { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) +
+    (days < 0 ? '（已过期）' : '（' + days + ' 天后）');
+}
 
 // renderExpiry 积分到期提醒：按「最近到期日」给每号一行，回答「哪天会作废多少、
 // 想用完得日均消耗多少」。数据只用 overview 已经带回来的 credits / expire，
@@ -647,13 +686,29 @@ async function loadOverview(quiet) {
     $('sDisabled').textContent = d.disabled;
     const cSum = list.reduce((s, a) => s + (isUSD(a) ? 0 : (a.credits || 0)), 0);
     const cTot = list.reduce((s, a) => s + (isUSD(a) ? 0 : (a.credits_total || 0)), 0);
-    $('sCredits').textContent = cSum + (cTot ? '/' + cTot : '');
+    // 合计卡只放「可用」：总额是历史发放量，混在同一行会被窄格截断成 950,921/9…
+    $('sCredits').textContent = fmtNum(cSum);
+    $('sCredits').parentElement.title = cTot
+      ? '可用 ' + fmtNum(cSum) + ' / 历史发放总额 ' + fmtNum(cTot) : '可用积分合计';
     // 每日/永久两桶（v1 或 setting_info+流水推算）：顶部直接看「还能花多少每日额度」。
     $('sDaily').textContent = fmtNum(d.daily_balance || 0);
     $('sDaily').title = '今日已发 ' + fmtNum(d.daily_today_granted || 0) +
       ' · 今日已用 ' + fmtNum(d.daily_used_today || 0);
     $('sDailyUsed').textContent = fmtNum(d.daily_used_today || 0);
     $('sPermanent').textContent = fmtNum(d.permanent_balance || 0);
+    // 构成条：每日 vs 永久（只看池内快照，不猜）。
+    const mix = $('ovMix');
+    if (mix) {
+      const dl = Math.max(0, Number(d.daily_balance || 0));
+      const pm = Math.max(0, Number(d.permanent_balance || 0));
+      const sum = dl + pm;
+      const w = sum > 0 ? Math.round(dl / sum * 100) : 0;
+      mix.querySelector('.d').style.width = w + '%';
+      mix.querySelector('.p').style.width = (sum > 0 ? 100 - w : 0) + '%';
+      mix.title = sum > 0
+        ? '每日赠送 ' + fmtNum(dl) + '（' + w + '%） · 永久 ' + fmtNum(pm) + '（' + (100 - w) + '%）'
+        : '暂无积分快照';
+    }
     // 国际版额度是美元，单独一张卡，不并进「积分合计」——两个口径不可换算，
     // 相加只会得到一个既不是积分也不是美元的假数。没有美元账号就整卡隐藏。
     const usdAccounts = list.filter(isUSD);
@@ -686,10 +741,6 @@ async function loadOverview(quiet) {
     // v1 明细接口 403 熔断中：余额改由工作台 setting_info 提供（官方网页同款口径）。
     if (d.quota_blocked) accNote += ' · v1 明细接口受限，余额取自工作台 setting_info';
     $('accNote').textContent = accNote;
-    // 网关基址现状（overview 的 agent_host_*）：上游换域名时这里是第一现场。
-    $('agHostNote').textContent = d.agent_host_intl
-      ? '推理 ' + d.agent_host_intl + ' · 鉴权 ' + (d.agent_host_cn || '—') + ' '
-      : '';
     const up = Math.floor(d.uptime_sec || 0);
     $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') +
       Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
@@ -2163,13 +2214,13 @@ async function loadInvites(force) {
   }
   if (invitesLoading) return;
   invitesLoading = true;
-  $('invBody').innerHTML = '<tr><td colspan="8"><div class="empty">加载中…（逐号查询上游邀请码，约需数秒；60 秒内命中缓存）</div></td></tr>';
+  $('invBody').innerHTML = '<tr><td colspan="7"><div class="empty">加载中…（逐号查询上游邀请码，约需数秒；60 秒内命中缓存）</div></td></tr>';
   try {
     invitesData = await api('invites');
     invitesAt = Date.now();
     renderInvites();
   } catch (e) {
-    $('invBody').innerHTML = '<tr><td colspan="8"><div class="empty">' + esc(e.message) + '</div></td></tr>';
+    $('invBody').innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
   } finally {
     invitesLoading = false;
   }
@@ -2181,8 +2232,6 @@ function invRows() {
   return all.filter(a => {
     if (f === 'invited') return (a.registered_invitees || 0) > 0;
     if (f === 'no_invitee') return !(a.registered_invitees || 0);
-    if (f === 'bound') return !!a.invited_by;
-    if (f === 'unbound') return !a.invited_by;
     return true;
   });
 }
@@ -2193,20 +2242,18 @@ const INV_SORT = {
   invitees: a => Number(a.registered_invitees || 0),
   granted: a => Number(a.granted_points || 0),
   remaining: a => Number(a.remaining_reward_invitees || 0),
-  bind: a => (a.invited_by ? 1 : 0),
 };
 
 function renderInvites() {
   const s = (invitesData && invitesData.summary) || {};
   $('invNote').textContent = '共 ' + (s.accounts || 0) + ' 个号 · 有邀请码 ' + (s.with_code || 0) +
-    ' · 已邀 ' + (s.invited_total || 0) + ' 人 · 已发 ' + fmtNum(s.granted_total || 0) + ' 分';
+    ' · 已邀 ' + (s.invited_total || 0) + ' 人 · 已发 ' + fmtNum(s.granted_total || 0) + ' 分' +
+    ' · 邀请只在注册时生效';
   $('invStats').innerHTML =
-    usKpi(String(s.accounts || 0), '账号总数') +
-    usKpi(String(s.with_code || 0), '有邀请码') +
-    usKpi(String(s.invited_total || 0), '已邀请人数') +
-    usKpi(fmtNum(s.granted_total || 0), '邀请已发积分') +
-    usKpi(String(s.slots_left || 0), '剩余奖励名额') +
-    usKpi(String(s.bound || 0) + ' / ' + String(s.unbound || 0), '已绑定 / 未绑定邀请人');
+    usKpi(String(s.invited_total || 0), '已邀请人数', 'c-accent') +
+    usKpi(fmtNum(s.granted_total || 0), '邀请已发积分', 'c-ok') +
+    usKpi(String(s.slots_left || 0), '剩余奖励名额', 'c-soft') +
+    usKpi(String(s.with_code || 0) + ' / ' + String(s.accounts || 0), '有邀请码 / 账号');
   const filtered = invRows();
   pgSig('inv', $('invFilter') ? $('invFilter').value : 'all');
   const rows = sortApply('inv', filtered, INV_SORT, 'invitees', -1);
@@ -2214,15 +2261,12 @@ function renderInvites() {
   const page = pgApply('invBody', 'inv', rows);
   sortMark('invBody', 'inv');
   if (!rows.length) {
-    $('invBody').innerHTML = '<tr><td colspan="8"><div class="empty">没有匹配的账号</div></td></tr>';
+    $('invBody').innerHTML = '<tr><td colspan="7"><div class="empty">没有匹配的账号</div></td></tr>';
     return;
   }
   $('invBody').innerHTML = page.map(a => {
     const who = '<div class="nm">' + esc(a.nickname || a.uid) + '</div>' +
       '<div class="id">' + (a.phone ? esc(a.phone) + ' · ' : '') + esc(a.uid) + '</div>';
-    const bind = a.invited_by
-      ? tag('ok', '已绑定', '注册时使用了邀请码 ' + a.invited_by)
-      : tag('mute', '未绑定', '注册时没有带邀请码；上游没有补绑接口');
     const link = a.link
       ? '<div class="urlrow" style="gap:6px"><input readonly value="' + esc(a.link) + '" ' +
         'style="min-width:240px;max-width:360px;font-size:12px">' +
@@ -2234,11 +2278,8 @@ function renderInvites() {
       '<td class="num">' + (a.registered_invitees || 0) + '</td>' +
       '<td class="num">' + fmtNum(a.granted_points || 0) + '</td>' +
       '<td class="num">' + (a.remaining_reward_invitees != null ? a.remaining_reward_invitees : '—') + '</td>' +
-      '<td>' + bind + '</td>' +
       '<td>' + link + '</td>' +
-      '<td class="c-acts">' +
-        (a.invited_by ? '' : '<button class="xs ghost" data-bind="' + esc(a.uid) + '">补绑</button>') +
-        '<button class="xs ghost" data-rec="' + esc(a.uid) + '">记录</button></td>' +
+      '<td class="c-acts"><button class="xs ghost" data-rec="' + esc(a.uid) + '">记录</button></td>' +
       '</tr>';
   }).join('');
 }
@@ -2830,41 +2871,36 @@ function grantsMsg(gs) {
     } catch (e) { toast(e.message, 'err'); }
     finally { b.disabled = false; loadOverview(true); }
   };
-  // 账号池「到期」筛选：原积分到期提醒表的入口，筛完自动回第一页。
+  // 账号池筛选：搜索防抖 120ms；状态下拉/到期下拉即时；三者叠加，筛完自动回第一页。
+  let accQTimer = null;
+  $('accQ').addEventListener('input', () => {
+    clearTimeout(accQTimer);
+    accQTimer = setTimeout(() => renderAccounts((overviewData && overviewData.accounts) || []), 120);
+  });
+  $('accStatus').onchange = () => renderAccounts((overviewData && overviewData.accounts) || []);
   $('accExpFilter').onchange = () => renderAccounts((overviewData && overviewData.accounts) || []);
+  $('btnAccReset').onclick = () => {
+    $('accQ').value = ''; $('accStatus').value = 'all'; $('accExpFilter').value = 'all';
+    renderAccounts((overviewData && overviewData.accounts) || []);
+  };
+  // 点整行展开只读细节；按钮/下拉/链接不触发展开。
+  $('accBody').addEventListener('click', ev => {
+    if (ev.target.closest('button, summary, input, select, a, .menu-pop')) return;
+    const tr = ev.target.closest('tr.acc-row');
+    if (!tr) return;
+    const uid = tr.dataset.row;
+    accOpen.has(uid) ? accOpen.delete(uid) : accOpen.add(uid);
+    const det = document.querySelector('tr.acc-det[data-det="' + CSS.escape(uid) + '"]');
+    const open = accOpen.has(uid);
+    tr.classList.toggle('sel', open);
+    if (det) det.hidden = !open;
+  });
   // 邀请页：复制链接 / 查看邀请记录 / 筛选 / 刷新
   $('invBody').addEventListener('click', async ev => {
     const c = ev.target.closest('button[data-copy]');
     if (c) {
       const ok = await copyText(c.dataset.copy, null);
       toast(ok ? '邀请链接已复制' : '复制失败，请手动选择链接', ok ? 'ok' : 'err');
-      return;
-    }
-    const b = ev.target.closest('button[data-bind]');
-    if (b) {
-      const code = prompt('输入邀请码，把账号 ' + b.dataset.bind + ' 绑定到该邀请人：');
-      if (!code || !code.trim()) return;
-      try {
-        const d = await api('accounts/' + encodeURIComponent(b.dataset.bind) + '/bind_invite',
-          { method: 'POST', body: JSON.stringify({ invite_code: code.trim() }) });
-        toast(d.attribution_updated
-          ? '已绑定邀请人 ' + d.invited_by
-          : '上游返回成功，但邀请归因没有落地（该号注册来源可能不支持补绑）',
-          d.attribution_updated ? 'ok' : 'err');
-        // 局部更新：只改这一行与汇总，不重新逐号查上游。
-        if (d.attribution_updated && d.invited_by && invitesData) {
-          const row = (invitesData.accounts || []).find(x => x.uid === b.dataset.bind);
-          if (row) {
-            row.invited_by = d.invited_by;
-            const sm = invitesData.summary;
-            if (sm) {
-              sm.bound = (sm.bound || 0) + 1;
-              sm.unbound = Math.max(0, (sm.unbound || 0) - 1);
-            }
-            renderInvites();
-          }
-        }
-      } catch (e) { toast(e.message, 'err'); }
       return;
     }
     const r = ev.target.closest('button[data-rec]');
@@ -2928,7 +2964,12 @@ function grantsMsg(gs) {
       else if (a === 'enable') toast('已启用', 'ok');
       else toast('已移除', 'ok');
     } catch (e) { toast(e.message, 'err'); }
-    finally { b.disabled = false; loadOverview(true); }
+    finally {
+      b.disabled = false;
+      const dm = b.closest('details.menu');
+      if (dm) dm.open = false;
+      loadOverview(true);
+    }
   });
 
   $('btnModels').onclick = loadModels;

@@ -285,7 +285,13 @@ func (p *Panel) writeOverview(w http.ResponseWriter, extra map[string]any) {
 		rows[i] = accountRow{Status: st}
 		if a := p.cfg.Pool.AuthByUID(st.UID); a != nil {
 			rows[i].MachineID = a.MachineIDValue()
-			rows[i].TokenExpiresAt = a.ExpiresAtValue()
+			// 字段口径是 Unix 秒，但凭证文件里的 exp 历史上存过毫秒；按量级归一，
+			// 否则前端会算出「2000 万天后到期」这种明显错的行。
+			if v := a.ExpiresAtValue(); v > 1e12 {
+				rows[i].TokenExpiresAt = v / 1000
+			} else {
+				rows[i].TokenExpiresAt = v
+			}
 		}
 	}
 	for _, a := range p.cfg.Usage.Snapshot(usagePanelHours, p.nicks()).ByAccount {
