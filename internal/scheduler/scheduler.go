@@ -445,6 +445,11 @@ func (s *Scheduler) RunCheckinNow() ([]CheckinResult, []error) {
 		if i > 0 {
 			time.Sleep(checkinPace()) // 第一个不等；最后一个签完也不用再等
 		}
+		// 面板「全部签到」也是用户主动点击：清掉当天限频标记，未领成功的礼包重问一次
+		// （已领的号有 Granted 终态，不会重复打上游）。
+		if a := s.cfg.Pool.AuthByUID(uid); a != nil {
+			a.ResetGrantMarks()
+		}
 		res, err := s.CheckinUID(uid)
 		results = append(results, res)
 		if err != nil {
@@ -626,7 +631,7 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 			desktopGrant, claimErr = s.claimWithRetry(a)
 			desktopTried = true
 			if claimErr == nil {
-				a.MarkDesktopGrantDone()
+				a.MarkDesktopGrantDone(desktopGrant != nil && desktopGrant.Granted)
 				if serr := a.SaveAtomic(); serr != nil {
 					log.Printf("checkin claim %s: 问询标记落盘失败: %v", uid, serr)
 				}
@@ -775,7 +780,7 @@ func checkinCooldown(err error) (time.Duration, bool) {
 func (s *Scheduler) claimWithRetry(a *auth.Auth) (*NewcomerGrant, error) {
 	granted, err := s.cfg.Upstream.CheckinClaim(a)
 	if err == nil {
-		a.MarkDesktopGrantDone()
+		a.MarkDesktopGrantDone(granted)
 		return &NewcomerGrant{Key: "desktop_login", Granted: granted}, nil
 	}
 	if !isNetworkError(err) {
@@ -786,7 +791,7 @@ func (s *Scheduler) claimWithRetry(a *auth.Auth) (*NewcomerGrant, error) {
 	if err != nil {
 		return nil, err
 	}
-	a.MarkDesktopGrantDone()
+	a.MarkDesktopGrantDone(granted)
 	return &NewcomerGrant{Key: "desktop_login", Granted: granted}, nil
 }
 
@@ -830,7 +835,7 @@ func (s *Scheduler) claimNewcomerGrants(a *auth.Auth, force, skipDesktop bool) [
 			log.Printf("desktop-grant %s: %v", a.UID, err)
 			out = append(out, NewcomerGrant{Key: "desktop_login", Error: err.Error()})
 		default:
-			a.MarkDesktopGrantDone()
+			a.MarkDesktopGrantDone(granted)
 			// 落盘：否则重启后同一天还会对所有号再打一轮（风控来源）。
 			if serr := a.SaveAtomic(); serr != nil {
 				log.Printf("desktop-grant %s: 问询标记落盘失败: %v", a.UID, serr)
@@ -846,7 +851,7 @@ func (s *Scheduler) claimNewcomerGrants(a *auth.Auth, force, skipDesktop bool) [
 			log.Printf("mobile-grant %s: %v", a.UID, err)
 			out = append(out, NewcomerGrant{Key: "mobile_login", Error: err.Error()})
 		default:
-			a.MarkMobileGrantDone()
+			a.MarkMobileGrantDone(granted)
 			if serr := a.SaveAtomic(); serr != nil {
 				log.Printf("mobile-grant %s: 问询标记落盘失败: %v", a.UID, serr)
 			}
@@ -920,6 +925,11 @@ func (s *Scheduler) RunCheckinOne(uid string) (CheckinResult, error) {
 		return CheckinResult{UID: uid}, ErrRoundBusy
 	}
 	defer s.checkinLock.Unlock()
+	// 手动签到的语义是「现在就领」：把当天限频标记清掉，未领成功的礼包立刻重问。
+	// 已领成功的号有 Granted 终态，不受影响，不会重复打上游。
+	if a := s.cfg.Pool.AuthByUID(uid); a != nil {
+		a.ResetGrantMarks()
+	}
 	return s.CheckinUID(uid)
 }
 

@@ -599,6 +599,17 @@ func (p *Panel) saveAccount(creds *auth.Auth) (uid, nickname string, err error) 
 	}
 	p.cfg.Pool.Add(creds)
 	log.Printf("panel: 账号已入池 uid=%s realm=%s", creds.UID, creds.Realm())
+	// 入池后立刻异步领一次性礼包（桌面端/移动端各 3000）：不等下一轮定时签到，
+	// 否则「刚加号 → 点签到」这段窗口里会显示没有新增积分。
+	// 与签到轮共用 checkinLock；正在跑一轮时返回 ErrRoundBusy，下一轮会补。
+	if p.cfg.Scheduler != nil {
+		uid := creds.UID
+		go func() {
+			if _, err := p.cfg.Scheduler.ClaimNewcomerNow(uid); err != nil {
+				log.Printf("panel: 新号 %s 立即领取礼包未完成（下一轮签到会补）：%v", uid, err)
+			}
+		}()
+	}
 	return creds.UID, creds.Nickname, nil
 }
 

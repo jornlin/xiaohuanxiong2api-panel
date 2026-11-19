@@ -73,10 +73,13 @@ type Data struct {
 	CreditAt  string `json:"credit_at,omitempty"`
 	CheckedIn string `json:"checked_in,omitempty"`
 
-	// 一次性新手礼包上次问询的日期（YYYY-MM-DD）。见 Auth 结构体上的说明：
-	// 落盘是为了重启后同一天不重复打上游。
+	// 一次性新手礼包上次问询的日期（YYYY-MM-DD）与「已确认领到」标记。
+	// 日期只用于自动轮次的限频；Granted 才是真的终态（只有上游 granted=true 才置位）。
+	// 之前把「问过一次 false」当终态，导致上游延迟结算的号当天再也领不到。
 	DesktopGrantAt string `json:"desktop_grant_at,omitempty"`
 	MobileGrantAt  string `json:"mobile_grant_at,omitempty"`
+	DesktopGranted bool   `json:"desktop_granted,omitempty"`
+	MobileGranted  bool   `json:"mobile_granted,omitempty"`
 }
 
 // Lock / Unlock / RLock / RUnlock 供其他包在改写字段期间加锁。
@@ -198,42 +201,52 @@ func (a *Auth) SetPhone(phone, nation string) {
 	a.mu.Unlock()
 }
 
-// DesktopGrantDone 今天是否已经问过桌面端礼包。
-// 按日期而非永久标记：同一天不重复打上游，次日允许再试。
+// DesktopGrantDone 是否已经不必再问桌面端礼包：
+// 真的领到过（Granted）或今天已经问过（At==今天）。
+// 「今天问过但没领到」只是限频，不代表终态——手动签到会 ResetGrantMarks 后重问。
 func (a *Auth) DesktopGrantDone() bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.DesktopGrantAt == grantToday()
+	return a.DesktopGranted || a.DesktopGrantAt == grantToday()
 }
 
-// MarkDesktopGrantDone 记下「今天问过了」。调用方负责 SaveAtomic 落盘，
-// 否则重启后同一天还会再打一轮（这正是风控的来源）。
-func (a *Auth) MarkDesktopGrantDone() {
+// MarkDesktopGrantDone 记下本次问询。granted=true 才是真正的终态；
+// false 只记日期（当天自动轮次不再重复打，次日/手动操作仍可重试）。
+func (a *Auth) MarkDesktopGrantDone(granted bool) {
 	a.mu.Lock()
 	a.DesktopGrantAt = grantToday()
+	if granted {
+		a.DesktopGranted = true
+	}
 	a.mu.Unlock()
 }
 
-// MobileGrantDone 今天是否已经问过手机端首登奖励。
+// MobileGrantDone 手机端首登奖励是否已不必再问（同 DesktopGrantDone）。
 func (a *Auth) MobileGrantDone() bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.MobileGrantAt == grantToday()
+	return a.MobileGranted || a.MobileGrantAt == grantToday()
 }
 
-// MarkMobileGrantDone 记下「今天问过了」，同样由调用方落盘。
-func (a *Auth) MarkMobileGrantDone() {
+// MarkMobileGrantDone 记下本次问询；granted=true 才置终态。
+func (a *Auth) MarkMobileGrantDone(granted bool) {
 	a.mu.Lock()
 	a.MobileGrantAt = grantToday()
+	if granted {
+		a.MobileGranted = true
+	}
 	a.mu.Unlock()
 }
 
 // ResetGrantMarks 抹掉两笔礼包的「已问过」记忆，让面板上的手动领取能真问一次上游。
 // 给用户手动点「领新手礼包」用：进程内标记只是省一次幂等请求，不该拦下显式点击。
+// ResetGrantMarks 清空礼包问询的日期与终态：供**用户显式操作**（面板领礼包、
+// 手动签到）使用——点击的语义就是「现在就问上游」，不该被限频或旧终态挡住。
+// 自动轮次不调用它，仍按日期/终态限频，避免把网关风控打出来。
 func (a *Auth) ResetGrantMarks() {
 	a.mu.Lock()
-	a.DesktopGrantAt = ""
-	a.MobileGrantAt = ""
+	a.DesktopGrantAt, a.MobileGrantAt = "", ""
+	a.DesktopGranted, a.MobileGranted = false, false
 	a.mu.Unlock()
 }
 
@@ -315,6 +328,8 @@ func (a *Auth) snapshotLocked() Data {
 		CheckedIn:      a.CheckedIn,
 		DesktopGrantAt: a.DesktopGrantAt,
 		MobileGrantAt:  a.MobileGrantAt,
+		DesktopGranted: a.DesktopGranted,
+		MobileGranted:  a.MobileGranted,
 	}
 }
 
