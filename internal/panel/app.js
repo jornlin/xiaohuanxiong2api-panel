@@ -365,7 +365,18 @@ function credTitle(a) {
       '。上游 is_dollar_usage_billing=true，积分字段（credits_limit）恒 0，' +
       '所以这一列不能按积分读——免费号是 $1 免费额度，不是无限。';
   }
-  return '剩余 / 总额（上游积分包）';
+  const daily = Number(a.daily || 0);
+  const perm = Number(a.monthly || 0) + Number(a.reward || 0) + Number(a.topup || 0);
+  let tip = '剩余 / 总额（上游积分包）';
+  if (daily || perm) {
+    tip += '；每日/限时 ' + fmtNum(daily) + ' · 永久 ' + fmtNum(perm);
+    const today = Number(a.daily_today || 0);
+    if (today) {
+      tip += '；今日已发每日 ' + fmtNum(today) + ' · 已用 ' +
+        fmtNum(Math.max(0, today - daily));
+    }
+  }
+  return tip;
 }
 // credCell 额度列单元格：只给一行「剩余 / 总额」；已用量与百分比在悬停提示（credTitle）里，
 // 单元格再压一行小字是重复。
