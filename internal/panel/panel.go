@@ -857,8 +857,12 @@ func (p *Panel) refreshBalance(uid string) error {
 	if err != nil {
 		return err
 	}
+	// 桶必须一起写：只传 Remain/Total 会把 daily/reward 清零，单号「刷新」等于
+	// 把「每日优先」刚算出来的拆分抹掉。
 	p.cfg.Pool.SetBalance(uid, pool.Balance{
 		Unit: u.Unit, Remain: u.Remain, Total: u.Total,
+		Daily: u.Daily, DailyToday: u.DailyToday,
+		Monthly: u.Monthly, Reward: u.Reward, Topup: u.Topup,
 		UsedUSD: u.UsedUSD, LimitUSD: u.LimitUSD,
 	}, u.Expire)
 	p.cfg.Pool.SetExpireCredits(uid, u.ExpirePoints)
