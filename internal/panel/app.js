@@ -223,7 +223,7 @@ function credCell(a) {
   // 余额接口 403 期间新号从没拿到过快照：显示「—」而不是 0。
   // 显示 0 会让人以为「领的 9000 分丢了」，实际积分在流水里（v2 income 可查）。
   if (a.credits_known === false) {
-    return '<div class="n" title="余额接口受限，尚未取得实时余额；积分/礼包到账以 v2 积分流水为准">—</div>';
+    return '<div class="n" title="余额接口（v1 balance 与工作台 setting_info）暂不可用；积分/礼包到账以 v2 积分流水为准">—</div>';
   }
   return '<div class="n">' + (a.credits || 0) +
     (a.credits_total ? '<span class="tot">/' + a.credits_total + '</span>' : '') + '</div>';
@@ -440,8 +440,8 @@ async function loadOverview(quiet) {
     let accNote = d.auth_required
       ? '已启用密钥鉴权'
       : (d.auth_scope === 'open' ? '⚠ 免密钥访问（已绑全接口）' : '本机免鉴权');
-    // 余额接口 403 熔断中：积分列是最后一次成功快照，别让人误以为「分丢了」。
-    if (d.quota_blocked) accNote += ' · 余额接口受限，积分显示为最近快照';
+    // v1 明细接口 403 熔断中：余额改由工作台 setting_info 提供（官方网页同款口径）。
+    if (d.quota_blocked) accNote += ' · v1 明细接口受限，余额取自工作台 setting_info';
     $('accNote').textContent = accNote;
     // 网关基址现状（overview 的 agent_host_*）：上游换域名时这里是第一现场。
     $('agHostNote').textContent = d.agent_host_intl

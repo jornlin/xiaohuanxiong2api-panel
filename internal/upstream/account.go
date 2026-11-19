@@ -94,11 +94,30 @@ func (c *Client) QuotaBlocked() bool {
 	return time.Now().Before(c.quotaBlockedUntil)
 }
 
+// OfficeSettingInfo 工作台的实时设置信息（GET /api/web/office/v3/setting_info）。
+//
+// 这是官方网页自己用的余额来源：2026-11-19 抓包确认网页「资源用量」页同时调
+// `points/v1/balance`（403）和 `setting_info`（200），页面余额来自后者的
+// available_points；point_grant_popups 是最近到账的通知列表（不是未入账）。
+func (c *Client) OfficeSettingInfo(a *auth.Auth) (map[string]any, error) {
+	resp, err := c.doJSON(http.MethodGet,
+		c.originBase()+"/api/web/office/v3/setting_info", nil, c.authHeader(a))
+	if err != nil {
+		return nil, err
+	}
+	return payloadOf(resp, "工作台设置信息")
+}
+
 // UserEntUsageDetail 查一次积分余额并归一成 EntUsage。
 //
-// 余额接口是 v1（/points/v1/balance），2026-11-19 下午起对 Bearer 令牌返回 403
-// （客户端走带会话的请求所以不受影响）。403 时进入 30 分钟熔断并返回最后一次成功
-// 快照：余额只是展示字段，不能让它拖垮签到，也不该每轮对 30+ 个号持续重打。
+// 两个来源，按可靠性排序：
+//  1. v1 /points/v1/balance：有分类桶（每日/月/奖励/充值），但 2026-11-19 起对
+//     Bearer 令牌一律 403（官方网页也 403，不是我们的请求差异）。
+//  2. 工作台 /api/web/office/v3/setting_info 的 available_points：**官方网页在
+//     balance 403 后就是用它显示余额**，只有总额、没有分类桶。
+//
+// balance 403 后进入 30 分钟熔断，期间直接走 setting_info，不再每轮对 30+ 个号
+// 重打被拦的端点；两者都失败才回退最后一次成功快照。
 func (c *Client) UserEntUsageDetail(a *auth.Auth) (EntUsage, error) {
 	uid := ""
 	if a != nil {
@@ -108,42 +127,52 @@ func (c *Client) UserEntUsageDetail(a *auth.Auth) (EntUsage, error) {
 	blocked := time.Now().Before(c.quotaBlockedUntil)
 	cached, hasCache := c.quotaCache[uid]
 	c.quotaMu.Unlock()
-	if blocked {
-		if hasCache {
-			return cached, nil
-		}
-		return EntUsage{}, &Error{Kind: ErrClient, Status: http.StatusForbidden,
-			Msg: "余额接口受限（上游临时 403，已暂停查询，稍后自动恢复）"}
+
+	cache := func(u EntUsage) {
+		c.quotaMu.Lock()
+		c.quotaCache[uid] = u
+		c.quotaMu.Unlock()
 	}
-	data, err := c.FetchQuota(a)
-	if err != nil {
-		var ue *Error
-		if errors.As(err, &ue) && ue.Status == http.StatusForbidden {
-			c.quotaMu.Lock()
-			c.quotaBlockedUntil = time.Now().Add(quotaBlockDuration)
-			c.quotaMu.Unlock()
-			if hasCache {
-				return cached, nil
+
+	if !blocked {
+		if data, err := c.FetchQuota(a); err == nil {
+			usage := EntUsage{
+				Unit:    UnitCredit,
+				Remain:  mustInt(data["available_points"]),
+				Daily:   mustInt(data["daily_points"]),
+				Monthly: mustInt(data["monthly_points"]),
+				Reward:  mustInt(data["reward_points"]),
+				Topup:   mustInt(data["topup_points"]),
+			}
+			if usage.Remain < 0 {
+				return EntUsage{}, &Error{Kind: ErrServer, Status: 502, Msg: "小浣熊额度响应里没有 available_points"}
+			}
+			usage.Total = usage.Remain
+			cache(usage)
+			return usage, nil
+		} else {
+			var ue *Error
+			if errors.As(err, &ue) && ue.Status == http.StatusForbidden {
+				c.quotaMu.Lock()
+				c.quotaBlockedUntil = time.Now().Add(quotaBlockDuration)
+				c.quotaMu.Unlock()
 			}
 		}
-		return EntUsage{}, err
 	}
-	usage := EntUsage{
-		Unit:    UnitCredit,
-		Remain:  mustInt(data["available_points"]),
-		Daily:   mustInt(data["daily_points"]),
-		Monthly: mustInt(data["monthly_points"]),
-		Reward:  mustInt(data["reward_points"]),
-		Topup:   mustInt(data["topup_points"]),
+
+	// 工作台 setting_info：官方网页同款余额口径（只有可用总额）。
+	if data, serr := c.OfficeSettingInfo(a); serr == nil {
+		if v := mustInt(data["available_points"]); v >= 0 {
+			usage := EntUsage{Unit: UnitCredit, Remain: v, Total: v}
+			cache(usage)
+			return usage, nil
+		}
 	}
-	if usage.Remain < 0 {
-		return EntUsage{}, &Error{Kind: ErrServer, Status: 502, Msg: "小浣熊额度响应里没有 available_points"}
+	if hasCache {
+		return cached, nil
 	}
-	usage.Total = usage.Remain
-	c.quotaMu.Lock()
-	c.quotaCache[uid] = usage
-	c.quotaMu.Unlock()
-	return usage, nil
+	return EntUsage{}, &Error{Kind: ErrClient, Status: http.StatusForbidden,
+		Msg: "余额接口受限（v1 balance 与 setting_info 均不可用）"}
 }
 
 // UserEntUsage 是老接口形状（remain,total,expire）。
