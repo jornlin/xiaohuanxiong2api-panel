@@ -23,11 +23,166 @@ function clearKey() {
 let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
 let view = 'accounts';
 let cfgLoaded = null;
+let overviewData = null; // 最近一次 overview（分页/排序重渲染用）
 let logPin = true, logCh = 'all', loginID = '', loginTimer = null, pollFails = 0, refTimer = null;
 let usageHours = 72;                   // 账号池用量列窗口，由 overview 的 usage_hours 同步
 let ready = false;                       // 认证探测通过后才允许拉数据，避免把 401 当加载失败刷 toast
 
 const $ = id => document.getElementById(id);
+
+/* ── 通用分页 / 列排序（所有长列表共用，交互与 Loomy 面板一致）──────
+   台账/账号本来都在内存里，分页不是为了少取，而是别把几百行一次塞进 DOM。
+   状态按 key 分开存，每页条数记 localStorage；筛选变化回到第一页。 */
+const PG = {}, PG_TOTAL = {}, PG_RENDER = {}, LAST = {};
+const PG_SIZES = [10, 20, 50, 100, 200];
+const PG_DEFAULT = 20;
+
+function pgState(key, total) {
+  let st = PG[key];
+  if (!st) {
+    let size = PG_DEFAULT;
+    try {
+      const saved = Number(localStorage.getItem('pg.size.' + key));
+      if (PG_SIZES.indexOf(saved) >= 0) size = saved;
+    } catch (e) { /* 隐私模式忽略 */ }
+    st = PG[key] = { page: 0, size: size, sig: null };
+  }
+  const pages = Math.max(1, Math.ceil(total / st.size));
+  if (st.page > pages - 1) st.page = pages - 1;
+  if (st.page < 0) st.page = 0;
+  return st;
+}
+// 筛选条件变了就翻回第一页：否则「第 5 页」在结果只剩 2 条时会显示空表。
+function pgSig(key, sig) {
+  if (!PG[key]) pgState(key, 0);
+  const s = PG[key];
+  if (s.sig !== sig) { s.sig = sig; s.page = 0; }
+}
+function pgBtn(key, d, label, dis, on) {
+  return '<button class="pg-btn' + (on ? ' on' : '') + '" data-pg="' + key + '" data-d="' + d + '"' +
+    (dis ? ' disabled' : '') + '>' + label + '</button>';
+}
+function pgHtml(key, total, st) {
+  const pages = Math.max(1, Math.ceil(total / st.size));
+  const cur = st.page;
+  let nav = '';
+  if (pages > 1) {
+    const nums = [];
+    if (pages <= 7) {
+      for (let i = 0; i < pages; i++) nums.push(i);
+    } else {
+      const keep = {};
+      [0, pages - 1, cur - 1, cur, cur + 1].forEach(i => { if (i >= 0 && i < pages) keep[i] = 1; });
+      const arr = Object.keys(keep).map(Number).sort((a, b) => a - b);
+      for (let i = 0; i < arr.length; i++) {
+        if (i && arr[i] - arr[i - 1] > 1) nums.push(-1);
+        nums.push(arr[i]);
+      }
+    }
+    nav = pgBtn(key, 'prev', '‹ 上一页', cur === 0) +
+      nums.map(i => i < 0 ? '<span class="pg-gap">…</span>' : pgBtn(key, i, String(i + 1), false, i === cur)).join('') +
+      pgBtn(key, 'next', '下一页 ›', cur >= pages - 1);
+  }
+  const sizeOpts = PG_SIZES.map(n =>
+    '<option value="' + n + '"' + (n === st.size ? ' selected' : '') + '>' + n + ' 条/页</option>').join('');
+  return '<div class="pg">' + nav +
+    '<span class="pg-info">共 ' + total + ' 条' + (pages > 1 ? ' · 第 ' + (cur + 1) + '/' + pages + ' 页' : '') + '</span>' +
+    '<select class="pg-size" data-pgsize="' + key + '">' + sizeOpts + '</select></div>';
+}
+// 分页条挂在滚动容器（.tbl-wrap）之外：宽表横向滚动时分页条不会跟着滚出视野。
+function pgFoot(tbId, key, total, st) {
+  const tb = $(tbId);
+  if (!tb) return;
+  const table = tb.closest('table');
+  const wrap = table && table.closest('.tbl-wrap');
+  const anchor = wrap || table || tb;
+  let bar = document.getElementById('pg-' + key);
+  if (total === 0) {
+    if (bar && bar.parentElement) bar.parentElement.removeChild(bar);
+    return;
+  }
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.id = 'pg-' + key;
+    bar.className = 'pg-bar';
+    anchor.parentElement.insertBefore(bar, anchor.nextSibling);
+  }
+  bar.innerHTML = pgHtml(key, total, st);
+}
+function pgApply(tbId, key, list) {
+  const st = pgState(key, list.length);
+  PG_TOTAL[key] = list.length;
+  const start = st.page * st.size;
+  pgFoot(tbId, key, list.length, st);
+  return list.slice(start, start + st.size);
+}
+
+/* 列排序：点表头切升/降序；DESC_FIRST 里的列首次点击从大到小。 */
+const SORT = {};
+const DESC_FIRST = new Set(['credits', 'ok', 'err_total', 'inflight', 'usage', 'last',
+  'latency', 'tokens', 'invitees', 'granted', 'remaining', 'reqs']);
+function sortState(key, defField, defDir) {
+  if (!SORT[key]) SORT[key] = { field: defField, dir: defDir };
+  return SORT[key];
+}
+function sortApply(key, rows, getters, defField, defDir) {
+  const st = sortState(key, defField, defDir);
+  const g = getters[st.field] || getters[defField];
+  const out = rows.slice();
+  out.sort((a, b) => {
+    const va = g(a), vb = g(b);
+    if (va === vb) return 0;
+    return (va < vb ? -1 : 1) * st.dir;
+  });
+  return out;
+}
+function sortMark(tbId, key) {
+  const tb = $(tbId);
+  const table = tb && tb.closest('table');
+  const st = SORT[key];
+  if (!table || !st) return;
+  table.querySelectorAll('th[data-sort]').forEach(th => {
+    const on = th.dataset.sort === st.field;
+    th.classList.toggle('sorted', on);
+    if (on) th.dataset.dir = st.dir > 0 ? 'asc' : 'desc';
+    else th.removeAttribute('data-dir');
+  });
+}
+document.addEventListener('click', ev => {
+  const th = ev.target.closest('th[data-sort]');
+  if (th) {
+    const table = th.closest('table');
+    const key = table && table.dataset.sortkey;
+    if (!key) return;
+    const st = sortState(key, th.dataset.sort, 1);
+    const field = th.dataset.sort;
+    if (st.field === field) st.dir = -st.dir;
+    else { st.field = field; st.dir = DESC_FIRST.has(field) ? -1 : 1; }
+    if (PG[key]) PG[key].page = 0;
+    if (PG_RENDER[key]) PG_RENDER[key]();
+    return;
+  }
+  const b = ev.target.closest('button[data-pg]');
+  if (b) {
+    const key = b.dataset.pg, st = PG[key];
+    if (!st) return;
+    const d = b.dataset.d;
+    if (d === 'prev') st.page = Math.max(0, st.page - 1);
+    else if (d === 'next') st.page++;
+    else st.page = Number(d) || 0;
+    if (PG_RENDER[key]) PG_RENDER[key]();
+  }
+});
+document.addEventListener('change', ev => {
+  const s = ev.target.closest('select[data-pgsize]');
+  if (!s) return;
+  const key = s.dataset.pgsize, st = PG[key];
+  if (!st) return;
+  st.size = Number(s.value) || PG_DEFAULT;
+  st.page = 0;
+  try { localStorage.setItem('pg.size.' + key, String(st.size)); } catch (e) { /* 隐私模式 */ }
+  if (PG_RENDER[key]) PG_RENDER[key]();
+});
 
 /* ── 主题 ─────────────────────────────────────────────────────────── */
 /* 两态翻转（浅/深），首次访问跟随系统偏好；点击总是切换可见外观，符合直觉。 */
@@ -312,6 +467,19 @@ function taskTags(t) {
   return out.join(' ');
 }
 
+const ACC_SORT = {
+  nick: a => (a.nickname || a.uid || '').toLowerCase(),
+  status: a => (a.disabled ? 2 : (a.cooling ? 1 : 0)),
+  credits: a => Number(a.credits || 0),
+  expire: a => Number(a.expire || 0),
+  token: a => Number(a.token_expires_at || 0),
+  err: a => Number(a.err_count || 0),
+  ok: a => Number(a.success_count || 0),
+  inflight: a => Number(a.in_flight || 0),
+  usage: a => Number((a.usage && a.usage.total_tokens) || 0),
+  last: a => a.last_success || '',
+};
+
 function renderAccounts(list) {
   const tb = $('accBody');
   if (!list.length) {
@@ -320,7 +488,11 @@ function renderAccounts(list) {
       '也可以切到 refreshToken 页粘贴一条凭证</div></td></tr>';
     return;
   }
-  tb.innerHTML = list.map(a => {
+  const rows = sortApply('acc', list, ACC_SORT, 'credits', -1);
+  LAST.acc = rows;
+  const page = pgApply('accBody', 'acc', rows);
+  sortMark('accBody', 'acc');
+  tb.innerHTML = page.map(a => {
     const cls = a.disabled ? 'off' : (a.cooling ? 'cool' : '');
     const st = [];
     if (a.disabled) st.push(tag('bad', '已禁用'));
@@ -369,6 +541,7 @@ function renderAccounts(list) {
       '<td class="c-acts"><div class="acts">' + acts.join('') + '</div></td></tr>';
   }).join('');
 }
+PG_RENDER.acc = () => renderAccounts((overviewData && overviewData.accounts) || []);
 
 // renderExpiry 积分到期提醒：按「最近到期日」给每号一行，回答「哪天会作废多少、
 // 想用完得日均消耗多少」。数据只用 overview 已经带回来的 credits / expire，
@@ -392,9 +565,10 @@ function renderExpiry(list) {
   rows.sort((x, y) => x.exp - y.exp);
   const tb = $('expBody');
   if (!tb) return;
+  const page = pgApply('expBody', 'exp', rows);
   tb.innerHTML = !rows.length
     ? '<tr><td colspan="5"><div class="empty">暂无到期信息（积分流水里没有未过期的每日发放批次，或余额已为 0）</div></td></tr>'
-    : rows.map(r => '<tr><td class="who"><div class="nm">' + esc(r.uid) + '</div></td>' +
+    : page.map(r => '<tr><td class="who"><div class="nm">' + esc(r.uid) + '</div></td>' +
         '<td>' + new Date(r.exp * 1000).toLocaleDateString('zh-CN') + '</td>' +
         '<td class="num">' + (r.days === 0 ? '今天' : r.days === 1 ? '明天' : r.days + ' 天') + '</td>' +
         '<td class="num">' + fmtNum(r.expiring) + '</td>' +
@@ -404,10 +578,12 @@ function renderExpiry(list) {
     $('expNote').textContent = rows.length ? rows.length + ' 个账号 · 合计 ' + fmtNum(total) : '—';
   }
 }
+PG_RENDER.exp = () => renderExpiry((overviewData && overviewData.accounts) || []);
 
 async function loadOverview(quiet) {
   try {
     const d = await api('overview');
+    overviewData = d;
     const list = d.accounts || [];
     if (d.usage_hours) usageHours = d.usage_hours;
     $('sTotal').textContent = d.total;
@@ -573,11 +749,13 @@ function mdRowHtml(m) {
 function renderModels() {
   const tb = $('mdBody');
   const list = mdSortList(mdAll.filter(m => mdMatch(m)));
+  pgSig('md', [mdFilter.q, mdFilter.fn, mdFilter.sort].join('|'));
+  const page = pgApply('mdBody', 'md', list);
   if (!list.length) {
     tb.innerHTML = '<tr><td colspan="6"><div class="empty">' +
       (mdAll.length ? '没有符合当前筛选条件的模型' : '上游未返回模型') + '</div></td></tr>';
   } else {
-    tb.innerHTML = list.map(m => mdRowHtml(m)).join('');
+    tb.innerHTML = page.map(m => mdRowHtml(m)).join('');
   }
   const filtered = list.length !== mdAll.length;
   $('mdCount').textContent = !mdAll.length ? ''
@@ -585,6 +763,7 @@ function renderModels() {
       : mdAll.length + ' 个模型';
   $('mdCount').className = filtered ? 'note src-off' : 'note';
 }
+PG_RENDER.md = renderModels;
 function resetModelFilter() {
   mdFilter = { q: '', realm: '', fn: '', sort: 'default' };
   $('mdQ').value = ''; $('mdFn').value = ''; $('mdSort').value = 'default';
@@ -848,11 +1027,23 @@ function reqToolCell(e) {
   return called ? text : '<span class="tag warn" title="声明了工具但一次没调用">' + text + '</span>';
 }
 
+const REQ_SORT = {
+  time: e => e.time || '',
+  status: e => Number(e.status || 0),
+  duration: e => Number(e.duration_ms || 0),
+  tokens: e => Number(e.total_tokens || (Number(e.prompt_tokens || 0) + Number(e.completion_tokens || 0))),
+  credit: e => Number(e.credit || 0),
+};
+
 function renderRequestTable() {
   const list = reqEntries.filter(e => reqMatch(e));
   const tb = $('reqBody');
   if (!tb) return;
-  tb.innerHTML = list.map(e => {
+  pgSig('req', [(reqFilter.q || ''), (reqFilter.outcome || '')].join('|'));
+  const sorted = sortApply('req', list, REQ_SORT, 'time', -1);
+  const page = pgApply('reqBody', 'req', sorted);
+  sortMark('reqBody', 'req');
+  tb.innerHTML = page.map(e => {
     const when = e && e.time ? new Date(e.time).toLocaleTimeString('zh-CN', { hour12: false }) : '—';
     const ip = e && e.client_ip ? e.client_ip : '';
     const ua = e && e.user_agent ? e.user_agent : '';
@@ -882,6 +1073,7 @@ function renderRequestTable() {
       (hasSource ? '' : ' · 来源未记录');
   $('reqCount').className = (filtered || !hasSource) ? 'note src-off' : 'note';
 }
+PG_RENDER.req = renderRequestTable;
 
 function requestLogText(e) {
   const when = e && e.time ? new Date(e.time).toLocaleTimeString('zh-CN', { hour12: false }) : '—';
@@ -1221,13 +1413,16 @@ function renderUsageDim() {
     model: (d.by_model || []).length,
   });
   $('usDimHead').innerHTML = usDimHead(usDim);
-  $('usDimBody').innerHTML = rows.map(x =>
+  pgSig('us', usDim + '|' + usSort);
+  const page = pgApply('usDimBody', 'us', rows);
+  $('usDimBody').innerHTML = page.map(x =>
     usRow(usDim === 'account' ? (x.extra || String(x.key || '').slice(0, 8)) : x.key,
       usDim === 'account' ? String(x.key || '').slice(0, 8) : '',
       x, m.withPerf)
   ).join('') || '<tr><td colspan="' + (m.withPerf ? 11 : 9) + '"><div class="empty">这个窗口内还没有调用</div></td></tr>';
   $('usDimNote').textContent = rows.length + ' 行 · 请求数含失败尝试';
 }
+PG_RENDER.us = renderUsageDim;
 
 function renderUsage(d) {
   usageData = d || {};
@@ -1622,8 +1817,12 @@ function pkDetailGroups(packs, limit) {
   return { visible, rest, used, restSize, restRemain, usedSize };
 }
 
+let pkgData = null;
 function renderPackages(d) {
-  const list = (d.accounts || []);
+  pkgData = d || {};
+  const list = (pkgData.accounts || []);
+  pgSig('pk', 'all');
+  const page = pgApply('pkSummary', 'pk', list);
   const now = Date.now();
   renderExpiryDistribution(list, now);
   if (!list.length) {
@@ -1651,7 +1850,7 @@ function renderPackages(d) {
     .filter(a => !a.error && isUSD(a) === usd)
     .map(a => (usd ? usdRemain(a) : Number(a.remain || 0))));
 
-  $('pkSummary').innerHTML = list.map(a => {
+  $('pkSummary').innerHTML = page.map(a => {
     if (a.error) {
       return '<div class="pk-card"><div class="who"><span class="nm">' +
         esc(a.nickname || String(a.uid || '').slice(0, 8)) + '</span>' +
@@ -1693,8 +1892,8 @@ function renderPackages(d) {
 
   $('pkNote').textContent = list.length + ' 个账号 · 实时查询上游';
 
-  // 逐包明细：每个账号一个表，包的**面额**列是重点
-  $('pkDetail').innerHTML = list.map(a => {
+  // 逐包明细：每个账号一个表，包的**面额**列是重点（与卡片同一页）
+  $('pkDetail').innerHTML = page.map(a => {
     if (a.error) return '';
     const groups = pkDetailGroups(a.packages || [], PK_DEFAULT_DETAIL_LIMIT);
     const rowOf = (p, rowGroup) => {
@@ -1751,6 +1950,8 @@ function renderPackages(d) {
       '</tr></thead><tbody>' + rows + restSummary + usedSummary + '</tbody></table></div></div>';
   }).join('');
 }
+
+PG_RENDER.pk = () => renderPackages(pkgData || {});
 
 async function loadPackages() {
   $('pkSummary').innerHTML = '<div class="empty">查询中…（逐账号向上游实时查询）</div>';
@@ -1888,14 +2089,23 @@ function inviteDate(s) {
 
 /* ── 邀请页：汇总 + 逐号绑定状态/邀请码/官方链接 ─────────────────── */
 let invitesData = null;
+let invitesAt = 0;
 let invitesLoading = false;
+// 邀请码/已邀进度不会随便变：前端缓存 5 分钟，切换视图不重复打上游；
+// 手动「刷新」/补绑成功才强制重取（后端还有 60 秒缓存兜底）。
+const INVITES_TTL = 5 * 60 * 1000;
 
-async function loadInvites() {
+async function loadInvites(force) {
+  if (!force && invitesData && Date.now() - invitesAt < INVITES_TTL) {
+    renderInvites();
+    return;
+  }
   if (invitesLoading) return;
   invitesLoading = true;
-  $('invBody').innerHTML = '<tr><td colspan="8"><div class="empty">加载中…（逐号查询上游邀请码，约需数秒）</div></td></tr>';
+  $('invBody').innerHTML = '<tr><td colspan="8"><div class="empty">加载中…（逐号查询上游邀请码，约需数秒；60 秒内命中缓存）</div></td></tr>';
   try {
     invitesData = await api('invites');
+    invitesAt = Date.now();
     renderInvites();
   } catch (e) {
     $('invBody').innerHTML = '<tr><td colspan="8"><div class="empty">' + esc(e.message) + '</div></td></tr>';
@@ -1916,6 +2126,15 @@ function invRows() {
   });
 }
 
+const INV_SORT = {
+  nick: a => (a.nickname || a.uid || '').toLowerCase(),
+  code: a => a.code || '',
+  invitees: a => Number(a.registered_invitees || 0),
+  granted: a => Number(a.granted_points || 0),
+  remaining: a => Number(a.remaining_reward_invitees || 0),
+  bind: a => (a.invited_by ? 1 : 0),
+};
+
 function renderInvites() {
   const s = (invitesData && invitesData.summary) || {};
   $('invNote').textContent = '共 ' + (s.accounts || 0) + ' 个号 · 有邀请码 ' + (s.with_code || 0) +
@@ -1927,12 +2146,17 @@ function renderInvites() {
     usKpi(fmtNum(s.granted_total || 0), '邀请已发积分') +
     usKpi(String(s.slots_left || 0), '剩余奖励名额') +
     usKpi(String(s.bound || 0) + ' / ' + String(s.unbound || 0), '已绑定 / 未绑定邀请人');
-  const rows = invRows();
+  const filtered = invRows();
+  pgSig('inv', $('invFilter') ? $('invFilter').value : 'all');
+  const rows = sortApply('inv', filtered, INV_SORT, 'invitees', -1);
+  LAST.inv = rows;
+  const page = pgApply('invBody', 'inv', rows);
+  sortMark('invBody', 'inv');
   if (!rows.length) {
     $('invBody').innerHTML = '<tr><td colspan="8"><div class="empty">没有匹配的账号</div></td></tr>';
     return;
   }
-  $('invBody').innerHTML = rows.map(a => {
+  $('invBody').innerHTML = page.map(a => {
     const who = '<div class="nm">' + esc(a.nickname || a.uid) + '</div>' +
       '<div class="id">' + (a.phone ? esc(a.phone) + ' · ' : '') + esc(a.uid) + '</div>';
     const bind = a.invited_by
@@ -1957,6 +2181,7 @@ function renderInvites() {
       '</tr>';
   }).join('');
 }
+PG_RENDER.inv = renderInvites;
 
 // preferUID 指定要查看的邀请人（邀请页每行的「记录」按钮传当前账号）。
 async function openInviteRecords(preferUID) {
@@ -2563,8 +2788,19 @@ function grantsMsg(gs) {
           ? '已绑定邀请人 ' + d.invited_by
           : '上游返回成功，但邀请归因没有落地（该号注册来源可能不支持补绑）',
           d.attribution_updated ? 'ok' : 'err');
-        invitesData = null;
-        loadInvites();
+        // 局部更新：只改这一行与汇总，不重新逐号查上游。
+        if (d.attribution_updated && d.invited_by && invitesData) {
+          const row = (invitesData.accounts || []).find(x => x.uid === b.dataset.bind);
+          if (row) {
+            row.invited_by = d.invited_by;
+            const sm = invitesData.summary;
+            if (sm) {
+              sm.bound = (sm.bound || 0) + 1;
+              sm.unbound = Math.max(0, (sm.unbound || 0) - 1);
+            }
+            renderInvites();
+          }
+        }
       } catch (e) { toast(e.message, 'err'); }
       return;
     }
@@ -2572,7 +2808,7 @@ function grantsMsg(gs) {
     if (r) openInviteRecords(r.dataset.rec);
   });
   $('invFilter').onchange = renderInvites;
-  $('btnInvitesReload').onclick = () => { invitesData = null; loadInvites(); };
+  $('btnInvitesReload').onclick = () => loadInvites(true);
   $('btnInviteClose').onclick = () => $('inviteVeil').classList.remove('on');
   $('inviteWho').onchange = () => {
     inviteUID = $('inviteWho').value;
