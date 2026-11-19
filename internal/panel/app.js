@@ -322,7 +322,7 @@ async function submitKey() {
 }
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
-const TITLES = { accounts: '账号池', invites: '邀请', models: '模型', usage: '用量', packages: '积分构成', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', invites: '邀请', models: '模型', usage: '用量', config: '配置', logs: '运行日志' };
 function go(v) {
   navSet(false);
   view = v;
@@ -334,7 +334,6 @@ function go(v) {
   if (v === 'invites') loadInvites();
   if (v === 'models' && !$('mdBody').children.length) loadModels();
   if (v === 'usage') loadUsage(true);
-  if (v === 'packages') loadPackages();
   if (v === 'config') loadConfig();
   if (v === 'logs') loadLogs();
 }
@@ -1063,13 +1062,14 @@ function usStat(v, k, cls) {
 function renderRequestMetrics(m, entries) {
   m = m || {};
   const a = m.archive || {};
+  // 与用量/邀请页同一套 .kpi 卡片（此前用的是另一种 .stat 条，两个页面像两套系统）。
   $('reqStats').innerHTML =
-    usStat(fmtTok(m.completed), '已完成') +
-    usStat(m.success_rate == null ? '—' : Number(m.success_rate).toFixed(1) + '%', '完成成功率') +
-    usStat(m.http_success_rate == null ? '—' : Number(m.http_success_rate).toFixed(1) + '%', 'HTTP 成功率') +
-    usStat(fmtMs(m.avg_duration_ms), '平均耗时') +
-    usStat(String(m.in_flight || 0), '进行中') +
-    usStat(fmtTok(a.files), '归档文件');
+    usKpi(fmtTok(m.completed), '已完成', 'c-accent') +
+    usKpi(m.success_rate == null ? '—' : Number(m.success_rate).toFixed(1) + '%', '完成成功率', 'c-ok') +
+    usKpi(m.http_success_rate == null ? '—' : Number(m.http_success_rate).toFixed(1) + '%', 'HTTP 成功率', 'c-soft') +
+    usKpi(fmtMs(m.avg_duration_ms), '平均耗时', 'c-soft') +
+    usKpi(String(m.in_flight || 0), '进行中', (m.in_flight ? 'c-warn' : 'c-mute')) +
+    usKpi(fmtTok(a.files), '归档文件', 'c-mute');
   $('reqNote').textContent = a.enabled
     ? 'JSONL 归档 ' + fmtBytes(a.bytes) + (a.dropped_writes ? ' · 丢弃 ' + a.dropped_writes + ' 条' : '') +
       (a.last_error ? ' · 错误：' + a.last_error : '')
@@ -1157,7 +1157,7 @@ function renderRequestTable() {
     return '<tr title="' + esc(requestLogText(e)) + '">' +
       '<td class="num">' + esc(when) + '</td>' +
       '<td>' + reqOutcomeTag(e) + '</td>' +
-      '<td>' + esc(e && e.model || '—') + '</td>' +
+      '<td><span class="clip" title="' + esc(e && e.model || '') + '">' + esc(e && e.model || '—') + '</span></td>' +
       '<td>' + esc(e && e.account || '—') + '</td>' +
       '<td class="num">' + reqToolCell(e) + '</td>' +
       '<td>' + (ip ? '<span class="clip ip" title="' + esc(ip) + '">' + esc(ip) + '</span>' : '<span class="muted">—</span>') + '</td>' +
@@ -1335,7 +1335,7 @@ function fmtHit(a) {
   if (!s || !pt) return '<span style="color:var(--ink-3)" title="上游没报缓存字段（无样本）">—</span>';
   const hit = Number((a && a.cache_hit_tokens) || 0);
   const r = Math.max(0, Math.min(1, hit / pt)) * 100;
-  return '<span title="命中 ' + fmtNum(hit) + ' / prompt ' + fmtNum(pt) + '（' + s + ' 个样本）">' +
+  return '<span title="命中 ' + fmtNum(hit) + ' / 输入 ' + fmtNum(pt) + '（' + s + ' 个样本）">' +
     r.toFixed(1) + '%</span>';
 }
 
@@ -1362,7 +1362,7 @@ function usDimHead(dim) {
   const m = US_DIMS[dim] || US_DIMS.account;
   return '<tr><th class="mark" aria-hidden="true"></th><th>' + esc(m.title) + '</th>' +
     '<th class="num">请求</th><th class="num">失败</th>' +
-    '<th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>' +
+    '<th class="num">输入 tok</th><th class="num">输出 tok</th><th class="num">合计</th>' +
     '<th class="num">缓存命中率</th>' +
     '<th class="num" title="按官方计费公式推算：输入/输出/缓存命中 token × 各自单价（积分/百万）。' +
     '上游 token_usage 帧里没有积分字段，所以这是估算，不是回报值；未收录单价的模型不计入。">' +
@@ -1555,11 +1555,11 @@ function renderUsage(d) {
   $('usStats').innerHTML =
     usKpi(fmtTok(reqs), '请求数', 'c-accent', errs ? '其中失败 ' + fmtNum(errs) + ' 次' : '全部成功') +
     usKpi(fmtTok(total), '总 token', 'c-accent',
-      'prompt ' + usPct(pt, total) + ' · completion ' + usPct(ct, total),
+      '输入 ' + usPct(pt, total) + ' · 输出 ' + usPct(ct, total),
       '<div class="kbar"><i style="width:' + pctW(pt) + ';background:var(--accent)"></i>' +
       '<i style="width:' + pctW(ct) + ';background:var(--ok)"></i></div>') +
-    usKpi(fmtTok(pt), 'prompt', 'c-soft', '占比 ' + usPct(pt, total)) +
-    usKpi(fmtTok(ct), 'completion', 'c-ok', '占比 ' + usPct(ct, total)) +
+    usKpi(fmtTok(pt), '输入 token', 'c-soft', '占比 ' + usPct(pt, total)) +
+    usKpi(fmtTok(ct), '输出 token', 'c-ok', '占比 ' + usPct(ct, total)) +
     usKpi(String(errs), '失败尝试', errs ? 'c-warn' : 'c-mute',
       okRate == null ? '—' : (errs ? '成功率 ' + okRate.toFixed(1) + '%' : '成功率 100%')) +
     usKpi(fmtMs(t.avg_latency_ms), '平均延迟', 'c-soft',
@@ -2596,6 +2596,9 @@ async function pollLogin() {
 /* ── 启动 ─────────────────────────────────────────────────────────── */
 function start() {
   ready = true;
+  // 首屏补一次 overview：导航底部状态、版本号与账号快照都靠它；
+  // 此前只有账号池视图会拉，直接落到「运行日志」时会一直显示「连接中」。
+  if (view !== 'accounts') loadOverview(true);
   go(view);                              // 认证已通过，加载当前视图
   if (refTimer) clearInterval(refTimer);
   refTimer = setInterval(() => {
@@ -2621,7 +2624,6 @@ function boot() {
     if (view === 'accounts') loadOverview();
     if (view === 'models') loadModels();
     if (view === 'usage') loadUsage();
-    if (view === 'packages') loadPackages();
     if (view === 'config') loadConfig();
     if (view === 'logs') loadLogs();
   };
@@ -2688,6 +2690,14 @@ function boot() {
   $('smsCode').addEventListener('keydown', e => { if (e.key === 'Enter') loginBySms(); });
   $('btnKey').onclick = submitKey;
   $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') submitKey(); });
+  // 配置页 API 密钥默认打码；「显示」只切 input 类型，不改值。
+  const apiKeyInput = document.querySelector('#cfgForm input[name=api_key]');
+  const apiKeyEye = $('btnApiKeyEye');
+  if (apiKeyInput && apiKeyEye) apiKeyEye.onclick = () => {
+    const show = apiKeyInput.type === 'password';
+    apiKeyInput.type = show ? 'text' : 'password';
+    apiKeyEye.textContent = show ? '隐藏' : '显示';
+  };
 
   document.querySelectorAll('.nav a').forEach(a => a.onclick = e => {
     e.preventDefault();
@@ -2980,9 +2990,10 @@ function grantsMsg(gs) {
   }
   $('mdReset').onclick = resetModelFilter;
 
-  $('btnPk').onclick = loadPackages;
   // 逐包明细的「其余未用完 / 已用完」折叠：委托式，行是渲染时生成的也不丢事件。
-  $('pkDetail').addEventListener('click', ev => {
+  // （「积分」页已下线：上游 v1 余额接口 403 后逐包数据取不到，入口与视图一并移除。）
+  const pkDetailEl = $('pkDetail');
+  if (pkDetailEl) pkDetailEl.addEventListener('click', ev => {
     const btn = ev.target.closest('button[data-pk-group]');
     if (!btn) return;
     const body = btn.closest('tbody');

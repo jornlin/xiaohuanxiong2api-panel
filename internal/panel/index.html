@@ -732,6 +732,28 @@ th.sorted[data-dir="desc"]::after { content: " ▼"; font-size: 10px; }
   .pool-fbar > input[type=search] { flex: 1 1 100%; max-width: none; }
   .acc.pool thead th { position: static; }
 }
+
+/* ── 全局一致性 polimento ─────────────────────────────────────────── */
+/* 导航分组：运营 / 系统，减少「6 个平级入口」的扫描成本 */
+.nav-sec { padding: 12px 12px 4px; font-size: 10.5px; letter-spacing: .08em;
+  text-transform: uppercase; color: var(--ink-3); user-select: none; }
+.nav-sec + li a { margin-top: 0; }
+/* 所有数据表统一：滚动时表头吸顶 */
+.tbl-wrap thead th { position: sticky; top: 0; z-index: 2; background: var(--surface); }
+/* 明细表统一淡斑马纹（账号池除外：每行有健康色条，再加底色反而脏） */
+.acc:not(.pool).zebra tbody tr:nth-child(even) { background: color-mix(in srgb, var(--surface-2) 55%, transparent); }
+.acc:not(.pool).zebra tbody tr:hover { background: var(--surface-2); }
+/* 按小时表：时段列不折行 */
+.acc.us td, .acc.us th { white-space: nowrap; }
+/* 日志页 6 张指标卡与用量/邀请同一套 .kpi 视觉 */
+#reqStats { grid-template-columns: repeat(6, minmax(0, 1fr)); }
+@media (max-width: 1180px) { #reqStats { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+@media (max-width: 700px) { #reqStats { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+/* 配置页的开关行：不要横跨整页，标签与控制在 520px 内对齐 */
+.box .pad .switch { max-width: 520px; }
+.box .pad .switch input[type=checkbox] { width: 16px; height: 16px; }
+/* urlrow 里的普通输入（API 密钥）也要占满剩余宽度 */
+.urlrow > input:not(.url) { flex: 1; min-width: 0; }
 </style>
 </head>
 <body>
@@ -742,6 +764,7 @@ th.sorted[data-dir="desc"]::after { content: " ▼"; font-size: 10px; }
       <div class="sub" id="navSub">控制台</div>
     </div>
     <ul>
+      <li class="nav-sec">运营</li>
       <li><a href="#accounts" data-view="accounts" class="on">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="5.5" r="2.6"/><path d="M2.8 13.5c.6-2.6 2.7-4 5.2-4s4.6 1.4 5.2 4"/></svg>
         账号池</a></li>
@@ -751,9 +774,7 @@ th.sorted[data-dir="desc"]::after { content: " ▼"; font-size: 10px; }
       <li><a href="#usage" data-view="usage">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.5 13.5v-11M2.5 13.5h11"/><path d="M5.5 11V7.2M8.5 11V4.6M11.5 11V8.8"/></svg>
         用量</a></li>
-      <li><a href="#packages" data-view="packages">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.2 5.4 8 2.5l5.8 2.9v5.2L8 13.5l-5.8-2.9z"/><path d="M2.2 5.4 8 8.3l5.8-2.9M8 8.3v5.2"/></svg>
-        积分</a></li>
+      <li class="nav-sec">系统</li>
       <li><a href="#models" data-view="models">
         <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 1.8 14 5v6L8 14.2 2 11V5z"/><path d="M2 5l6 3.2L14 5M8 8.2v6"/></svg>
         模型</a></li>
@@ -811,7 +832,7 @@ th.sorted[data-dir="desc"]::after { content: " ▼"; font-size: 10px; }
         </header>
         <div class="kpis" id="invStats"></div>
         <div class="tbl-wrap">
-          <table class="acc" data-sortkey="inv">
+          <table class="acc zebra" data-sortkey="inv">
             <thead><tr>
               <th data-sort="nick">账号</th><th data-sort="code">邀请码</th>
               <th class="num" data-sort="invitees">已邀</th><th class="num" data-sort="granted">已发积分</th>
@@ -944,7 +965,7 @@ th.sorted[data-dir="desc"]::after { content: " ▼"; font-size: 10px; }
           <button class="xs ghost" id="mdReset" title="清空全部筛选条件">重置</button>
         </div>
         <div class="tbl-wrap">
-        <table class="acc md">
+        <table class="acc md zebra">
           <thead><tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>思考</th><th>通道</th>
               <th class="num" title="上游基准积分倍率（consumption_rate.data.rate，客户端选择器展示的就是它）">倍率</th>
               <th class="num">上下文长度</th><th class="num">最大输出</th></tr></thead>
@@ -972,7 +993,10 @@ th.sorted[data-dir="desc"]::after { content: " ▼"; font-size: 10px; }
                 <span class="hint">改动需重启进程</span></label>
             </div>
             <label class="fld"><span class="lb">API 密钥（config.json 的 api_key）</span>
-              <input name="api_key" placeholder="留空 = 不鉴权（仅本机可访问）" autocomplete="off">
+              <div class="urlrow">
+                <input name="api_key" type="password" placeholder="留空 = 不鉴权（仅本机可访问）" autocomplete="off">
+                <button type="button" class="xs" id="btnApiKeyEye">显示</button>
+              </div>
               <span class="hint">显示的就是文件里的原值；保存后立即生效，本页随即用新密钥继续请求</span></label>
           </div>
         </div>
@@ -1184,7 +1208,7 @@ th.sorted[data-dir="desc"]::after { content: " ▼"; font-size: 10px; }
               <span class="lb">Token 时序</span>
               <span class="note" id="usChartNote">—</span>
               <span class="grow"></span>
-              <span class="legend"><i class="sw sw-p"></i>prompt<i class="sw sw-c"></i>completion<i class="sw sw-hit"></i>缓存命中率<i class="sw sw-t"></i>均值</span>
+              <span class="legend"><i class="sw sw-p"></i>输入<i class="sw sw-c"></i>输出<i class="sw sw-hit"></i>缓存命中率<i class="sw sw-t"></i>均值</span>
             </div>
             <div id="usChart" class="uschart-body"></div>
           </div>
@@ -1220,38 +1244,15 @@ th.sorted[data-dir="desc"]::after { content: " ▼"; font-size: 10px; }
       <div class="box">
         <header><h3>按小时</h3><span class="grow"></span><span class="note" id="usSeriesNote"></span></header>
         <div class="tbl-wrap">
-        <table class="acc us">
+        <table class="acc us zebra">
           <thead><tr>
             <th class="mark" aria-hidden="true"></th>
-            <th>时段</th><th>请求</th><th>失败</th><th>Prompt</th><th>Completion</th><th>合计</th><th>缓存命中率</th><th title="按官方计费公式推算，不是上游回报值；未收录单价的模型不计入">积分≈</th>
+            <th>时段</th><th>请求</th><th>失败</th><th>输入 tok</th><th>输出 tok</th><th>合计</th><th>缓存命中率</th><th title="按官方计费公式推算，不是上游回报值；未收录单价的模型不计入">积分≈</th>
           </tr></thead>
           <tbody id="usSeriesBody"></tbody>
         </table>
         </div>
       </div>
-    </section>
-
-    <!-- 积分构成 -->
-    <section class="view" id="view-packages" hidden>
-      <div class="box">
-        <header>
-          <h3>积分到期分布</h3>
-          <span class="grow"></span>
-          <span class="note">按批次到期日聚合，颜色区分账号</span>
-        </header>
-        <div class="pad"><div id="pkExpiry"></div></div>
-      </div>
-
-      <div class="box">
-        <header>
-          <h3>账号对比</h3>
-          <span class="grow"></span>
-          <span class="note" id="pkNote">—</span>
-          <button class="xs" id="btnPk">刷新</button>
-        </header>
-        <div class="pad"><div class="pk-grid" id="pkSummary"></div></div>
-      </div>
-      <div id="pkDetail"></div>
     </section>
 
     <!-- 日志 -->
@@ -1265,7 +1266,7 @@ th.sorted[data-dir="desc"]::after { content: " ▼"; font-size: 10px; }
         <!-- reqStats：指标行容器（renderRequestMetrics 写入）。合并 #87 时新排版丢了它，
              而 loadLogs 里的 renderRequestMetrics 仍写这个 id —— 元素缺失时抛错被
              loadLogs 的 try/catch 吞掉，整块运行日志渲染不出来（只有它这一个 id 悬空）。 -->
-        <div class="stats" id="reqStats"></div>
+        <div class="kpis" id="reqStats"></div>
         <div class="fbar" id="reqFilter">
           <input id="reqQ" type="search" placeholder="搜索 IP / UA / 模型 / 账号 / 请求 ID" aria-label="搜索请求记录">
           <select id="reqOutcome" aria-label="按结果筛选">
