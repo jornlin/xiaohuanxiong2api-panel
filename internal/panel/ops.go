@@ -245,6 +245,19 @@ func (p *Panel) invites(w http.ResponseWriter, r *http.Request) {
 		MarketingText string `json:"marketing_text,omitempty"`
 		Error         string `json:"error,omitempty"`
 	}
+	// 逐号 /tasks 是 N 次上游请求（号多时很可观）：60 秒内直接复用上一份结果。
+	p.invitesMu.Lock()
+	if len(p.invitesJSON) > 0 && time.Since(p.invitesAt) < 60*time.Second {
+		body := p.invitesJSON
+		p.invitesMu.Unlock()
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(body)
+		return
+	}
+	p.invitesMu.Unlock()
+
 	out := []row{}
 	summary := map[string]int64{
 		"accounts": 0, "with_code": 0, "invited_total": 0, "granted_total": 0,
@@ -254,6 +267,9 @@ func (p *Panel) invites(w http.ResponseWriter, r *http.Request) {
 		a := p.cfg.Pool.AuthByUID(st.UID)
 		if a == nil {
 			continue
+		}
+		if len(out) > 0 {
+			time.Sleep(300 * time.Millisecond) // 号与号之间留节奏，避免网关频率风控
 		}
 		rw := row{
 			UID: st.UID, Nickname: st.Nickname,
@@ -291,7 +307,13 @@ func (p *Panel) invites(w http.ResponseWriter, r *http.Request) {
 		}
 		out = append(out, rw)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "summary": summary, "accounts": out})
+	resp := map[string]any{"ok": true, "summary": summary, "accounts": out}
+	if raw, err := json.Marshal(resp); err == nil {
+		p.invitesMu.Lock()
+		p.invitesAt, p.invitesJSON = time.Now(), raw
+		p.invitesMu.Unlock()
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // inviteRecords 邀请记录（**只读**，零额度消耗）：GET /panel/api/invite_records?uid=&offset=

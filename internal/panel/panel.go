@@ -70,6 +70,12 @@ type Panel struct {
 	smsAttempts map[string][]time.Time
 	// loginDone 记已成功入池的会话（state → 账号），只服务「同一回调重复提交」的幂等回报。
 	loginDone map[string]loginDone
+
+	// invites 缓存：逐号查 /tasks 是 N 次上游请求（80 个号就是 80 次），
+	// 60 秒内复用同一份结果，避免每次切到邀请页都对网关连打。
+	invitesMu   sync.Mutex
+	invitesAt   time.Time
+	invitesJSON []byte
 }
 
 // New 构建面板。Logs 为空时自建一个环，但 main 应传入和标准日志共用的那个。

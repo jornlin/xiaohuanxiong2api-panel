@@ -224,6 +224,12 @@ type stateAccount struct {
 	Unit     string  `json:"credit_unit,omitempty"`
 	UsedUSD  float64 `json:"used_usd,omitempty"`
 	LimitUSD float64 `json:"limit_usd,omitempty"`
+	// 积分桶也要持久化：v1 balance 403 时重启后只能靠这份快照继续执行「每日优先」，
+	// 否则每次重启策略都静默失效。
+	Daily   int64 `json:"daily,omitempty"`
+	Monthly int64 `json:"monthly,omitempty"`
+	Reward  int64 `json:"reward,omitempty"`
+	Topup   int64 `json:"topup,omitempty"`
 }
 
 // stateFile 持久化格式。
@@ -1126,6 +1132,10 @@ func (p *Pool) load() {
 			unit:             s.Unit,
 			usedUSD:          s.UsedUSD,
 			limitUSD:         s.LimitUSD,
+			daily:            s.Daily,
+			monthly:          s.Monthly,
+			reward:           s.Reward,
+			topup:            s.Topup,
 		}
 	}
 }
@@ -1155,6 +1165,10 @@ func (p *Pool) saveLocked() {
 			Unit:          e.unit,
 			UsedUSD:       e.usedUSD,
 			LimitUSD:      e.limitUSD,
+			Daily:         e.daily,
+			Monthly:       e.monthly,
+			Reward:        e.reward,
+			Topup:         e.topup,
 		}
 	}
 	raw, err := json.MarshalIndent(sf, "", "  ")

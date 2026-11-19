@@ -361,18 +361,31 @@ func (a *Auth) Snapshot() Data {
 // Parse 解析一份账号 JSON（面板粘贴 / 磁盘文件 / 上游响应同形）。
 // uid 优先取显式字段，其次从 access token 的 JWT 里解；都没有就用 token 哈希兜底。
 func Parse(raw []byte) (*Auth, error) {
+	// 这里必须覆盖 Data 的**全部**持久化字段：早先漏了 phone/invited_by/礼包标记，
+	// 每次重启 LoadDir 都会把它们解析丢，随后任意一次 SaveAtomic 就把文件覆盖成没有
+	// 这些字段——手机号「补完又消失」、礼包终态丢失后反复重问上游，都是这个原因。
+	// ExpiresAt 仍用 any：兼容毫秒整数与字符串两种历史写法。
 	var in struct {
-		AccessToken  string `json:"access_token"`
-		Token        string `json:"token"`
-		RefreshToken string `json:"refresh_token"`
-		ExpiresAt    any    `json:"expires_at"`
-		UID          string `json:"uid"`
-		UserID       string `json:"user_id"`
-		Nickname     string `json:"nickname"`
-		Name         string `json:"name"`
-		Email        string `json:"email"`
-		Credit       int64  `json:"credit"`
-		CheckedIn    string `json:"checked_in"`
+		AccessToken    string `json:"access_token"`
+		Token          string `json:"token"`
+		RefreshToken   string `json:"refresh_token"`
+		ExpiresAt      any    `json:"expires_at"`
+		UID            string `json:"uid"`
+		UserID         string `json:"user_id"`
+		Nickname       string `json:"nickname"`
+		Name           string `json:"name"`
+		Email          string `json:"email"`
+		Phone          string `json:"phone"`
+		NationCode     string `json:"nation_code"`
+		InvitedBy      string `json:"invited_by"`
+		MachineID      string `json:"machine_id"`
+		Credit         int64  `json:"credit"`
+		CreditAt       string `json:"credit_at"`
+		CheckedIn      string `json:"checked_in"`
+		DesktopGrantAt string `json:"desktop_grant_at"`
+		MobileGrantAt  string `json:"mobile_grant_at"`
+		DesktopGranted bool   `json:"desktop_granted"`
+		MobileGranted  bool   `json:"mobile_granted"`
 	}
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return nil, fmt.Errorf("解析账号 JSON: %w", err)
@@ -385,14 +398,23 @@ func Parse(raw []byte) (*Auth, error) {
 		return nil, errors.New("access_token 过长")
 	}
 	a := &Auth{Data: Data{
-		AccessToken:  access,
-		RefreshToken: stripBearer(in.RefreshToken),
-		ExpiresAt:    millisOf(in.ExpiresAt),
-		UID:          firstNonEmpty(in.UID, in.UserID),
-		Nickname:     firstNonEmpty(in.Nickname, in.Name),
-		Email:        in.Email,
-		Credit:       in.Credit,
-		CheckedIn:    in.CheckedIn,
+		AccessToken:    access,
+		RefreshToken:   stripBearer(in.RefreshToken),
+		ExpiresAt:      millisOf(in.ExpiresAt),
+		UID:            firstNonEmpty(in.UID, in.UserID),
+		Nickname:       firstNonEmpty(in.Nickname, in.Name),
+		Email:          in.Email,
+		Phone:          in.Phone,
+		NationCode:     in.NationCode,
+		InvitedBy:      in.InvitedBy,
+		MachineID:      in.MachineID,
+		Credit:         in.Credit,
+		CreditAt:       in.CreditAt,
+		CheckedIn:      in.CheckedIn,
+		DesktopGrantAt: in.DesktopGrantAt,
+		MobileGrantAt:  in.MobileGrantAt,
+		DesktopGranted: in.DesktopGranted,
+		MobileGranted:  in.MobileGranted,
 	}}
 	if a.ExpiresAt == 0 {
 		a.ExpiresAt = JWTExpiry(access)
