@@ -336,11 +336,31 @@ func (p *Panel) writeOverview(w http.ResponseWriter, extra map[string]any) {
 	}
 	// 每日/永久积分汇总（顶部卡片）：每日已用 = 今日发放 - 当前每日剩余。
 	// 数据来自每号最近一次余额刷新（v1 或 setting_info+流水推算）；拿不到拆分的号不计入。
-	var dailyBal, dailyToday, permBal int64
+	// 可花费/锁定口径：冻结的充值桶不算永久余额；Chargeable 与账面 Credits 的差额
+	// 是上游锁定的部分（total_chargeable_points 剔除后剩下的）。
+	var dailyBal, dailyToday, permBal, chargeableBal, lockedBal int64
+	var chargeableKnown, dailyTodayKnown int
 	for _, st := range list {
 		dailyBal += st.Daily
 		dailyToday += st.DailyToday
-		permBal += st.Monthly + st.Reward + st.Topup
+		if st.DailyTodayKnown {
+			dailyTodayKnown++
+		}
+		perm := st.Monthly + st.Reward + st.Topup
+		if st.TopupFrozen && st.FrozenTopup > 0 {
+			perm -= st.FrozenTopup
+		}
+		if perm < 0 {
+			perm = 0
+		}
+		permBal += perm
+		if st.CreditUnit != "usd" && st.CreditsKnown && st.ChargeableKnown {
+			chargeableKnown++
+			chargeableBal += st.Chargeable
+			if st.Credits > st.Chargeable {
+				lockedBal += st.Credits - st.Chargeable
+			}
+		}
 	}
 	dailyUsed := dailyToday - dailyBal
 	if dailyUsed < 0 {
@@ -359,8 +379,12 @@ func (p *Panel) writeOverview(w http.ResponseWriter, extra map[string]any) {
 		"accounts":            rows,
 		"daily_balance":       dailyBal,
 		"daily_today_granted": dailyToday,
+		"daily_today_known":   dailyTodayKnown,
 		"daily_used_today":    dailyUsed,
 		"permanent_balance":   permBal,
+		"chargeable_balance":  chargeableBal,
+		"locked_balance":      lockedBal,
+		"chargeable_known":    chargeableKnown,
 		// 余额接口（v1）403 熔断中：积分列显示的是最后一次成功快照，不是实时值。
 		"quota_blocked": p.cfg.Upstream != nil && p.cfg.Upstream.QuotaBlocked(),
 	}
@@ -897,6 +921,12 @@ func (p *Panel) refreshBalance(uid string) error {
 		Unit: u.Unit, Remain: u.Remain, Total: u.Total,
 		Daily: u.Daily, DailyToday: u.DailyToday,
 		Monthly: u.Monthly, Reward: u.Reward, Topup: u.Topup,
+		Chargeable: u.Chargeable, ChargeableKnown: u.ChargeableKnown,
+		BucketsExact: u.BucketsExact, DailyTodayKnown: u.DailyTodayKnown,
+		TopupFrozen: u.TopupFrozen, FrozenTopup: u.FrozenTopup,
+		EnterpriseReserved: u.EnterpriseReserved, EnterpriseTopup: u.EnterpriseTopup,
+		ExtrasKnown: u.ExtrasKnown,
+		OwnerType:   u.OwnerType, OwnerID: u.OwnerID, OwnerMismatch: u.OwnerMismatch,
 		UsedUSD: u.UsedUSD, LimitUSD: u.LimitUSD,
 	}, u.Expire)
 	p.cfg.Pool.SetExpireCredits(uid, u.ExpirePoints)

@@ -57,7 +57,7 @@
 | 对话 | `POST {llm_base}/chat/completions` | 就是 OpenAI 形状；SSE 是标准 `data:` 帧 |
 | 续期 | `POST {auth_base}/refresh` | body `{"refresh_token":…}`，回 `data.access_token/refresh_token` |
 | 目录 | `GET {llm_base}/model_catalog` | `data.categories[].models[]`，`visible:false` 不展示 |
-| 积分 | `GET {points_base}/balance` | `data.available_points` + 四个钱包字段 |
+| 积分 | `GET {points_base}/balance` | `data.available_points` + 四个钱包字段；`total_chargeable_points` 是实际可扣费额度，`topup_frozen`/`enterprise_reserved`/`enterprise_topup_points` 标出不可花费部分，`owner_type`/`owner_id` 用于校验凭证是否串号 |
 | 签到 | `POST {origin}/api/web/desktop/v1/login/points/grant` + `GET {points_base}/bills` | 每日 300 分是服务端 00:00 自动发放、午夜清零，没有「调一下就发分」的客户端开关；grant 是幂等的登录领取（领过回 `granted:false`），是否到账以 bills 里当天的 `daily_grant` 为准 |
 | 手机端首登 | `POST {origin}/api/web/mobile/v1/login/points/grant` | 与桌面端那笔额度独立，桌面端领过的号照样能领 |
 | 任务状态 | `GET {points_base}/tasks` | 只读回任务三组：`new_user_task_states`（注册/桌面端/移动端礼包）、`invitee_task_states`（活跃 7 天/首次付费）、`invite`（邀请码与进度）。上游**没有任何「完成任务」写端点**（POST/PUT 全是 404），所以能靠 API 领的只有桌面端与移动端两笔礼包，活跃/付费由服务端按行为判定 |

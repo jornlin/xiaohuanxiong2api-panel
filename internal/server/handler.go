@@ -427,9 +427,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	tried := map[string]bool{}
 	var lastErr error
+	// 整个请求共享一个闸门预算：否则每次 WaitGate 各自 30s，MaxRotate×重试
+	// 能把首字节拖到几分钟。
+	gateDeadline := time.Now().Add(30 * time.Second)
 	for i := 0; i < h.cfg.MaxRotate; i++ {
+		// 网关级限流闸门：上游按频率打回 403/429 时，所有请求在这里排队等一小会儿，
+		// 而不是继续并发撞墙、把批量 403 直接甩给客户端。
+		h.cfg.Upstream.WaitGateUntil(r.Context(), gateDeadline)
+		if r.Context().Err() != nil {
+			return
+		}
 		// 按地区选号：国际版模型只有国际号能做，反之亦然。
-		acct, release := h.acquireAccount(tried, sessKey, realm)
+		acct, release := h.acquireAccount(r.Context(), tried, sessKey, realm)
 		if acct == nil {
 			break
 		}
@@ -444,6 +453,20 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		// 排队（10605 / isQueued）不是失败，也不该换号：它是模型侧的窗口。按上游建议的
 		// 时长等一会儿，对**同一账号**重发同一请求（最多 2 次）；客户端断开就不再白打。
 		for retry := 0; ; retry++ {
+			// 上一次 attempt 结束时已经 release（见下方 defer）；重试前必须重新占到
+			// 同一个号的在途名额，否则「acquire 一次、release 多次」会让并发上限失效。
+			// 抢不到（别的请求占了/账号被冷却）就交给外层换号。
+			if retry > 0 {
+				if _, ok := h.cfg.Pool.AcquireIfHealthy(acct.UID); !ok {
+					break
+				}
+			}
+			// 重试前也要过闸门：上一次 403 可能刚把全局暂停拉长到几秒。
+			h.cfg.Upstream.WaitGateUntil(r.Context(), gateDeadline)
+			if r.Context().Err() != nil {
+				release() // 名额已占，客户端已断开：必须还回去
+				return
+			}
 			func() {
 				defer release()
 				done, err = h.attempt(r.Context(), w, acct, body, peek, sessKey, traceFrom(r))
@@ -465,10 +488,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			// 调用方参数错（4xx，与账号无关，同 4001/4011 那一类）：如实回上游状态码，
 			// 不再换号——换号只会把每个号都罚一次降权，最后还谎报成「号都不可用」。
+			//
+			// 403 是例外：它既可能是权限差异（换号可能就好），也可能是排队/风控
+			// （分类层已归 ErrBusy）。高并发下把 403 直接 fail-fast 正是「批量 403、
+			// 请求大批量中断」的放大器——这里改为继续轮转，最多试满 MaxRotate。
 			var ue *upstream.Error
-			if errors.As(err, &ue) && (ue.Kind == upstream.ErrClient || ue.Kind == upstream.ErrNone || ue.Kind == upstream.ErrGateway) {
-				writeOpenAIError(w, ue.Status, "upstream_rejected", ue.Msg)
-				return
+			if errors.As(err, &ue) {
+				failFast := ue.Kind == upstream.ErrNone || ue.Kind == upstream.ErrGateway ||
+					(ue.Kind == upstream.ErrClient && ue.Status != http.StatusForbidden)
+				if failFast {
+					writeOpenAIError(w, ue.Status, "upstream_rejected", ue.Msg)
+					return
+				}
 			}
 			lastErr = err
 		}
@@ -483,6 +514,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				msg = "上游当前对该模型不可服务（" + peek.Model + "，serviceAvailable=false）：这是上游容量/套餐侧状态，与账号无关，请稍后再发或换模型"
 			}
 			writeOpenAIError(w, http.StatusServiceUnavailable, "raccoon_model_busy", msg)
+			return
+		}
+		// 轮转完仍是 403（多半是模型权限，不是账号池故障）：如实回 403，
+		// 不要伪装成 503「所有账号不可用」——那会让人去查号池而不是查模型权限。
+		var ue *upstream.Error
+		if errors.As(lastErr, &ue) && ue.Status == http.StatusForbidden {
+			writeOpenAIError(w, http.StatusForbidden, "upstream_rejected", ue.Msg)
 			return
 		}
 		var se *upstream.StreamError
@@ -524,8 +562,14 @@ func queueHopeless(err error) bool {
 func queueDelay(err error) time.Duration {
 	secs := int64(15)
 	var ue *upstream.Error
-	if errors.As(err, &ue) && ue.RetryAfterSecs > 0 {
-		secs = ue.RetryAfterSecs
+	if errors.As(err, &ue) {
+		if ue.Throttled {
+			// 网关限流：等多久由全局闸门决定（1~10s 指数），这里只留 1s
+			// 让出 CPU；按模型排队的 15s 等会把批量限流拖成分钟级。
+			secs = 1
+		} else if ue.RetryAfterSecs > 0 {
+			secs = ue.RetryAfterSecs
+		}
 	}
 	var se *upstream.StreamError
 	if errors.As(err, &se) && se.RetryAfterSecs > 0 {
@@ -541,7 +585,7 @@ func queueDelay(err error) time.Duration {
 //
 // 返回的 release 必须在这次尝试结束（无论成败）后调用一次——在途名额泄漏会把账号
 // 慢慢挤出池（达到 max_in_flight 后不再可选）。
-func (h *Handler) acquireAccount(tried map[string]bool, sessKey, realm string) (*auth.Auth, func()) {
+func (h *Handler) acquireAccount(ctx context.Context, tried map[string]bool, sessKey, realm string) (*auth.Auth, func()) {
 	if sessKey != "" && h.cfg.Session != nil {
 		if uid, ok := h.cfg.Session.Resolve(sessKey); ok && !tried[uid] {
 			if a, ok := h.cfg.Pool.AcquireIfHealthy(uid); ok {
@@ -555,13 +599,28 @@ func (h *Handler) acquireAccount(tried map[string]bool, sessKey, realm string) (
 			h.cfg.Session.Unbind(sessKey)
 		}
 	}
-	a := h.cfg.Pool.PickRealmExcluding(realm, tried)
-	if a == nil {
-		return nil, func() {}
+	// 池子只是被占满（还有 healthy 号）时短暂等空位，而不是立刻 503；
+	// 池子真空了（全部冷却/禁用）或本轮已试过账号，则立即返回。
+	deadline := time.Now().Add(poolCapacityWait)
+	for {
+		if a := h.cfg.Pool.PickRealmExcluding(realm, tried); a != nil {
+			uid := a.UID
+			return a, func() { h.cfg.Pool.Release(uid) }
+		}
+		if len(tried) > 0 || !h.cfg.Pool.HasHealthy(realm) || !time.Now().Before(deadline) {
+			return nil, func() {}
+		}
+		select {
+		case <-ctx.Done():
+			return nil, func() {}
+		case <-time.After(50 * time.Millisecond):
+		}
 	}
-	uid := a.UID
-	return a, func() { h.cfg.Pool.Release(uid) }
 }
+
+// poolCapacityWait 是「号池被占满」时等待空位的最长时间。真没号（全冷却/禁用）
+// 不会等，直接 503；这里的等待只吸收瞬时并发尖峰。
+const poolCapacityWait = 5 * time.Second
 
 // attempt 对一个账号跑一次完整尝试：预刷新 token → 出站 → 分类记账 → 写响应。
 //
@@ -604,17 +663,18 @@ func (h *Handler) attempt(ctx context.Context, w http.ResponseWriter, acct *auth
 		// （实测：上游一整天 p3 排队，账号被自己的排队记成 breaker）。
 		h.noteUsage(acct.UID, peek.Model, attemptStart, false, nil, tr)
 		kind := upstream.ErrServer
+		var retryAfter int64
 		var ue *upstream.Error
 		if errors.As(terr, &ue) {
-			kind = ue.Kind
+			kind, retryAfter = ue.Kind, ue.RetryAfterSecs
 		}
-		h.noteFailure(acct.UID, kind)
+		h.noteFailure(acct.UID, kind, retryAfter)
 		return false, terr
 	}
 	if status >= 400 {
 		kind := upstream.Classify(status, string(respBody))
 		h.noteUsage(acct.UID, peek.Model, attemptStart, false, nil, tr)
-		h.noteFailure(acct.UID, kind)
+		h.noteFailure(acct.UID, kind, 0)
 		return false, &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 	}
 
@@ -658,7 +718,7 @@ func (h *Handler) attempt(ctx context.Context, w http.ResponseWriter, acct *auth
 		if errors.As(err, &se) {
 			// 流内错误与 HTTP 级错误走同一张分类表（noteFailure），避免两处口径漂移。
 			h.noteUsage(acct.UID, peek.Model, attemptStart, false, nil, tr)
-			h.noteFailure(acct.UID, se.Kind())
+			h.noteFailure(acct.UID, se.Kind(), se.RetryAfterSecs)
 			return false, err
 		}
 		if errors.Is(err, upstream.ErrEmptyStream) {
@@ -687,7 +747,7 @@ func (h *Handler) attempt(ctx context.Context, w http.ResponseWriter, acct *auth
 //   - 5xx → 熔断计数；
 //   - 其余 4xx（参数/404 等）→ 降权计数，不罚号；
 //   - ErrNone（模型/参数问题，如 4001）→ 不记账：与账号无关，写进去只会污染状态。
-func (h *Handler) noteFailure(uid string, kind upstream.ErrKind) {
+func (h *Handler) noteFailure(uid string, kind upstream.ErrKind, retryAfterSecs int64) {
 	switch kind {
 	case upstream.ErrNone:
 		// no-op
@@ -699,7 +759,7 @@ func (h *Handler) noteFailure(uid string, kind upstream.ErrKind) {
 	case upstream.ErrPlanLimit:
 		h.cfg.Pool.CooldownPlan(uid)
 	case upstream.ErrSoftRate:
-		h.cfg.Pool.CooldownSoft(uid, "429 rate limit")
+		h.cfg.Pool.CooldownSoft(uid, "429 rate limit", time.Duration(retryAfterSecs)*time.Second)
 	case upstream.ErrSessionDead:
 		h.cfg.Pool.NoteSessionDead(uid)
 	case upstream.ErrServer:
@@ -733,7 +793,7 @@ func (h *Handler) bindSession(sessKey, uid string) {
 // 与 HTTP 级错误同一张分类表：Kind() 现在能区分「模型/参数问题」（ErrNone，不记账）
 // 与「限流/会话失效/服务端」，所以不再需要"一律按罚号计数"的粗口径。
 func (h *Handler) handleStreamError(uid string, se *upstream.StreamError) {
-	h.noteFailure(uid, se.Kind())
+	h.noteFailure(uid, se.Kind(), se.RetryAfterSecs)
 }
 
 // noteUsage 把一次出站尝试记进用量台账。

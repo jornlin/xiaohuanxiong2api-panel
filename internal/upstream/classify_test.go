@@ -23,6 +23,15 @@ func TestClassifyNoFalsePenalty(t *testing.T) {
 		// 403 是权限（某接口只对网页会话开放、模型权限不足），不是登录态失效：
 		// 判成 session dead 会让好号在连续三次 403 后被自动禁用（bills v1 的 403 就是实例）。
 		{"403 forbidden", 403, `{"message":"insufficient permissions to access this resource"}`, ErrClient},
+		// 403 也可能是上游排队/网关限流的投放方式（高并发下的批量 403）：
+		// 判成 ErrClient 会让 handler fail-fast，必须归 ErrBusy 走等待/重试。
+		{"403 queue", 403, `{"message":"model is queued","serviceAvailable":false}`, ErrBusy},
+		{"403 Queue", 403, `{"message":"request isQueued, retryAfterSeconds":15}`, ErrBusy},
+		{"403 throttle", 403, `{"message":"too many requests, rate limit exceeded"}`, ErrBusy},
+		{"403 busy", 403, `{"message":"服务繁忙，请稍后重试"}`, ErrBusy},
+		// 额度信号优先于 403 的忙判据：该罚计划冷却，不能当排队到处重试。
+		{"403 quota", 403, `{"message":"积分不足，服务繁忙"}`, ErrPlanLimit},
+		{"429 queue", 429, `{"message":"busy","serviceAvailable":false}`, ErrBusy},
 		{"401", 401, `{"message":"unauthorized"}`, ErrSessionDead},
 		// 499 是调用方断开：不能换号重发
 		{"499 abort", 499, `client has aborted request`, ErrClient},
@@ -71,5 +80,43 @@ func TestStreamClassifyMatchesHTTP(t *testing.T) {
 	}
 	if got := classifyErrorText(`context window is insufficient for this model`); got == ErrPlanLimit {
 		t.Errorf("上下文过长被误判成额度不足")
+	}
+}
+
+// 200 信封里的 statusCodeValue=403 是上游「排队」的另一种投递形状：
+// 必须与 HTTP 403 一样归 ErrBusy，而不是当限流去软冷却账号。
+func TestStreamEnvelope403IsBusy(t *testing.T) {
+	for _, raw := range []string{
+		`{"message":"model is queued","statusCodeValue":403}`,
+		`{"error":{"message":"busy","statusCode":403}}`,
+		`{"status_code":403,"message":"暂不可服务"}`,
+	} {
+		if got := classifyErrorText(raw); got != ErrBusy {
+			t.Errorf("classifyErrorText(%s) = %v，期望 ErrBusy", raw, got)
+		}
+	}
+}
+
+// statusCodeValue 在外层 chunk 上，parseSSELine 必须按 status 兜底：
+// 200 信封 + 403 是排队，不能漏判成普通错误。
+func TestParseSSEEnvelope403(t *testing.T) {
+	ev := parseSSELine(`{"error":{"message":"暂不可服务"},"statusCodeValue":403}`)
+	if ev.Kind != sseError || ev.Status != 403 || ev.Class != ErrBusy {
+		t.Fatalf("事件 = %+v，期望 sseError/403/ErrBusy", ev)
+	}
+	// 额度不足仍按额度处理，不被 403 覆盖。
+	ev = parseSSELine(`{"error":{"message":"积分不足","statusCodeValue":403}}`)
+	if ev.Class != ErrPlanLimit {
+		t.Fatalf("额度错误被 403 覆盖成 %v", ev.Class)
+	}
+}
+
+// serviceAvailable/retryAfterSeconds 在外层 chunk：解析时要读到，
+// 否则队列「永远排不上」的会白等两轮 15s。
+func TestParseSSEOuterQueueFields(t *testing.T) {
+	ev := parseSSELine(`{"error":{"message":"busy"},"statusCodeValue":403,` +
+		`"serviceAvailable":false,"retryAfterSeconds":20}`)
+	if ev.Class != ErrBusy || !ev.ServiceUnavailable || ev.RetryAfterSecs != 20 {
+		t.Fatalf("事件 = %+v，期望 Busy/hopeless/20s", ev)
 	}
 }

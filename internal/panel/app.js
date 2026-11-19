@@ -376,16 +376,29 @@ function credTitle(a) {
       '所以这一列不能按积分读——免费号是 $1 免费额度，不是无限。';
   }
   const daily = Number(a.daily || 0);
-  const perm = Number(a.monthly || 0) + Number(a.reward || 0) + Number(a.topup || 0);
-  let tip = '剩余 / 总额（上游积分包）';
+  const frozen = a.topup_frozen ? Number(a.frozen_topup || a.topup || 0) : 0;
+  const perm = Math.max(0, Number(a.monthly || 0) + Number(a.reward || 0) +
+    Number(a.topup || 0) - frozen);
+  const total = Number(a.credits || 0);
+  let tip = '剩余（上游积分）';
+  if (a.credits_total && a.credits_total !== total) tip = '剩余 / 总额（上游积分包）';
   if (daily || perm) {
-    tip += '；每日/限时 ' + fmtNum(daily) + ' · 永久 ' + fmtNum(perm);
-    const today = Number(a.daily_today || 0);
-    if (today) {
+    tip += '；每日/限时 ' + fmtNum(daily) + ' · 永久 ' + fmtNum(perm) +
+      (a.buckets_exact === false ? '（无权威拆分，永久为合并估算）' : '');
+    // 今日已用只在「今天发放额确实观测到」时给：v1 balance 不含该字段，
+    // 拿 0 当已知会把「没观测到」显示成「今天没发」。
+    if (a.daily_today_known) {
+      const today = Number(a.daily_today || 0);
       tip += '；今日已发每日 ' + fmtNum(today) + ' · 已用 ' +
         fmtNum(Math.max(0, today - daily));
     }
   }
+  if (a.chargeable_known && Number(a.chargeable || 0) < total) {
+    tip += '；可扣费 ' + fmtNum(a.chargeable) + '（锁定 ' + fmtNum(total - Number(a.chargeable || 0)) + '）';
+  }
+  if (frozen > 0) tip += '；充值积分已冻结 ' + fmtNum(frozen) + '，不计入可花费余额';
+  if (a.enterprise_reserved) tip += '；企业额度保留中';
+  if (a.owner_mismatch) tip += '；⚠ 余额归属与本地账号不一致（owner_id=' + (a.owner_id || '?') + '），疑似凭证串号';
   return tip;
 }
 
@@ -533,17 +546,30 @@ function credCell2(a) {
     return '<div class="n" title="余额接口暂不可用；积分/礼包到账以积分流水为准">—</div>';
   }
   const daily = Number(a.daily || 0);
-  const perm = Number(a.monthly || 0) + Number(a.reward || 0) + Number(a.topup || 0);
+  const frozen = a.topup_frozen ? Number(a.frozen_topup || a.topup || 0) : 0;
+  const perm = Math.max(0, Number(a.monthly || 0) + Number(a.reward || 0) +
+    Number(a.topup || 0) - frozen);
   const total = Number(a.credits || 0);
   const denom = daily + perm;
-  let out = '<div class="n">' + fmtNum(total) +
-    (a.credits_total ? '<span class="tot">/' + fmtNum(a.credits_total) + '</span>' : '') + '</div>';
+  // 分母只在确实有「总额」时显示：国内积分把 Total 写成 Remain 会让每行都出现
+  // 「47528/47528」这种假比例（修复前就是这样）。
+  const totalStr = (a.credits_total && a.credits_total !== total)
+    ? '<span class="tot">/' + fmtNum(a.credits_total) + '</span>' : '';
+  let out = '<div class="n">' + fmtNum(total) + totalStr + '</div>';
+  const notes = [];
   if (denom > 0) {
     const wd = Math.max(0, Math.min(100, Math.round(daily / denom * 100)));
     out += '<div class="mix"><i class="d" style="width:' + wd + '%"></i>' +
       '<i class="p" style="width:' + (100 - wd) + '%"></i></div>' +
       '<div class="sub">每日 ' + fmtNum(daily) + ' · 永久 ' + fmtNum(perm) + '</div>';
+    if (a.buckets_exact === false) notes.push('拆分估算');
   }
+  if (frozen > 0) notes.push('充值冻结 ' + fmtNum(frozen));
+  if (a.chargeable_known && Number(a.chargeable || 0) < total) {
+    notes.push('可扣费 ' + fmtNum(a.chargeable));
+  }
+  if (a.owner_mismatch) notes.push('⚠ 串号');
+  if (notes.length) out += '<div class="sub warn" style="color:var(--warn)">' + esc(notes.join(' · ')) + '</div>';
   return out;
 }
 
@@ -684,10 +710,14 @@ async function loadOverview(quiet) {
     $('sCredits').parentElement.title = cTot
       ? '可用 ' + fmtNum(cSum) + ' / 历史发放总额 ' + fmtNum(cTot) : '可用积分合计';
     // 每日/永久两桶（v1 或 setting_info+流水推算）：顶部直接看「还能花多少每日额度」。
+    // 「今日已发/已用」要流水才能算；v1 balance 不含该字段时这是未知，不是 0。
+    const dtKnown = Number(d.daily_today_known || 0) > 0;
     $('sDaily').textContent = fmtNum(d.daily_balance || 0);
-    $('sDaily').title = '今日已发 ' + fmtNum(d.daily_today_granted || 0) +
-      ' · 今日已用 ' + fmtNum(d.daily_used_today || 0);
-    $('sDailyUsed').textContent = fmtNum(d.daily_used_today || 0);
+    $('sDaily').title = dtKnown
+      ? '今日已发 ' + fmtNum(d.daily_today_granted || 0) + ' · 今日已用 ' + fmtNum(d.daily_used_today || 0)
+      : '每日余额已拿到；今日发放额未观测（v1 balance 不含该字段，需积分流水）';
+    $('sDailyUsed').textContent = dtKnown ? fmtNum(d.daily_used_today || 0) : '—';
+    $('sDailyUsed').title = dtKnown ? '今日已用（发放额 - 每日剩余）' : '未观测：v1 余额接口不返回今日发放额';
     $('sPermanent').textContent = fmtNum(d.permanent_balance || 0);
     // 构成条：每日 vs 永久（只看池内快照，不猜）。
     const mix = $('ovMix');
@@ -2596,7 +2626,8 @@ function grantsMsg(gs) {
         toast('额度已刷新' + (acc
           ? (isUSD(acc)
             ? '，已用 ' + fmtUSD(acc.used_usd || 0) + ' / 额度 ' + fmtUSD(acc.limit_usd || 0)
-            : '，积分包 ' + acc.credits + (acc.credits_total ? '/' + acc.credits_total : ''))
+            : '，可用 ' + acc.credits +
+              (acc.credits_total && acc.credits_total !== acc.credits ? '/' + acc.credits_total : ''))
           : ''), 'ok');
       } else if (a === 'clear-cooldown') toast('已解除冷却', 'ok');
       else if (a === 'refresh') toast('这个号的 token 已换新' + (r.expires_at

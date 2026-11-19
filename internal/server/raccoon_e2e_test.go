@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -222,5 +223,69 @@ func TestNoAccount(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "no_healthy_account") {
 		t.Errorf("错误码不对: %s", rec.Body.String())
+	}
+}
+
+// 403 不能 fail-fast：一个号权限不足/被风控时，应换下一个号重试，
+// 而不是把 403 原样甩给客户端（高并发下那会变成批量中断）。
+func TestChat403RotatesAnotherAccount(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		body string
+	}{
+		{"plain 403", `{"message":"insufficient permissions to access this resource"}`},
+		{"busy 403", `{"message":"model is queued","serviceAvailable":false}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			var seen []string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/chat/completions":
+					authz := r.Header.Get("Authorization")
+					mu.Lock()
+					seen = append(seen, authz)
+					mu.Unlock()
+					if authz == "Bearer access-1" {
+						w.WriteHeader(http.StatusForbidden)
+						_, _ = io.WriteString(w, tc.body)
+						return
+					}
+					w.Header().Set("Content-Type", "application/json")
+					_, _ = io.WriteString(w, `{"id":"c1","object":"chat.completion","model":"m",`+
+						`"choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],`+
+						`"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+				case "/model_catalog":
+					_, _ = io.WriteString(w, `{"code":0,"data":{"categories":[{"type":"chat","models":[
+						{"name":"raccoon-chat-ml-5-5","display_name":"R","visible":true}]}]}}`)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			defer srv.Close()
+
+			client := upstream.New()
+			client.SetAgentHosts(srv.URL, srv.URL)
+			client.SetAPIHosts(srv.URL, srv.URL)
+			p := pool.New("")
+			p.Add(&auth.Auth{Data: auth.Data{AccessToken: "access-1", UID: "u-1",
+				ExpiresAt: time.Now().Add(48 * time.Hour).UnixMilli()}})
+			p.Add(&auth.Auth{Data: auth.Data{AccessToken: "access-2", UID: "u-2",
+				ExpiresAt: time.Now().Add(48 * time.Hour).UnixMilli()}})
+			p.SetRandInt64N(func(int64) int64 { return 0 }) // 确定性：权重相同时按 uid 取 u-1
+			h := NewHandler(Config{Pool: p, Upstream: client, MaxRotate: 2,
+				DefaultModel: upstream.DefaultConfigName})
+
+			rec := post(t, h, "/v1/chat/completions",
+				`{"model":"`+upstream.DefaultConfigName+`","messages":[{"role":"user","content":"hi"}]}`)
+			if rec.Code != http.StatusOK {
+				t.Fatalf("status = %d, body = %s", rec.Code, rec.Body.String())
+			}
+			mu.Lock()
+			defer mu.Unlock()
+			if len(seen) != 2 || seen[0] == seen[1] {
+				t.Fatalf("应在两个账号上各试一次，实际 %v", seen)
+			}
+		})
 	}
 }

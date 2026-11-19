@@ -384,6 +384,12 @@ func (s *Scheduler) entUsageOf(uid string, a *auth.Auth) (upstream.EntUsage, err
 		Unit: u.Unit, Remain: u.Remain, Total: u.Total,
 		Daily: u.Daily, DailyToday: u.DailyToday,
 		Monthly: u.Monthly, Reward: u.Reward, Topup: u.Topup,
+		Chargeable: u.Chargeable, ChargeableKnown: u.ChargeableKnown,
+		BucketsExact: u.BucketsExact, DailyTodayKnown: u.DailyTodayKnown,
+		TopupFrozen: u.TopupFrozen, FrozenTopup: u.FrozenTopup,
+		EnterpriseReserved: u.EnterpriseReserved, EnterpriseTopup: u.EnterpriseTopup,
+		ExtrasKnown: u.ExtrasKnown,
+		OwnerType:   u.OwnerType, OwnerID: u.OwnerID, OwnerMismatch: u.OwnerMismatch,
 		UsedUSD: u.UsedUSD, LimitUSD: u.LimitUSD,
 	}, u.Expire)
 	s.cfg.Pool.SetExpireCredits(uid, u.ExpirePoints)
@@ -734,8 +740,25 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 		// 余额桶沿用上一份拆分快照：本次 CheckinStatus 只拿到总额（setting_info 口径），
 		// 不能把 daily/reward 等桶写成 0，否则「每日优先」会立刻失效。
 		s.cfg.Pool.SetBalance(uid, pool.Balance{
-			Unit: "credit", Remain: finalCredits, Total: finalCredits,
-			Daily: prev.Daily, Monthly: prev.Monthly, Reward: prev.Reward, Topup: prev.Topup,
+			// 这里只有「可用」总额，没有额度上限；Total 留 0，
+			// 否则前端又会画出「47528/47528」这种假分母。
+			Unit: "credit", Remain: finalCredits, Total: 0,
+			// 本次签到没有重新观测「今日发放额」：Known 置 false，交给池子按
+			// daily_today_date 决定保留（同一天）还是清空（跨过午夜），
+			// 避免把昨天的数当今天盖上日期。
+			Daily: prev.Daily, DailyTodayKnown: false,
+			Monthly: prev.Monthly, Reward: prev.Reward, Topup: prev.Topup,
+			// 本次只刷新了总额：可扣费口径与冻结/归属标记沿用上一份，
+			// 不把「未知」写成 0（否则会把冻结的充值积分重新当成可用）。
+			// 可扣费额度沿用上一份，但不能直接写成 finalCredits：prev 可能是
+			// available=10000 / chargeable=3000（7000 锁定），签到只刷新了 available，
+			// 直接把 10000 当可扣费会把锁定额也放出来。取两者较小值。
+			Chargeable:      chargeableAfterCheckin(prev.Chargeable, finalCredits),
+			ChargeableKnown: prev.ChargeableKnown,
+			BucketsExact:    prev.BucketsExact,
+			TopupFrozen:     prev.TopupFrozen, EnterpriseReserved: prev.EnterpriseReserved,
+			EnterpriseTopup: prev.EnterpriseTopup,
+			OwnerType:       prev.OwnerType, OwnerID: prev.OwnerID, OwnerMismatch: prev.OwnerMismatch,
 		}, prev.Expire)
 		if checkinErr == nil {
 			// 「签到解冻」只在成功路径上做：失败路径也调它，等于一次失败签到
@@ -1005,4 +1028,17 @@ func (s *Scheduler) RunRefreshNow() {
 			log.Printf("refresh %s save: %v", st.UID, err)
 		}
 	}
+}
+
+// chargeableAfterCheckin 签到路径没有重新查可扣费额度，只能沿用上一份；
+// 同时用本次刷新到的 available 做上限，避免把锁定积分放出来。
+func chargeableAfterCheckin(prevChargeable, available int64) int64 {
+	c := prevChargeable
+	if c > available {
+		c = available
+	}
+	if c < 0 {
+		c = 0
+	}
+	return c
 }

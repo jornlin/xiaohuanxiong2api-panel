@@ -42,6 +42,30 @@ type EntUsage struct {
 	Monthly    int64 `json:"monthly,omitempty"`
 	Reward     int64 `json:"reward,omitempty"`
 	Topup      int64 `json:"topup,omitempty"`
+	// Chargeable 是上游口径的「可扣费积分」（total_chargeable_points）。available_points
+	// 可能含锁定/保留部分，选号与「还有没有额度」应以 Chargeable 为准；字段缺失时
+	// ChargeableKnown=false，调用方回落到 Remain。
+	Chargeable      int64 `json:"chargeable,omitempty"`
+	ChargeableKnown bool  `json:"chargeable_known,omitempty"`
+	// BucketsExact 四桶（每日/月会员/奖励/充值）是否来自 v1 balance 的权威拆分。
+	// setting_info 回退路径只有总额，四桶是流水推算/合并的，此时为 false。
+	BucketsExact bool `json:"buckets_exact,omitempty"`
+	// DailyTodayKnown 今天发放的每日积分是否已知（需要看流水；v1 balance 本身没有）。
+	DailyTodayKnown bool `json:"daily_today_known,omitempty"`
+	// 冻结/企业保留标记：为 true 时对应桶不能当可花费余额算。
+	TopupFrozen        bool  `json:"topup_frozen,omitempty"`
+	EnterpriseReserved bool  `json:"enterprise_reserved,omitempty"`
+	EnterpriseTopup    int64 `json:"enterprise_topup,omitempty"`
+	// FrozenTopup 是 topup_frozen=true 时被冻结的充值积分额：v1 不可用期间
+	// 也要能从可花费余额里扣掉（Topup 桶本身可能在回退快照里为 0）。
+	FrozenTopup int64 `json:"frozen_topup,omitempty"`
+	// ExtrasKnown 表示上面冻结/企业/归属字段本次是否由上游权威给出。
+	// setting_info 回退只有总额，不能拿它的空值覆盖上一次 v1 的快照。
+	ExtrasKnown bool `json:"extras_known,omitempty"`
+	// OwnerType / OwnerID 是上游对这份余额的归属声明，用来校验 token 是否串号。
+	OwnerType     string `json:"owner_type,omitempty"`
+	OwnerID       string `json:"owner_id,omitempty"`
+	OwnerMismatch bool   `json:"owner_mismatch,omitempty"`
 	// 面板/池子要的三件美元口径字段：小浣熊只有积分，恒 0 / 空。
 	Unit     string  `json:"unit,omitempty"`
 	UsedUSD  float64 `json:"used_usd,omitempty"`
@@ -96,6 +120,24 @@ func (c *Client) QuotaBlocked() bool {
 	return time.Now().Before(c.quotaBlockedUntil)
 }
 
+// billsBlocked v1 /bills 是否处于 403 静默窗口。
+func (c *Client) billsBlocked() bool {
+	c.quotaMu.Lock()
+	defer c.quotaMu.Unlock()
+	return time.Now().Before(c.billsBlockedUntil)
+}
+
+// noteBillsError 把 v1 /bills 的 403 记成 30 分钟静默：这是与 v1 balance 同批的
+// 权限收紧，不是账号故障，重试没有意义。
+func (c *Client) noteBillsError(err error) {
+	var ue *Error
+	if errors.As(err, &ue) && ue.Status == http.StatusForbidden {
+		c.quotaMu.Lock()
+		c.billsBlockedUntil = time.Now().Add(quotaBlockDuration)
+		c.quotaMu.Unlock()
+	}
+}
+
 // OfficeSettingInfo 工作台的实时设置信息（GET /api/web/office/v3/setting_info）。
 //
 // 这是官方网页自己用的余额来源：2026-11-19 抓包确认网页「资源用量」页同时调
@@ -139,18 +181,57 @@ func (c *Client) UserEntUsageDetail(a *auth.Auth) (EntUsage, error) {
 
 	if !blocked {
 		if data, err := c.FetchQuota(a); err == nil {
-			usage := EntUsage{
-				Unit:    UnitCredit,
-				Remain:  mustInt(data["available_points"]),
-				Daily:   mustInt(data["daily_points"]),
-				Monthly: mustInt(data["monthly_points"]),
-				Reward:  mustInt(data["reward_points"]),
-				Topup:   mustInt(data["topup_points"]),
-			}
-			if usage.Remain < 0 {
+			avail := mustInt(data["available_points"])
+			if avail < 0 {
 				return EntUsage{}, &Error{Kind: ErrServer, Status: 502, Msg: "小浣熊额度响应里没有 available_points"}
 			}
-			usage.Total = usage.Remain
+			// 四个桶缺失时按 0 处理（必须显式钳住：mustInt 的「缺失 = -1」直接写进池子
+			// 会让汇总变负、构成条百分比被算成负数）。
+			daily, dailyOK := optInt(data["daily_points"])
+			monthly, monthlyOK := optInt(data["monthly_points"])
+			reward, rewardOK := optInt(data["reward_points"])
+			topup, topupOK := optInt(data["topup_points"])
+			daily, monthly, reward, topup = nonNeg(daily), nonNeg(monthly), nonNeg(reward), nonNeg(topup)
+			// 可扣费积分：available_points 是「账面可用」，total_chargeable_points 才是
+			// 上游实际会拿来扣费的额度（可能剔除了冻结/企业保留部分）。缺失时回落。
+			chargeable, chargeableOK := optInt(data["total_chargeable_points"])
+			if !chargeableOK {
+				chargeable = avail
+			}
+			frozen := boolOf(data["topup_frozen"])
+			var frozenTopup int64
+			if frozen {
+				frozenTopup = topup
+			}
+			usage := EntUsage{
+				Unit:   UnitCredit,
+				Remain: avail,
+				// 国内积分不存在「总额」：上游不返回、可用也不等于额度上限。
+				// 以前把 Total 写成 Remain，前端就永远显示「47528/47528」这种假分母。
+				Total:              0,
+				Daily:              daily,
+				Monthly:            monthly,
+				Reward:             reward,
+				Topup:              topup,
+				Chargeable:         chargeable,
+				ChargeableKnown:    chargeableOK,
+				BucketsExact:       dailyOK && monthlyOK && rewardOK && topupOK,
+				TopupFrozen:        frozen,
+				FrozenTopup:        frozenTopup,
+				EnterpriseReserved: boolOf(data["enterprise_reserved"]),
+				EnterpriseTopup:    nonNeg(mustInt(data["enterprise_topup_points"])),
+				OwnerType:          text(data, "owner_type"),
+				ExtrasKnown:        true,
+			}
+			if oid := text(data, "owner_id"); oid != "" {
+				usage.OwnerID = oid
+				// 企业/组织号的 owner_id 是组织标识，本来就不等于个人 uid；
+				// 只有个人归属（users/缺省）才做串号比对。
+				if (usage.OwnerType == "" || usage.OwnerType == "users") &&
+					a != nil && a.UID != "" && oid != a.UID {
+					usage.OwnerMismatch = true
+				}
+			}
 			cache(usage)
 			return usage, nil
 		} else {
@@ -169,7 +250,9 @@ func (c *Client) UserEntUsageDetail(a *auth.Auth) (EntUsage, error) {
 	if !settingBlocked {
 		if data, serr := c.OfficeSettingInfo(a); serr == nil {
 			if v := mustInt(data["available_points"]); v >= 0 {
-				usage := EntUsage{Unit: UnitCredit, Remain: v, Total: v}
+				// setting_info 没有可扣费/桶字段：可扣费按总额兜底，但明确标 unknown，
+				// 调用方不会把「账面可用」误当成「上游保证能扣」。
+				usage := EntUsage{Unit: UnitCredit, Remain: v, Chargeable: v}
 				// setting_info 只有总额：用 v2 发放流水按 FEFO 推算每日/永久两桶。
 				// 失败保持 0（未知），不猜——daily=0 时「每日优先」自然不生效。
 				if bk, berr := c.QuotaBuckets(a); berr == nil {
@@ -182,6 +265,7 @@ func (c *Client) UserEntUsageDetail(a *auth.Auth) (EntUsage, error) {
 					}
 					usage.Daily = daily
 					usage.DailyToday = bk.TodayGrant
+					usage.DailyTodayKnown = true
 					usage.Reward = v - daily // 永久（月会员/奖励/充值合并口径）
 					if usage.Reward < 0 {
 						usage.Reward = 0
@@ -253,13 +337,18 @@ func (c *Client) BalancePackages(a *auth.Auth) ([]CreditPackage, EntUsage, error
 // dailyBatchExpiry 查 bills，取每日发放批次里最早的**未过期**到期时刻（unix 秒）。
 // 失败静默返回 0（构成页照常显示余额，只是到期分布缺这一列——不拿流水故障拖累额度页）。
 func (c *Client) dailyBatchExpiry(a *auth.Auth) int64 {
+	if c.billsBlocked() {
+		return 0
+	}
 	resp, err := c.doJSON(http.MethodGet,
 		c.pointsBase()+PointsBillsPath+"?"+PointsBillsQuery, nil, c.authHeader(a))
 	if err != nil {
+		c.noteBillsError(err)
 		return 0
 	}
 	data, err := payloadOf(resp, "积分流水")
 	if err != nil {
+		c.noteBillsError(err)
 		return 0
 	}
 	now := time.Now()
@@ -313,13 +402,18 @@ func (c *Client) UserEntUsageDetailWithExpiry(a *auth.Auth) (EntUsage, error) {
 // 「哪天会作废多少」，会得出「6490 分 5 天后全没」这种吓人的假数（实际只有每日批次那
 // 几百分会作废）。所以按 expire_at 分组，取最早那组的积分合计。
 func (c *Client) earliestBatchExpiry(a *auth.Auth) (expire, points int64) {
+	if c.billsBlocked() {
+		return 0, 0
+	}
 	resp, err := c.doJSON(http.MethodGet,
 		c.pointsBase()+PointsBillsPath+"?"+PointsBillsQuery, nil, c.authHeader(a))
 	if err != nil {
+		c.noteBillsError(err)
 		return 0, 0
 	}
 	data, err := payloadOf(resp, "积分流水")
 	if err != nil {
+		c.noteBillsError(err)
 		return 0, 0
 	}
 	now := time.Now()
@@ -1148,6 +1242,21 @@ func mustInt(value any) int64 {
 		return n
 	}
 	return -1
+}
+
+// optInt 与 mustInt 同源，但把「字段有没有给」显式返回：额度桶要据此决定
+// 是「真为 0」还是「上游没给」，不能都折叠成 0。
+func optInt(value any) (int64, bool) {
+	n := mustInt(value)
+	return n, n >= 0
+}
+
+// nonNeg 把缺失/负数钳成 0：mustInt 的 -1 只能用于判断，不能进入余额汇总。
+func nonNeg(n int64) int64 {
+	if n < 0 {
+		return 0
+	}
+	return n
 }
 
 // businessCodeOf 从响应体里取业务码（没有返回 false）。

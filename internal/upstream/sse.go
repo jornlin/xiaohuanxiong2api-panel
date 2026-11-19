@@ -115,9 +115,20 @@ func parseSSELine(data string) sseEvent {
 		if encoded, err := json.Marshal(errObj); err == nil {
 			raw = string(encoded)
 		}
+		status := statusOfError(chunk, errObj)
 		class := classifyErrorText(raw)
-		return sseEvent{Kind: sseError, Status: statusOfError(chunk, errObj), Class: class, Raw: truncate(raw, 500),
-			Message: messageOf(class), RetryAfterSecs: retryAfterOf(raw), ServiceUnavailable: queueUnavailable(raw)}
+		// 信封状态 403 = 上游的「排队/暂不可服务」投递形状（见 handler.isQueueError）。
+		// statusCodeValue 在外层 chunk 上，单看 errObj 会漏掉，所以在这里按 status 兜底。
+		// 额度/登录态是更强语义，保持原判。
+		if class != ErrPlanLimit && class != ErrSessionDead &&
+			(status == http.StatusForbidden || queueUnavailable(trimmed)) {
+			class = ErrBusy
+		}
+		// 排队标记/建议间隔可能在外层 chunk（不在 errObj 里），必须用整条报文取，
+		// 否则 serviceAvailable:false 会被当成可等待，白等两轮 15s。
+		return sseEvent{Kind: sseError, Status: status, Class: class, Raw: truncate(raw, 500),
+			Message: messageOf(class), RetryAfterSecs: retryAfterOf(trimmed),
+			ServiceUnavailable: queueUnavailable(trimmed)}
 	}
 	if code, ok := intOf(chunk["code"]); ok && code != 0 {
 		class := classifyErrorText(trimmed)
@@ -138,7 +149,7 @@ func parseSSELine(data string) sseEvent {
 // statusOfError 取错误对象里的状态码（没有就按分类给）。
 func statusOfError(chunk, errObj map[string]any) int {
 	for _, src := range []map[string]any{errObj, chunk} {
-		for _, key := range []string{"status", "status_code", "statusCode"} {
+		for _, key := range []string{"status", "status_code", "statusCode", "statusCodeValue"} {
 			if n, ok := intOf(src[key]); ok && n >= 400 {
 				return n
 			}
@@ -158,22 +169,43 @@ func statusOfError(chunk, errObj map[string]any) int {
 // 所以改判词（sessionDeadSignal / quotaSignal）都收窄到「确实在说这件事」。
 func classifyErrorText(raw string) ErrKind {
 	lower := strings.ToLower(raw)
-	if queueUnavailable(raw) {
-		return ErrBusy
-	}
+	// 额度信号优先：与 HTTP Classify 保持同一优先级，403/429 里写「积分不足」
+	// 必须进计划冷却，不能被排队字段覆盖成可重试。
 	if quotaSignal(lower) {
 		return ErrPlanLimit
 	}
-	if strings.Contains(lower, "rate limit") || strings.Contains(lower, "too many") || strings.Contains(raw, "429") {
-		return ErrSoftRate
+	if queueUnavailable(raw) {
+		return ErrBusy
 	}
 	if sessionDeadSignal(lower) || strings.Contains(raw, "401") {
 		return ErrSessionDead
+	}
+	// 200 信封里的 403 是上游投递「排队/暂不可服务」的另一种形状
+	// （见 handler.isQueueError 的说明）。归 ErrBusy：不罚号、可等待重试；
+	// 若当成 ErrSoftRate，高并发下会把整池号逐个软冷却，反而放大故障。
+	// 放在额度/登录态判据之后：403 里如果明确写了「积分不足」，那是更强的语义。
+	if envelope403(raw) {
+		return ErrBusy
+	}
+	if strings.Contains(lower, "rate limit") || strings.Contains(lower, "too many") || strings.Contains(raw, "429") {
+		return ErrSoftRate
 	}
 	if strings.Contains(lower, "server") || strings.Contains(raw, "500") || strings.Contains(raw, "502") {
 		return ErrServer
 	}
 	return ErrNone
+}
+
+// envelope403 判断错误报文里的信封状态码是否为 403（忽略空白与转义差异）。
+func envelope403(raw string) bool {
+	flat := strings.ReplaceAll(raw, `\`, "")
+	flat = strings.ReplaceAll(flat, " ", "")
+	for _, key := range []string{`"statusCodeValue":403`, `"statusCode":403`, `"status_code":403`} {
+		if strings.Contains(flat, key) {
+			return true
+		}
+	}
+	return false
 }
 
 func messageOf(kind ErrKind) string {

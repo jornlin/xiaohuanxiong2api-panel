@@ -2,10 +2,12 @@ package upstream
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -120,6 +122,9 @@ type Error struct {
 	RetryAfterSecs int64
 	// ServiceUnavailable = 排队体里 serviceAvailable:false：等也没用，立刻回错。
 	ServiceUnavailable bool
+	// Throttled = 网关频率/风控拒绝（不是模型排队）：退避交给全局闸门，
+	// 单次重试间隔可以很短，不必按模型的 15s 排队窗口等。
+	Throttled bool
 }
 
 func (e *Error) Error() string {
@@ -204,15 +209,35 @@ func sessionDeadSignal(lower string) bool {
 // 各写一份必然漂移，同一报文会在 HTTP 与 SSE 两条路径上被判成不同类别。
 func Classify(status int, body string) ErrKind {
 	lower := strings.ToLower(body)
-	switch {
-	// 认证类**先判**。401 才是登录态失效；403 是权限/风控（例如某个接口只对网页会话
-	// 开放，或模型权限不足），判成 session dead 会让好号在连续三次 403 后被自动禁用
-	// （bills v1 的 403 就是活例）。403 归「调用方侧」，不罚号。
-	case status == http.StatusUnauthorized:
+	// 认证先判：401 才是登录态失效。
+	if status == http.StatusUnauthorized {
 		return ErrSessionDead
+	}
+	// 额度信号必须在状态码分支之前：上游会用 403/429 投递「积分不足」，
+	// 若先按 403 判成忙/客户端错误，该账号就永远进不了计划冷却。
+	if quotaSignal(lower) || status == http.StatusPaymentRequired {
+		return ErrPlanLimit
+	}
+	switch {
+	// 403 是权限/风控（例如某个接口只对网页会话开放，或模型权限不足），
+	// 判成 session dead 会让好号在连续三次 403 后被自动禁用（bills v1 的 403 就是活例）。
+	// 403 归「调用方侧」，不罚号。
 	case status == http.StatusForbidden:
+		// 403 有两种来源，必须分开：
+		//   1. 排队/网关限流/风控：上游把「模型暂不可服务」也用 403 投递；
+		//   2. 真正的权限问题（接口只对网页会话开放、模型无权限）。
+		// 早先在 switch 里直接把 403 归 ErrClient，于是 (1) 被 handler 当请求错误
+		// fail-fast 原样回给客户端——高并发时表现为「批量 403、请求大批量中断」。
+		// 先看报文里的忙信号；没有才按权限错误处理。
+		if busySignal(body) || throttleSignal(body) {
+			return ErrBusy
+		}
 		return ErrClient
 	case status == http.StatusTooManyRequests:
+		// 429 默认为账号级限流（要软冷却）；但上游排队体也是 429 时就别罚号。
+		if queueUnavailable(body) {
+			return ErrBusy
+		}
 		return ErrSoftRate
 	case status == http.StatusGatewayTimeout:
 		return ErrGateway
@@ -229,9 +254,6 @@ func Classify(status int, body string) ErrKind {
 	}
 	if queueUnavailable(body) {
 		return ErrBusy
-	}
-	if quotaSignal(lower) || status == http.StatusPaymentRequired {
-		return ErrPlanLimit
 	}
 	if status >= 400 {
 		return ErrClient
@@ -272,10 +294,24 @@ type Client struct {
 	// 期间用最后一次成功快照（没有快照就如实报错）。
 	quotaMu           sync.Mutex
 	quotaBlockedUntil time.Time
+	// billsBlockedUntil v1 /bills 403 后的静默窗口（30 分钟）：v1 余额收紧通常与
+	// v1 流水同批（2026-11-19 实测）。签到与到期推算已全走 v2；继续每号重打 v1
+	// 只是白送请求，还会把网关风控窗口越撑越长。
+	billsBlockedUntil time.Time
 	// settingBlockedUntil setting_info 也 403 后的短熔断（10 分钟）：两个余额接口
 	// 同时被网关拦时，全池逐号重打只是继续喂风控。
 	settingBlockedUntil time.Time
 	quotaCache          map[string]EntUsage
+
+	// 网关级暂缓（global gate）：上游按频率打回 403/429 时，不是某一个号的问题，
+	// 继续全池重试只会把风控窗口越撑越长。这里给所有出站对话请求加一道共享闸门：
+	// 命中限流后短暂暂停新请求（指数退避，封顶 10s），请求是排队等待而不是直接被拒。
+	throttleMu      sync.Mutex
+	gateUntil       time.Time
+	throttleStreak  int
+	lastThrottle    time.Time
+	lastThrottleLog time.Time
+	lastRejectLog   time.Time
 }
 
 // New 生产默认值：连接池共享，短请求 120s 兜底、长流只看首字节超时。
@@ -724,15 +760,31 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte, turnTitle string) (io.Rea
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		uid := ""
+		if a != nil {
+			uid = a.UID
+		}
+		// 先记拒绝样本并更新全局闸门，再分类：403 的正文是判断「排队/风控/权限」
+		// 的唯一依据，不能既不进日志也不进闸门。
+		xtt := resp.Header.Get("X-TT-System-Error")
+		throttled := c.noteChatReject(resp.StatusCode, uid, xtt, raw)
 		_ = resp.Body.Close()
 		kind := Classify(resp.StatusCode, string(raw))
+		// X-TT-System-Error 是网关级限流标记，正文可能不含任何关键字；
+		// Classify 只看得到正文，这里用头上的信号把 403/429 归为可等待的忙。
+		if xtt != "" && (resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusTooManyRequests) {
+			kind = ErrBusy
+		}
 		msg := truncate(errorText(raw), 300)
 		if msg == "" {
 			msg = fmt.Sprintf("上游返回 HTTP %d", resp.StatusCode)
 		}
 		return nil, resp.StatusCode, raw, &Error{Kind: kind, Status: resp.StatusCode, Msg: msg,
-			RetryAfterSecs: retryAfterOf(string(raw)), ServiceUnavailable: queueUnavailable(string(raw))}
+			RetryAfterSecs: retryAfterOf(string(raw)), ServiceUnavailable: queueUnavailable(string(raw)),
+			Throttled: throttled}
 	}
+
+	c.NoteUpstreamOK()
 
 	// stream:false 时上游回的是普通 JSON（不是 SSE）：包成一帧 SSE 交给同一套管道，
 	// 下游（handler/Aggregate）就只用认一种线上形状。
@@ -782,6 +834,135 @@ var (
 func queueUnavailable(raw string) bool {
 	flat := strings.ReplaceAll(raw, `\`, "")
 	return serviceAvailRE.MatchString(flat)
+}
+
+// busySignal 判断报文是不是「上游忙/排队」而不是请求本身有问题。
+// 与 throttleSignal 的区别：这里的信号很强（排队字段/错误码），任何下文都认；
+// throttleSignal 更宽（限流文案），只在 403/429 这类状态码上才拿来判。
+func busySignal(raw string) bool {
+	flat := strings.ReplaceAll(raw, `\`, "")
+	lower := strings.ToLower(flat)
+	if queueUnavailable(flat) {
+		return true
+	}
+	for _, s := range []string{"isqueued", "queued", "in queue", "10605", "排队", "\"queue\"", "queue_position"} {
+		if strings.Contains(lower, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// throttleSignal 判断 403/429 的报文是否在说「频率/风控」——高并发下上游网关
+// （X-TT-System-Error:3）会这样打回。这类拒绝与账号健康、请求参数都无关，
+// 应当暂缓出站后重试，不能原样回给客户端。
+func throttleSignal(raw string) bool {
+	lower := strings.ToLower(strings.ReplaceAll(raw, `\`, ""))
+	for _, s := range []string{
+		"x-tt-system-error", "too many requests", "rate limit", "rate_limit",
+		"too frequent", "requests are too frequent", "request frequency",
+		"频繁", "限流", "风控", "繁忙", "busy", "throttl",
+	} {
+		if strings.Contains(lower, s) {
+			return true
+		}
+	}
+	return false
+}
+
+// NoteUpstreamOK 一次成功出站。只有长时间（60s）没有再见到限流才把退避档位清零，
+// 避免「失败-成功-失败」来回抖动时档位重置、闸门失去作用。
+func (c *Client) NoteUpstreamOK() {
+	c.throttleMu.Lock()
+	if c.throttleStreak != 0 && time.Since(c.lastThrottle) > time.Minute {
+		c.throttleStreak = 0
+	}
+	c.throttleMu.Unlock()
+}
+
+// WaitGate 阻塞到全局闸门放开（或 ctx 结束）。handler 在每次出站尝试前调用：
+// 上游限流期间请求是「等一会儿再发」，而不是立刻拿到 403。
+func (c *Client) WaitGate(ctx context.Context) {
+	c.WaitGateUntil(ctx, time.Now().Add(30*time.Second))
+}
+
+// WaitGateUntil 与 WaitGate 相同，但共享调用方给的截止时间：一个请求内部的
+// 多次重试/换号共用同一份等待预算，不会每步各等 30s。
+func (c *Client) WaitGateUntil(ctx context.Context, deadline time.Time) {
+	for {
+		if !time.Now().Before(deadline) {
+			return
+		}
+		c.throttleMu.Lock()
+		until := c.gateUntil
+		c.throttleMu.Unlock()
+		d := time.Until(until)
+		if d <= 0 {
+			return
+		}
+		if left := time.Until(deadline); d > left {
+			d = left
+		}
+		timer := time.NewTimer(d)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return
+		case <-timer.C:
+		}
+	}
+}
+
+// noteChatReject 记录一次上游拒绝（采样），并视是否为限流信号更新全局闸门。
+//
+// 采样日志是排障的关键：403 的报文以前既没进请求记录也没进日志，只能看到
+// 「客户端批量 403」，无法判断是排队、风控还是真的权限问题。
+func (c *Client) noteChatReject(status int, uid, xtt string, raw []byte) (throttled bool) {
+	now := time.Now()
+	body := truncate(string(raw), 300)
+	// 只有「网关级频率/风控」才拉全局闸门：X-TT-System-Error 头或正文明确说
+	// 频率超限/风控。以下情况**不**全局暂停，否则会把单账号/单模型的问题放大成整池变慢：
+	//   - 429（线上实测 body code=200108「您的模型请求频率超限」）= 单账号/单模型限流，
+	//     换号即可；仍会按账号软冷却；
+	//   - 403 里的排队信号（isQueued/serviceAvailable）= 某模型暂不可服务，由
+	//     handler 按上游建议等待重试，其它模型不该一起停。
+	throttled = status == http.StatusForbidden && (xtt != "" || throttleSignal(body))
+
+	c.throttleMu.Lock()
+	logNow := now.Sub(c.lastRejectLog) >= 5*time.Second
+	if logNow {
+		c.lastRejectLog = now
+	}
+	if !throttled {
+		c.throttleMu.Unlock()
+		if logNow {
+			log.Printf("[upstream] chat 拒绝 HTTP %d uid=%s xtt=%q body=%s", status, uid, xtt, body)
+		}
+		return
+	}
+	// 60s 没再见限流就从 1s 重新起退；否则档位递增，封顶 10s。
+	if now.Sub(c.lastThrottle) > time.Minute {
+		c.throttleStreak = 0
+	}
+	c.lastThrottle = now
+	if c.throttleStreak < 6 {
+		c.throttleStreak++
+	}
+	delay := time.Second << (c.throttleStreak - 1)
+	if delay > 10*time.Second {
+		delay = 10 * time.Second
+	}
+	if until := now.Add(delay); until.After(c.gateUntil) {
+		c.gateUntil = until
+	}
+	streak := c.throttleStreak
+	c.throttleMu.Unlock()
+
+	if logNow {
+		log.Printf("[upstream] 网关限流 HTTP %d uid=%s xtt=%q，暂停新出站 %s（连续第 %d 次）body=%s",
+			status, uid, xtt, delay, streak, body)
+	}
+	return throttled
 }
 
 // retryAfterOf 抓上游建议的重试间隔（秒）。

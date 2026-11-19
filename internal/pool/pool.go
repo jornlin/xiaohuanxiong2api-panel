@@ -68,6 +68,24 @@ type Status struct {
 	Monthly    int64 `json:"monthly,omitempty"`
 	Reward     int64 `json:"reward,omitempty"`
 	Topup      int64 `json:"topup,omitempty"`
+	// Chargeable = 上游 total_chargeable_points（实际可扣费额度）。available 可能含
+	// 冻结/企业保留部分；ChargeableKnown=false 时界面与选号回落到 Credits。
+	Chargeable      int64 `json:"chargeable,omitempty"`
+	ChargeableKnown bool  `json:"chargeable_known,omitempty"`
+	// BucketsExact 四桶是否来自 v1 balance 的权威拆分（回退路径是流水推算/合并）。
+	// 不加 omitempty：前端用 `=== false` 判断「拆分是估算的」，false 必须显式出现。
+	BucketsExact bool `json:"buckets_exact"`
+	// DailyTodayKnown 今日发放额是否已观测（v1 balance 不含该字段，需要流水）。
+	DailyTodayKnown bool `json:"daily_today_known,omitempty"`
+	// TopupFrozen/EnterpriseReserved 为 true 时对应积分不可当可花费余额。
+	TopupFrozen        bool  `json:"topup_frozen,omitempty"`
+	FrozenTopup        int64 `json:"frozen_topup,omitempty"`
+	EnterpriseReserved bool  `json:"enterprise_reserved,omitempty"`
+	EnterpriseTopup    int64 `json:"enterprise_topup,omitempty"`
+	// OwnerType/OwnerID 上游余额归属；OwnerMismatch 表示与本地 uid 不一致（疑似串号）。
+	OwnerType     string `json:"owner_type,omitempty"`
+	OwnerID       string `json:"owner_id,omitempty"`
+	OwnerMismatch bool   `json:"owner_mismatch,omitempty"`
 	// Phone / NationCode 账号绑定手机号（授权码入池的号没有 loginid，只能从
 	// /auth/v1/user_info 补全；面板靠它认出「随机昵称 + 7 位 uid」是谁）。
 	Phone      string `json:"phone,omitempty"`
@@ -112,6 +130,22 @@ type entry struct {
 	// 积分桶（v1 balance）：daily=每日赠送/限时；monthly/reward/topup=永久。
 	// balance 403 期间这些值来自最后一次成功快照，0 不代表真的没有。
 	daily, dailyToday, monthly, reward, topup int64
+	// 可扣费余额与新口径标记（见 Status 同名字段）。
+	chargeable      int64
+	chargeableKnown bool
+	bucketsExact    bool
+	dailyTodayKnown bool
+	// dailyTodayDate 今日发放额对应的日期（本地时区，2026-01-02）。v1 balance 不含该
+	// 字段：跨过午夜后的第一份「未知」快照要把昨天的数清掉，否则面板会一直显示
+	// 昨天的「今日已发」。
+	dailyTodayDate     string
+	topupFrozen        bool
+	frozenTopup        int64
+	enterpriseReserved bool
+	enterpriseTopup    int64
+	ownerType          string
+	ownerID            string
+	ownerMismatch      bool
 	// creditsTotal 是上游总额（分母），只由余额查询路径写；见 SetCredits。
 	creditsTotal int64
 	expire       int64
@@ -232,6 +266,20 @@ type stateAccount struct {
 	Monthly    int64 `json:"monthly,omitempty"`
 	Reward     int64 `json:"reward,omitempty"`
 	Topup      int64 `json:"topup,omitempty"`
+	// 新口径字段也要持久化：重启后 Chargeable/冻结/归属标记丢失会让选号与面板
+	// 回落到旧假设（把冻结的充值积分当可用）。
+	Chargeable         int64  `json:"chargeable,omitempty"`
+	ChargeableKnown    bool   `json:"chargeable_known,omitempty"`
+	BucketsExact       bool   `json:"buckets_exact,omitempty"`
+	DailyTodayKnown    bool   `json:"daily_today_known,omitempty"`
+	DailyTodayDate     string `json:"daily_today_date,omitempty"`
+	TopupFrozen        bool   `json:"topup_frozen,omitempty"`
+	FrozenTopup        int64  `json:"frozen_topup,omitempty"`
+	EnterpriseReserved bool   `json:"enterprise_reserved,omitempty"`
+	EnterpriseTopup    int64  `json:"enterprise_topup,omitempty"`
+	OwnerType          string `json:"owner_type,omitempty"`
+	OwnerID            string `json:"owner_id,omitempty"`
+	OwnerMismatch      bool   `json:"owner_mismatch,omitempty"`
 }
 
 // stateFile 持久化格式。
@@ -461,7 +509,7 @@ func (p *Pool) pickLocked(tried map[string]bool, realm string) *entry {
 	if p.lim.ExpiringSoon > 0 {
 		var expiring []*entry
 		for _, e := range cands {
-			if e.credits > 0 && e.expire > 0 && time.Unix(e.expire, 0).Sub(now) <= p.lim.ExpiringSoon {
+			if e.spendableCredits() > 0 && e.expire > 0 && time.Unix(e.expire, 0).Sub(now) <= p.lim.ExpiringSoon {
 				expiring = append(expiring, e)
 			}
 		}
@@ -487,8 +535,8 @@ var minPickGap = 100 * time.Millisecond
 func (p *Pool) drawLocked(cands []*entry, now time.Time) *entry {
 	var maxCredits int64
 	for _, e := range cands {
-		if e.credits > maxCredits {
-			maxCredits = e.credits
+		if c := e.spendableCredits(); c > maxCredits {
+			maxCredits = c
 		}
 	}
 	type weighted struct {
@@ -552,6 +600,29 @@ func (p *Pool) drawLocked(cands []*entry, now time.Time) *entry {
 	return eligible[len(eligible)-1].e
 }
 
+// spendableCredits 选号时的「可花积分」口径。
+//
+// 优先用上游 total_chargeable_points（实际会扣费的部分）；字段缺失才回落到账面
+// available_points。美元号返回 0：它走 limit-used 分支，积分口径不适用。
+func (e *entry) spendableCredits() int64 {
+	if e.unit == "usd" {
+		return 0
+	}
+	if e.chargeableKnown {
+		return e.chargeable
+	}
+	// 可扣费额度未知时，至少把「已知被冻结的充值积分」从账面余额里扣掉，
+	// 否则 v1 不可用期间会把冻结积分重新当成可花费。
+	c := e.credits
+	if e.frozenTopup > 0 {
+		c -= e.frozenTopup
+		if c < 0 {
+			c = 0
+		}
+	}
+	return c
+}
+
 // weight 选号权重（照 workbuddy2api-panel 的 weightOf 形状：**加性**，基线 1.0）。
 //
 //	1.0        基线——任何 healthy 号都有非零权重。乘性权重（旧实现 credits×(1+闲置%)）
@@ -583,7 +654,7 @@ func (p *Pool) weight(e *entry, maxCredits int64, now time.Time) float64 {
 		}
 		w += remain / e.limitUSD * 10
 	case maxCredits > 0:
-		w += float64(e.credits) / float64(maxCredits) * 10
+		w += float64(e.spendableCredits()) / float64(maxCredits) * 10
 	}
 	if p.lim.IdleWeightPerHour <= 0 {
 		return w
@@ -615,6 +686,25 @@ func (p *Pool) Acquire(uid string) bool {
 	}
 	e.inFlight++
 	return true
+}
+
+// HasHealthy 报告该地区是否存在未禁用、未冷却的账号（不考虑在途/已尝试）。
+//
+// 只用于区分「池子空了」和「只是被占满」：两者都让 Pick 返回 nil，但前者应
+// 立即 503，后者值得短暂等一下空出来的名额。
+func (p *Pool) HasHealthy(realm string) bool {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	now := time.Now()
+	for _, e := range p.byUID {
+		if realm != "" && e.a.Realm() != realm {
+			continue
+		}
+		if e.healthy(now) {
+			return true
+		}
+	}
+	return false
 }
 
 // AcquireIfHealthy 指定账号可用（healthy 且未达在途上限）时占用一个在途名额并返回凭证；
@@ -677,6 +767,24 @@ type Balance struct {
 	// 积分桶（国内口径）：Daily=每日赠送/限时，其余=永久（月会员/奖励/充值）。
 	// v1 balance 是唯一提供拆分的地方；setting_info 只给总额时这些字段保持旧值。
 	Daily, DailyToday, Monthly, Reward, Topup int64
+	// Chargeable 上游实际可扣费额度；ChargeableKnown=false 时视为未知、回落 Remain。
+	Chargeable      int64
+	ChargeableKnown bool
+	// 口径标记：四桶是否权威拆分、今日发放额是否已观测。
+	BucketsExact    bool
+	DailyTodayKnown bool
+	// 冻结/企业保留标记：为 true 时对应桶不计入可花费余额。
+	TopupFrozen        bool
+	FrozenTopup        int64
+	EnterpriseReserved bool
+	EnterpriseTopup    int64
+	// ExtrasKnown=false 表示本次快照没有权威的冻结/企业/归属字段（setting_info
+	// 回退路径），SetBalance 会保留上一次 v1 快照的对应值而不是清空。
+	ExtrasKnown bool
+	// 余额归属（串号检测）。
+	OwnerType     string
+	OwnerID       string
+	OwnerMismatch bool
 	// 美元口径（Unit="usd"）。Free plan 实测 used=0.00059，必须留小数。
 	UsedUSD  float64
 	LimitUSD float64
@@ -696,15 +804,49 @@ func (p *Pool) SetBalance(uid string, b Balance, expire int64) {
 	if unit == "" {
 		unit = "credit"
 	}
+	wasMismatch := e.ownerMismatch
 	e.unit, e.usedUSD, e.limitUSD = unit, b.UsedUSD, b.LimitUSD
 	if unit == "usd" {
 		// 美元号：credits 留 0（没有积分这回事），余额看 usedUSD/limitUSD。
 		// 不把美元塞进 credits —— 那会让「积分」列显示一个不是积分的数。
 		e.credits, e.creditsTotal = 0, 0
 		e.daily, e.dailyToday, e.monthly, e.reward, e.topup = 0, 0, 0, 0, 0
+		e.chargeable, e.chargeableKnown = 0, false
+		e.dailyTodayKnown, e.dailyTodayDate = false, ""
+		e.topupFrozen, e.frozenTopup = false, 0
+		e.enterpriseReserved, e.enterpriseTopup = false, 0
+		e.ownerType, e.ownerID, e.ownerMismatch = "", "", false
 	} else {
 		e.credits, e.creditsTotal = b.Remain, b.Total
-		e.daily, e.dailyToday, e.monthly, e.reward, e.topup = b.Daily, b.DailyToday, b.Monthly, b.Reward, b.Topup
+		e.daily, e.monthly, e.reward, e.topup = b.Daily, b.Monthly, b.Reward, b.Topup
+		// DailyToday 只在「确实观测到」时覆盖：v1 balance 不含今日发放额，
+		// 但它返回时会把之前由流水算出的值清零，面板「今日已用」就会凭空回 0。
+		// 同一天内保留旧值；跨过午夜后的第一份未知快照才清空。
+		// 用东八区日期而不是容器本地时区：上游每日积分按 CST 00:00 发放，
+		// 面板/选号也必须以同一个「今天」为准。
+		today := time.Now().In(time.FixedZone("CST", 8*3600)).Format("2006-01-02")
+		switch {
+		case b.DailyTodayKnown:
+			e.dailyToday, e.dailyTodayKnown, e.dailyTodayDate = b.DailyToday, true, today
+		case e.dailyTodayKnown && e.dailyTodayDate == today:
+			// 保留今天已经算出来的值。
+		default:
+			e.dailyToday, e.dailyTodayKnown, e.dailyTodayDate = 0, false, ""
+		}
+		e.chargeable, e.chargeableKnown = b.Chargeable, b.ChargeableKnown
+		e.bucketsExact = b.BucketsExact
+		// 冻结/企业/归属只有 v1 balance 才有。setting_info 回退快照没带这些字段时
+		// 保留上一次权威快照，不能拿空值把「充值冻结」清掉（否则冻结积分又变成可花）。
+		if b.ExtrasKnown {
+			e.topupFrozen, e.frozenTopup = b.TopupFrozen, b.FrozenTopup
+			e.enterpriseReserved, e.enterpriseTopup = b.EnterpriseReserved, b.EnterpriseTopup
+			e.ownerType, e.ownerID, e.ownerMismatch = b.OwnerType, b.OwnerID, b.OwnerMismatch
+			if b.OwnerMismatch && !wasMismatch {
+				// 只在「正常 → 串号」的跳变时记一条，避免每 5 分钟刷新刷屏。
+				log.Printf("[pool] uid=%s 余额归属校验失败：owner_id=%s（owner_type=%s）与账号不一致，疑似凭证串号",
+					uid, b.OwnerID, b.OwnerType)
+			}
+		}
 		e.usedUSD, e.limitUSD = 0, 0
 	}
 	e.expire = expire
@@ -963,7 +1105,7 @@ func (p *Pool) NoteDegrade(uid string) {
 
 // CooldownSoft 软限流冷却（429/404）：基数软冷却 × 2^(n-1)，封顶 soft_cooldown_max。
 // 连续被限流的号需要比单次更长的静默期，否则只是把 429 摊薄。
-func (p *Pool) CooldownSoft(uid, reason string) {
+func (p *Pool) CooldownSoft(uid, reason string, retryAfter time.Duration) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	e, ok := p.byUID[uid]
@@ -978,6 +1120,11 @@ func (p *Pool) CooldownSoft(uid, reason string) {
 	}
 	e.softStreak++
 	d := p.lim.SoftCooldown << (e.softStreak - 1)
+	if retryAfter > d {
+		// 上游明确给了 retryAfterSeconds 时以它为准：猜得比上游久会白白缩池，
+		// 猜得比它短只会再吃一次 429（并继续指数退避）。
+		d = retryAfter
+	}
 	if d <= 0 || d > p.lim.SoftCooldownMax {
 		d = p.lim.SoftCooldownMax
 	}
@@ -1057,32 +1204,43 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		invited = e.a.InvitedByValue()
 	}
 	return Status{
-		UID:           uid,
-		Nickname:      e.a.Nickname,
-		Realm:         e.a.Realm(),
-		Credits:       e.credits,
-		CreditsKnown:  e.creditsKnown,
-		Daily:         e.daily,
-		DailyToday:    e.dailyToday,
-		Monthly:       e.monthly,
-		Reward:        e.reward,
-		Topup:         e.topup,
-		Phone:         phone,
-		NationCode:    nation,
-		InvitedBy:     invited,
-		CreditsTotal:  e.creditsTotal,
-		Expire:        e.expire,
-		ExpireCredits: e.expireCredits,
-		CreditUnit:    e.unit,
-		UsedUSD:       e.usedUSD,
-		LimitUSD:      e.limitUSD,
-		Cooling:       !e.until.IsZero() && now.Before(e.until),
-		Until:         e.until,
-		Reason:        e.reason,
-		Disabled:      e.disabled,
-		ErrCount:      e.errCount,
-		Degraded:      e.degradeCount,
-		InFlight:      e.inFlight,
+		UID:                uid,
+		Nickname:           e.a.Nickname,
+		Realm:              e.a.Realm(),
+		Credits:            e.credits,
+		CreditsKnown:       e.creditsKnown,
+		Daily:              e.daily,
+		DailyToday:         e.dailyToday,
+		Monthly:            e.monthly,
+		Reward:             e.reward,
+		Topup:              e.topup,
+		Chargeable:         e.chargeable,
+		ChargeableKnown:    e.chargeableKnown,
+		BucketsExact:       e.bucketsExact,
+		DailyTodayKnown:    e.dailyTodayKnown,
+		TopupFrozen:        e.topupFrozen,
+		FrozenTopup:        e.frozenTopup,
+		EnterpriseReserved: e.enterpriseReserved,
+		EnterpriseTopup:    e.enterpriseTopup,
+		OwnerType:          e.ownerType,
+		OwnerID:            e.ownerID,
+		OwnerMismatch:      e.ownerMismatch,
+		Phone:              phone,
+		NationCode:         nation,
+		InvitedBy:          invited,
+		CreditsTotal:       e.creditsTotal,
+		Expire:             e.expire,
+		ExpireCredits:      e.expireCredits,
+		CreditUnit:         e.unit,
+		UsedUSD:            e.usedUSD,
+		LimitUSD:           e.limitUSD,
+		Cooling:            !e.until.IsZero() && now.Before(e.until),
+		Until:              e.until,
+		Reason:             e.reason,
+		Disabled:           e.disabled,
+		ErrCount:           e.errCount,
+		Degraded:           e.degradeCount,
+		InFlight:           e.inFlight,
 
 		CheckinCooling: !e.coolUntil.IsZero() && now.Before(e.coolUntil),
 		CheckinUntil:   e.coolUntil,
@@ -1117,29 +1275,41 @@ func (p *Pool) load() {
 			creditsKnown = *s.CreditsKnown
 		}
 		p.byUID[uid] = &entry{
-			a:                &auth.Auth{Data: auth.Data{UID: uid}}, // placeholder，Add 时会换成完整凭证
-			credits:          s.Credits,
-			creditsKnown:     creditsKnown,
-			creditsTotal:     s.CreditsTotal,
-			expire:           s.Expire,
-			expireCredits:    s.ExpireCredits,
-			disabled:         s.Disabled,
-			reason:           s.Reason,
-			until:            s.Until,
-			coolUntil:        s.CoolUntil,
-			coolReason:       s.CoolReason,
-			breakerStreak:    s.Breaker,
-			softStreak:       s.Soft,
-			degradeCount:     s.Degrade,
-			sessionDeadFails: s.SessDead,
-			unit:             s.Unit,
-			usedUSD:          s.UsedUSD,
-			limitUSD:         s.LimitUSD,
-			daily:            s.Daily,
-			dailyToday:       s.DailyToday,
-			monthly:          s.Monthly,
-			reward:           s.Reward,
-			topup:            s.Topup,
+			a:                  &auth.Auth{Data: auth.Data{UID: uid}}, // placeholder，Add 时会换成完整凭证
+			credits:            s.Credits,
+			creditsKnown:       creditsKnown,
+			creditsTotal:       s.CreditsTotal,
+			expire:             s.Expire,
+			expireCredits:      s.ExpireCredits,
+			disabled:           s.Disabled,
+			reason:             s.Reason,
+			until:              s.Until,
+			coolUntil:          s.CoolUntil,
+			coolReason:         s.CoolReason,
+			breakerStreak:      s.Breaker,
+			softStreak:         s.Soft,
+			degradeCount:       s.Degrade,
+			sessionDeadFails:   s.SessDead,
+			unit:               s.Unit,
+			usedUSD:            s.UsedUSD,
+			limitUSD:           s.LimitUSD,
+			daily:              s.Daily,
+			dailyToday:         s.DailyToday,
+			monthly:            s.Monthly,
+			reward:             s.Reward,
+			topup:              s.Topup,
+			chargeable:         s.Chargeable,
+			chargeableKnown:    s.ChargeableKnown,
+			bucketsExact:       s.BucketsExact,
+			dailyTodayKnown:    s.DailyTodayKnown,
+			dailyTodayDate:     s.DailyTodayDate,
+			topupFrozen:        s.TopupFrozen,
+			frozenTopup:        s.FrozenTopup,
+			enterpriseReserved: s.EnterpriseReserved,
+			enterpriseTopup:    s.EnterpriseTopup,
+			ownerType:          s.OwnerType,
+			ownerID:            s.OwnerID,
+			ownerMismatch:      s.OwnerMismatch,
 		}
 	}
 }
@@ -1152,28 +1322,40 @@ func (p *Pool) saveLocked() {
 	for uid, e := range p.byUID {
 		creditsKnown := e.creditsKnown
 		sf.Accounts[uid] = stateAccount{
-			Credits:       e.credits,
-			CreditsKnown:  &creditsKnown,
-			CreditsTotal:  e.creditsTotal,
-			Expire:        e.expire,
-			ExpireCredits: e.expireCredits,
-			Disabled:      e.disabled,
-			Reason:        e.reason,
-			Until:         e.until,
-			CoolUntil:     e.coolUntil,
-			CoolReason:    e.coolReason,
-			Breaker:       e.breakerStreak,
-			Soft:          e.softStreak,
-			Degrade:       e.degradeCount,
-			SessDead:      e.sessionDeadFails,
-			Unit:          e.unit,
-			UsedUSD:       e.usedUSD,
-			LimitUSD:      e.limitUSD,
-			Daily:         e.daily,
-			DailyToday:    e.dailyToday,
-			Monthly:       e.monthly,
-			Reward:        e.reward,
-			Topup:         e.topup,
+			Credits:            e.credits,
+			CreditsKnown:       &creditsKnown,
+			CreditsTotal:       e.creditsTotal,
+			Expire:             e.expire,
+			ExpireCredits:      e.expireCredits,
+			Disabled:           e.disabled,
+			Reason:             e.reason,
+			Until:              e.until,
+			CoolUntil:          e.coolUntil,
+			CoolReason:         e.coolReason,
+			Breaker:            e.breakerStreak,
+			Soft:               e.softStreak,
+			Degrade:            e.degradeCount,
+			SessDead:           e.sessionDeadFails,
+			Unit:               e.unit,
+			UsedUSD:            e.usedUSD,
+			LimitUSD:           e.limitUSD,
+			Daily:              e.daily,
+			DailyToday:         e.dailyToday,
+			Monthly:            e.monthly,
+			Reward:             e.reward,
+			Topup:              e.topup,
+			Chargeable:         e.chargeable,
+			ChargeableKnown:    e.chargeableKnown,
+			BucketsExact:       e.bucketsExact,
+			DailyTodayKnown:    e.dailyTodayKnown,
+			DailyTodayDate:     e.dailyTodayDate,
+			TopupFrozen:        e.topupFrozen,
+			FrozenTopup:        e.frozenTopup,
+			EnterpriseReserved: e.enterpriseReserved,
+			EnterpriseTopup:    e.enterpriseTopup,
+			OwnerType:          e.ownerType,
+			OwnerID:            e.ownerID,
+			OwnerMismatch:      e.ownerMismatch,
 		}
 	}
 	raw, err := json.MarshalIndent(sf, "", "  ")
