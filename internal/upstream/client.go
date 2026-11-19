@@ -484,8 +484,11 @@ func payloadOf(resp *apiResponse, action string) (map[string]any, error) {
 	if resp.Status < 200 || resp.Status >= 300 {
 		hint := ""
 		switch resp.Status {
-		case 401, 403:
+		case 401:
 			hint = "，登录态可能已失效"
+		case 403:
+			// 403 是权限/接口受限（v1 金额接口对 Bearer 收紧就是活例），不是登录态失效。
+			hint = "，接口权限受限（不是登录态失效）"
 		case 429:
 			hint = "，请稍后重试"
 		}

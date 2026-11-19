@@ -584,12 +584,14 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 		res.Status = "skipped"
 		log.Printf("checkin %s: upstream disabled (enable=false)", uid)
 	default:
-		// 上游已经不给这个号发每日积分：没有「签到」这回事。继续打 grant 端点只会
-		// 每轮白打一次 + 触发风控，复核照样 false。直接如实报 skipped，不记冷却。
-		//
-		// 从未发过还要再分两种：当天新注册的号是 pending（上游 00:00 的批次今天
-		// 还没轮到它），不是「未开通」。只在 ever=false 时查一次注册时间，老号
+		// 从未发过每日积分还要再分两种：当天新注册的号是 pending（上游 00:00 的批次
+		// 今天还没轮到它），不是「未开通」。只在 ever=false 时查一次注册时间，老号
 		// 不需要多打这一枪。
+		//
+		// 注意：**不要**因为「最近 N 天没发」就跳过领取。客户端的实证（2026-11-19）：
+		// 一个 11-13 起就没再收到 daily_grant 的号，用户在桌面客户端打开后当场补发了
+		// 11-13 到今天的一整串 300 分——领取动作就是下面这次 grant。判定「停发」只能
+		// 放在**领取之后**（拿到结果再说），提前跳过等于把本来能补发的号直接放弃。
 		if !cst.EverGranted {
 			if created, ok := s.cfg.Upstream.UserCreatedAt(a); ok && sameDayShanghai(created, time.Now()) {
 				res.Status = "pending"
@@ -604,19 +606,15 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 			}
 			break
 		}
-		if !cst.LastGrant.IsZero() && time.Since(cst.LastGrant) > dailyGrantStaleAfter {
-			res.Status = "skipped"
-			res.Reason = fmt.Sprintf("上游近期未再发放每日积分（最近一次 %s，已 %d 天）：无需签到",
-				cst.LastGrant.In(shanghaiTZ).Format("2006-01-02"), int(time.Since(cst.LastGrant).Hours()/24))
-			log.Printf("checkin %s: skipped（每日积分已停发，最近一次 %s）",
-				uid, cst.LastGrant.In(shanghaiTZ).Format("2006-01-02"))
-			break
-		}
 		var claimErr error
 		// 桌面端那笔礼包就是被这次"每日登录领取"顺带领掉的：把结果留好，
 		// 否则面板只会看到移动端那笔，看着像漏领。
+		// granted=true 且 popup.source=daily 时，上游就是把当天/欠发的每日积分补上了。
 		desktopGrant, claimErr = s.claimWithRetry(a)
 		desktopTried = true
+		if claimErr == nil && desktopGrant != nil {
+			log.Printf("checkin claim %s: granted=%v", uid, desktopGrant.Granted)
+		}
 		switch {
 		case claimErr == nil:
 			// 交给下面的复核判定
@@ -651,14 +649,20 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 				// 当天新注册的号：每日积分发放是上游 00:00 的定时任务，今天这批根本还没发，
 				// bills 里不会有 daily_grant。这不是签到失败（claim 该拿的登录奖励已拿到），
 				// 报 failed 还会给它记一次 5 分钟签到冷却、把面板刷成一脸错。
-				// 「从没发过 / 已经停发」在进 claim 之前就短路成 skipped 了，这里只剩
-				// 「最近还在发、今天暂时没到」的情况。
 				if created, ok := s.cfg.Upstream.UserCreatedAt(a); ok && sameDayShanghai(created, time.Now()) {
 					res.Status = "pending"
 					res.Reason = "上游今日尚未发放每日积分（" + created.In(shanghaiTZ).Format("2006-01-02 15:04") +
 						" 注册的新号，首批在次日 00:00 发放）"
 					log.Printf("checkin %s: pending（%s 注册的新号，等次日 00:00 首批每日积分）",
 						uid, created.In(shanghaiTZ).Format("2006-01-02 15:04"))
+				} else if !vst.LastGrant.IsZero() && time.Since(vst.LastGrant) > dailyGrantStaleAfter {
+					// 已经尝试过 grant（见上面的 default 分支），上游仍没补发：如实报
+					// 「近期未发放」，但不记失败/冷却——这已经不是客户端能改变的状态。
+					res.Status = "skipped"
+					res.Reason = fmt.Sprintf("已尝试领取，但上游近期未再发放每日积分（最近一次 %s，已 %d 天）",
+						vst.LastGrant.In(shanghaiTZ).Format("2006-01-02"), int(time.Since(vst.LastGrant).Hours()/24))
+					log.Printf("checkin verify %s: skipped（已尝试领取，上游仍未发放；最近一次 %s）",
+						uid, vst.LastGrant.In(shanghaiTZ).Format("2006-01-02"))
 				} else {
 					checkinErr = &upstream.BusinessError{Message: "签到复核未通过：上游仍报未签到"}
 					log.Printf("checkin verify %s: status still checked_in=false", uid)
@@ -687,8 +691,14 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 	}
 	u, err := s.entUsageOf(uid, a)
 	if err != nil {
-		log.Printf("ent-usage %s: %v", uid, err)
-		return res, err
+		// 余额接口失败（v1 /points/v1/balance 已对 Bearer 收紧）不该推翻本轮签到结果：
+		// grant 与流水判定都已经完成，余额只是附加快照，下一轮刷新再补。
+		// 否则余额一 403，整池签到就全部报失败——2026-11-19 实测 32/32 个账号「失败」。
+		log.Printf("ent-usage %s: %v（余额快照跳过，不影响签到结果）", uid, err)
+		if checkinErr == nil {
+			s.cfg.Pool.ClearCheckinCooldown(uid)
+		}
+		return res, nil
 	}
 	// 先落余额与到期时间（签到后的新值），再谈解冻/冷却。
 	// 「签到解冻」（ReenableIfCredits 在 remain>0 时清网关冷却）**只在成功路径上做**：

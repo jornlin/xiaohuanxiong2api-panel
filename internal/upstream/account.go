@@ -349,11 +349,12 @@ type BillRow struct {
 
 // CheckinState 是一次签到状态查询的结果。
 type CheckinState struct {
-	CheckedIn   bool      // 今天（东八区）是否已有 daily_grant 入账
-	Credits     int64     // 可用积分
-	Enable      bool      // 上游是否允许该账号使用积分
-	EverGranted bool      // 历史上有没有过 daily_grant
-	LastGrant   time.Time // 最近一次 daily_grant 的时间（零值 = 没有）
+	CheckedIn    bool      // 今天（东八区）是否已有 daily_grant 入账
+	Credits      int64     // 可用积分（CreditsKnown=false 时无意义）
+	CreditsKnown bool      // 余额快照是否拿到了
+	Enable       bool      // 上游是否允许该账号使用积分
+	EverGranted  bool      // 历史上有没有过 daily_grant
+	LastGrant    time.Time // 最近一次 daily_grant 的时间（零值 = 没有）
 	// GrantErr 非 nil 表示流水查询失败（接口/权限问题）：此时 CheckedIn 不可信，
 	// 调用方不能据此判「签到失败」，更不能记签到冷却。
 	GrantErr error
@@ -364,12 +365,15 @@ type CheckinState struct {
 // 流水查不到时**不再**退回 `usage.Daily > 0`：daily 是「今日剩余额度」，花完就是 0，
 // 拿它当「今天已发放」会把正常号误判成未签到。2026-11-19 实测 v1 bills 全线 403，
 // 回退逻辑导致 13/15 个号每轮签到失败并反复记冷却——那是「动不动冷却」的主要来源。
+//
+// 余额查询失败**不阻断签到**：v1 /points/v1/balance 从 2026-11-19 下午起对 Bearer
+// 令牌返回 403（与 v1 bills 同一批次收紧），而余额只是展示字段。签到判定只看 v2 流水，
+// 余额拿不到就标记 CreditsKnown=false，交给调用方沿用池里的旧快照。
 func (c *Client) CheckinStatus(a *auth.Auth) (CheckinState, error) {
-	usage, err := c.UserEntUsageDetail(a)
-	if err != nil {
-		return CheckinState{}, err
+	st := CheckinState{Enable: true}
+	if usage, uerr := c.UserEntUsageDetail(a); uerr == nil {
+		st.Credits, st.CreditsKnown = usage.Remain, true
 	}
-	st := CheckinState{Credits: usage.Remain, Enable: true}
 	today, ever, last, berr := c.DailyGrant(a)
 	if berr != nil {
 		st.GrantErr = berr
