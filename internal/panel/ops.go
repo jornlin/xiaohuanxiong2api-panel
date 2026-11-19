@@ -378,3 +378,51 @@ func (p *Panel) checkinStatus(w http.ResponseWriter, r *http.Request) {
 		"ok": true, "checked": checked, "unchecked": unchecked, "failed": failed, "accounts": out,
 	})
 }
+
+// profilesSync 批量补全手机号：对缺少 phone 的账号逐个查一次 user_info
+// （只读、一次请求、号与号之间 1.5s），补到账号文件并落盘。
+//
+// 授权码/浏览器授权入池的号没有 loginid，面板里只剩「随机昵称 + 7 位 uid」；
+// 手机号是唯一能让人认出是哪个号的信息。已有 phone 的号跳过，重复点击不重复打。
+func (p *Panel) profilesSync(w http.ResponseWriter, r *http.Request) {
+	type row struct {
+		UID        string `json:"uid"`
+		Phone      string `json:"phone,omitempty"`
+		NationCode string `json:"nation_code,omitempty"`
+		Error      string `json:"error,omitempty"`
+	}
+	out := []row{}
+	updated := 0
+	first := true
+	for _, st := range p.cfg.Pool.List() {
+		a := p.cfg.Pool.AuthByUID(st.UID)
+		if a == nil {
+			continue
+		}
+		if phone, _ := a.PhoneValue(); phone != "" {
+			continue
+		}
+		if !first {
+			time.Sleep(1500 * time.Millisecond) // 与余额刷新同节奏，避免网关频率风控
+		}
+		first = false
+		pr, err := p.cfg.Upstream.FetchProfile(a)
+		if err != nil {
+			out = append(out, row{UID: st.UID, Error: publicErr(err)})
+			continue
+		}
+		if pr.Phone == "" {
+			out = append(out, row{UID: st.UID, Error: "上游未返回手机号"})
+			continue
+		}
+		a.SetPhone(pr.Phone, pr.NationCode)
+		if serr := a.SaveAtomic(); serr != nil {
+			out = append(out, row{UID: st.UID, Phone: pr.Phone, Error: "落盘失败：" + serr.Error()})
+			continue
+		}
+		updated++
+		out = append(out, row{UID: st.UID, Phone: pr.Phone, NationCode: pr.NationCode})
+	}
+	log.Printf("panel: profiles sync 补全 %d 个账号手机号（失败 %d）", updated, len(out)-updated)
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "updated": updated, "results": out})
+}

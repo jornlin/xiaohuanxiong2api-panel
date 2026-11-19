@@ -138,6 +138,8 @@ func New(cfg Config) *Panel {
 	p.mux.HandleFunc("POST /panel/api/grants", p.withAuth(p.grantsAll))
 	p.mux.HandleFunc("POST /panel/api/accounts/{uid}/grants", p.withAuth(p.accountGrants))
 	p.mux.HandleFunc("GET /panel/api/tasks", p.withAuth(p.tasksStatus))
+	// 批量补全手机号（授权码入池的号没有 loginid，只能从 user_info 补）
+	p.mux.HandleFunc("POST /panel/api/profiles/sync", p.withAuth(p.profilesSync))
 	// 池里各账号的邀请码：面板用它拼「带邀请码的注册链接」
 	p.mux.HandleFunc("GET /panel/api/invites", p.withAuth(p.invites))
 	// 邀请记录明细（只读，20 条/页）：官网「赚取积分」邀请列表同款端点

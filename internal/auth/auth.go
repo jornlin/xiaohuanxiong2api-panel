@@ -59,6 +59,11 @@ type Data struct {
 	UID          string `json:"uid"`
 	Nickname     string `json:"nickname,omitempty"`
 	Email        string `json:"email,omitempty"`
+	// Phone / NationCode 来自 /auth/v1/user_info（authorization 用 access_token 即可）。
+	// 授权码/浏览器授权入池的号没有 loginid，只有 7 位 uid 和上游随机昵称，靠手机号
+	// 才能在面板里认出是哪个号；补全后随账号文件一起落盘。
+	Phone      string `json:"phone,omitempty"`
+	NationCode string `json:"nation_code,omitempty"`
 	// MachineID 是小浣熊没有的东西（设备指纹是 Qoder 的），保留字段只为让基线池代码
 	// 的「换指纹」路径有个稳定落点，恒空。
 	MachineID string `json:"machine_id,omitempty"`
@@ -177,6 +182,20 @@ func (a *Auth) CheckedInToday() bool {
 // grantToday 返回东八区今天的日期串（与 CheckedIn 同口径）。
 func grantToday() string {
 	return time.Now().Format("2006-01-02")
+}
+
+// PhoneValue 返回绑定手机号与区号（读锁快照）。
+func (a *Auth) PhoneValue() (phone, nation string) {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.Phone, a.NationCode
+}
+
+// SetPhone 写入手机号与区号（调用方负责 SaveAtomic 落盘）。
+func (a *Auth) SetPhone(phone, nation string) {
+	a.mu.Lock()
+	a.Phone, a.NationCode = phone, nation
+	a.mu.Unlock()
 }
 
 // DesktopGrantDone 今天是否已经问过桌面端礼包。

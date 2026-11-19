@@ -349,7 +349,7 @@ function renderAccounts(list) {
     if (!a.disabled) acts.push('<button class="xs danger" data-a="disable" data-u="' + esc(a.uid) + '">禁用</button>');
     acts.push('<button class="xs danger" data-a="remove" data-u="' + esc(a.uid) + '">移除</button>');
     return '<tr class="' + cls + '"><td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + (a.realm !== 'cn' ? '<span class="tag mute">国际</span> ' : '') + esc(a.nickname || a.uid) + '</div><div class="id">' + esc(a.uid) + '</div></td>' +
+      '<td class="who"><div class="nm">' + (a.realm !== 'cn' ? '<span class="tag mute">国际</span> ' : '') + esc(a.nickname || a.uid) + '</div><div class="id">' + (a.phone ? esc(a.phone) + ' · ' : '') + esc(a.uid) + '</div></td>' +
       '<td>' + st.join(' ') + '</td>' +
       '<td class="cred" title="' + esc(credTitle(a)) + '">' + credCell(a) + '</td>' +
       '<td>' + expCell(a.expire) + '</td>' +
@@ -2446,6 +2446,20 @@ function grantsMsg(gs) {
   };
   // 邀请记录（只读）：选邀请人账号 → 按 20 条/页翻页。
   $('btnInviteRecords').onclick = openInviteRecords;
+  // 批量补全手机号（授权码入池的号没有 loginid）。
+  $('btnProfiles').onclick = async () => {
+    const b = $('btnProfiles');
+    b.disabled = true;
+    try {
+      const d = await api('profiles/sync', { method: 'POST' });
+      const rs = d.results || [];
+      const bad = rs.filter(x => x.error);
+      toast('手机号补全：成功 ' + (d.updated || 0) + ' 个' +
+        (bad.length ? '，失败 ' + bad.length + ' 个：' + bad.slice(0, 3).map(x => x.uid + ' ' + x.error).join('；') : ''),
+        bad.length ? 'err' : 'ok');
+    } catch (e) { toast(e.message, 'err'); }
+    finally { b.disabled = false; loadOverview(true); }
+  };
   $('btnInviteClose').onclick = () => $('inviteVeil').classList.remove('on');
   $('inviteWho').onchange = () => {
     inviteUID = $('inviteWho').value;

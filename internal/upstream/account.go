@@ -564,6 +564,35 @@ func parseBillTime(s string) (time.Time, bool) {
 	return t, true
 }
 
+// Profile 是 /auth/v1/user_info 里面板要用的身份字段。
+type Profile struct {
+	UID        string
+	Nickname   string
+	Phone      string
+	NationCode string
+}
+
+// FetchProfile 拉一次用户资料（只读、一次请求）。
+//
+// 授权码 / 浏览器授权入池的号没有 loginid，只有 7 位 uid 和上游随机昵称，
+// 面板里认不出是哪个号；手机号只能从这条接口补。
+func (c *Client) FetchProfile(a *auth.Auth) (Profile, error) {
+	resp, err := c.doJSON(http.MethodGet, c.authBase()+UserInfoPath, nil, c.authHeader(a))
+	if err != nil {
+		return Profile{}, err
+	}
+	data, err := payloadOf(resp, "用户资料")
+	if err != nil {
+		return Profile{}, err
+	}
+	return Profile{
+		UID:        text(data, "id", "user_id", "uid"),
+		Nickname:   text(data, "name", "nickname"),
+		Phone:      text(data, "phone"),
+		NationCode: text(data, "nation_code"),
+	}, nil
+}
+
 // ClaimDesktopGrant 领桌面端礼包（一次性新手福利之一，与每日 300 分无关）。
 //
 // 与 CheckinClaim 是同一条端点：上游对「还没领的桌面端礼包」和「手动登录领取」

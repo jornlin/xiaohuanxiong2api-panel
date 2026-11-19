@@ -61,6 +61,10 @@ type Status struct {
 	// CreditsKnown 是否真的拿到过余额快照。上游余额接口 403 期间新号的 credits
 	// 会一直是 0——不区分「未知」与「真的是 0」，界面就会把 9000 分显示成 0。
 	CreditsKnown bool `json:"credits_known"`
+	// Phone / NationCode 账号绑定手机号（授权码入池的号没有 loginid，只能从
+	// /auth/v1/user_info 补全；面板靠它认出「随机昵称 + 7 位 uid」是谁）。
+	Phone      string `json:"phone,omitempty"`
+	NationCode string `json:"nation_code,omitempty"`
 	// CreditsTotal 上游给的积分总额（各包 credits_limit 之和），只作分母：
 	// 「积分」列显示 剩余/总额。0 表示还没查到过，界面只显示剩余。
 	CreditsTotal int64 `json:"credits_total,omitempty"`
@@ -1012,12 +1016,18 @@ func (p *Pool) List() []Status {
 
 func (p *Pool) statusOf(uid string, e *entry) Status {
 	now := time.Now()
+	phone, nation := "", ""
+	if e.a != nil {
+		phone, nation = e.a.PhoneValue()
+	}
 	return Status{
 		UID:           uid,
 		Nickname:      e.a.Nickname,
 		Realm:         e.a.Realm(),
 		Credits:       e.credits,
 		CreditsKnown:  e.creditsKnown,
+		Phone:         phone,
+		NationCode:    nation,
 		CreditsTotal:  e.creditsTotal,
 		Expire:        e.expire,
 		ExpireCredits: e.expireCredits,
