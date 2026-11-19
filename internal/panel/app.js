@@ -413,7 +413,10 @@ function expCellRich(a) {
   const days = Math.round((unix * 1000 - Date.now()) / 86400000);
   const md = (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0');
   const remain = Number(a.credits || 0);
-  const expiring = Math.min(Number(a.expire_credits || 0) || remain, remain);
+  // 只有确实拿到「该日会作废的每日批次额」才显示金额。v1 流水 403 时 expire_credits
+  // 恒 0，用总余额兜底会把「全部积分都那天到期」这个假数写到每一行上。
+  const ec = Number(a.expire_credits || 0);
+  const expiring = ec > 0 ? Math.min(ec, remain) : 0;
   let s = '<div class="num">' + md;
   if (days < 0) s += ' ' + tag('bad', '已过期');
   else if (days <= 3) s += ' ' + tag('warn', days === 0 ? '今天' : '剩 ' + days + ' 天');
@@ -598,8 +601,10 @@ function renderExpiry(list) {
     if (isUSD(a)) continue;
     const remain = Number(a.credits || 0);
     const exp = Number(a.expire || 0);
-    const expiring = Number(a.expire_credits || 0) || remain;
+    const ec = Number(a.expire_credits || 0);
     if (!exp || remain <= 0) continue;
+    // 没有 expire_credits 时不拿 total 冒充「该日到期额」（见 expCellRich 的说明）。
+    const expiring = ec > 0 ? Math.min(ec, remain) : 0;
     const days = Math.max(0, Math.round((exp * 1000 - Date.now()) / 86400000));
     rows.push({ exp, days, expiring: Math.min(expiring, remain) });
   }
@@ -610,7 +615,8 @@ function renderExpiry(list) {
   if (!el) return;
   el.textContent = rows.length
     ? (within7.length
-      ? within7.length + ' 个号 7 天内到期 ' + fmtNum(total7) + ' 分'
+      ? within7.length + ' 个号 7 天内到期' +
+        (total7 > 0 ? ' ' + fmtNum(total7) + ' 分' : '（到期金额明细暂不可用）')
       : '暂无 7 天内到期')
     : '暂无到期信息';
   el.title = rows.length
