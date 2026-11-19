@@ -428,6 +428,8 @@ type BillRow struct {
 	EventName string `json:"event_name"`
 	Points    int64  `json:"points"` // 消费为负，发放为正
 	CreatedAt string `json:"created_at"`
+	// ExpireAt 每日批次自带的到期时刻（RFC3339，v2 income 实锤）；永久积分没有。
+	ExpireAt string `json:"expire_at,omitempty"`
 }
 
 // CheckinState 是一次签到状态查询的结果。
@@ -504,6 +506,32 @@ func (c *Client) DailyGrant(a *auth.Auth) (today, ever bool, last time.Time, err
 	return today, ever, last, nil
 }
 
+// EarliestDailyExpiry 从 v2 发放流水里找**未过期的每日批次**最早到期时刻（Unix 秒）。
+//
+// v1 balance/bills 403 时，「到期」列仍要有数：每日批次在 v2 income 里自带 expire_at
+// （2026-11-19 实测），永久积分没有。返回 0 = 没有未过期的每日批次。
+func (c *Client) EarliestDailyExpiry(a *auth.Auth) (int64, error) {
+	items, err := c.IncomeBills(a, 2)
+	if err != nil {
+		return 0, err
+	}
+	now := time.Now()
+	var earliest int64
+	for _, it := range items {
+		if it.BizType != "daily_grant" || it.ExpireAt == "" {
+			continue
+		}
+		t, ok := parseBillTime(it.ExpireAt)
+		if !ok || !t.After(now) {
+			continue
+		}
+		if earliest == 0 || t.Unix() < earliest {
+			earliest = t.Unix()
+		}
+	}
+	return earliest, nil
+}
+
 // IncomeBills 拉 v2 发放流水（type=income，cursor 分页），最多 pages 页。
 //
 // 只取 income 而不是 all：重度使用一天几十条消耗记录，all 要翻很多页才能碰到一条发放；
@@ -541,6 +569,7 @@ func (c *Client) IncomeBills(a *auth.Auth, pages int) ([]BillRow, error) {
 				Points:    mustInt(item["points"]),
 				// v2 用 created_at；v1（以及部分镜像）用 grant_at，两处都认。
 				CreatedAt: text(item, "created_at", "grant_at"),
+				ExpireAt:  text(item, "expire_at"),
 			})
 		}
 		more, _ := data["has_more"].(bool)
