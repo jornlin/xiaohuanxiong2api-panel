@@ -1421,6 +1421,17 @@ function usagePointTime(t) {
   };
 }
 
+/* token 数的紧凑格式：1234 → 1.2k、1200000 → 1.20M（两位小数保留精度）。
+   请求记录 / 用量页仍在用；0403462 清理积分页时把它当死代码误删，导致
+   renderRequestMetrics 抛 ReferenceError、请求记录页永远空白。 */
+function fmtTok(n) {
+  n = Number(n || 0);
+  if (n >= 1e9) return (n / 1e9).toFixed(2) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(2) + 'M';
+  if (n >= 1e3) return (n / 1e3).toFixed(1) + 'k';
+  return String(n);
+}
+
 /* 坐标轴刻度用的紧凑数字：1234 → 1.2k、1200000 → 1.2M。 */
 function fmtShortTok(v) {
   if (v >= 1e6) return (v / 1e6).toFixed(1) + 'M';
