@@ -272,7 +272,10 @@ type Client struct {
 	// 期间用最后一次成功快照（没有快照就如实报错）。
 	quotaMu           sync.Mutex
 	quotaBlockedUntil time.Time
-	quotaCache        map[string]EntUsage
+	// settingBlockedUntil setting_info 也 403 后的短熔断（10 分钟）：两个余额接口
+	// 同时被网关拦时，全池逐号重打只是继续喂风控。
+	settingBlockedUntil time.Time
+	quotaCache          map[string]EntUsage
 }
 
 // New 生产默认值：连接池共享，短请求 120s 兜底、长流只看首字节超时。

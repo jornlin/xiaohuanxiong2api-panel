@@ -125,6 +125,7 @@ func (c *Client) UserEntUsageDetail(a *auth.Auth) (EntUsage, error) {
 	}
 	c.quotaMu.Lock()
 	blocked := time.Now().Before(c.quotaBlockedUntil)
+	settingBlocked := time.Now().Before(c.settingBlockedUntil)
 	cached, hasCache := c.quotaCache[uid]
 	c.quotaMu.Unlock()
 
@@ -161,11 +162,22 @@ func (c *Client) UserEntUsageDetail(a *auth.Auth) (EntUsage, error) {
 	}
 
 	// 工作台 setting_info：官方网页同款余额口径（只有可用总额）。
-	if data, serr := c.OfficeSettingInfo(a); serr == nil {
-		if v := mustInt(data["available_points"]); v >= 0 {
-			usage := EntUsage{Unit: UnitCredit, Remain: v, Total: v}
-			cache(usage)
-			return usage, nil
+	// 它同样会被网关频率风控（X-TT-System-Error:3）——403 后短期熔断 10 分钟，
+	// 避免全池逐号重打把风控窗口越撑越长。
+	if !settingBlocked {
+		if data, serr := c.OfficeSettingInfo(a); serr == nil {
+			if v := mustInt(data["available_points"]); v >= 0 {
+				usage := EntUsage{Unit: UnitCredit, Remain: v, Total: v}
+				cache(usage)
+				return usage, nil
+			}
+		} else {
+			var ue *Error
+			if errors.As(serr, &ue) && ue.Status == http.StatusForbidden {
+				c.quotaMu.Lock()
+				c.settingBlockedUntil = time.Now().Add(10 * time.Minute)
+				c.quotaMu.Unlock()
+			}
 		}
 	}
 	if hasCache {

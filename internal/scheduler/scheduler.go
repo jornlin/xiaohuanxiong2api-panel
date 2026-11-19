@@ -393,6 +393,7 @@ func (s *Scheduler) entUsageOf(uid string, a *auth.Auth) (upstream.EntUsage, err
 // 等于这些机制不存在。
 func (s *Scheduler) RunBalanceRefresh() int {
 	failed := 0
+	first := true
 	for _, st := range s.cfg.Pool.List() {
 		if st.Disabled {
 			continue
@@ -401,6 +402,12 @@ func (s *Scheduler) RunBalanceRefresh() int {
 		if a == nil {
 			continue
 		}
+		// 号与号之间留节奏：全池瞬间连发几十个余额请求会被网关按频率拦成 403
+		// （实测 52 个号连查后，balance/setting_info 同时 403 一段时间）。
+		if !first {
+			time.Sleep(1500 * time.Millisecond)
+		}
+		first = false
 		if _, err := s.entUsageOf(st.UID, a); err != nil {
 			failed++
 			continue
@@ -472,11 +479,11 @@ func (s *Scheduler) byUrgency() []string {
 		// 已放开前置否决，这里同步别再按票筛掉，否则自动签到永远排不进该号）。
 		// 所有号都要进签到队列：小浣熊的每日积分发放对所有账号一致（
 		// CheckinUID 会按「上游未开」如实跳过，而不是这里直接不排队）。
-		expire := int64(0)
-		if u, err := s.entUsageOf(st.UID, a); err == nil {
-			expire = u.Expire
-		}
-		rows = append(rows, row{uid: st.UID, expire: expire})
+		//
+		// 到期时间直接用池里的持久化快照（st.Expire），**不再逐号探一次余额**：
+		// 原来这轮探询 + CheckinStatus + 收尾刷新 = 每号 3 次余额请求，37 个号
+		// 一轮就是上百次，正是上游网关对 balance/setting_info 返回 403 的原因。
+		rows = append(rows, row{uid: st.UID, expire: st.Expire})
 	}
 	sort.SliceStable(rows, func(i, j int) bool {
 		a, b := rows[i].expire, rows[j].expire
@@ -544,6 +551,8 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 	}
 	cst, serr := s.cfg.Upstream.CheckinStatus(a)
 	checkedIn, reward, enable := cst.CheckedIn, cst.Credits, cst.Enable
+	// 收尾落池用的余额：默认复用签到前的状态查询，复核拿到更新的快照时覆盖。
+	finalCredits, finalKnown := cst.Credits, cst.CreditsKnown
 	// token 被别处轮换/提前吊销 → status 报 session 失效：换一张新票再查一次，别把
 	// 「票过期」记成签到失败（这条只重试一次，重试前必须真的换到了新票）。
 	if isSessionDead(serr) {
@@ -648,7 +657,8 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 		// 复核（claim 成功与 9095 两条路径都要走）：只有 status 说 checked_in 才算签上。
 		// claim 回 code 0 不等于真签上（上游偶发只回执不落账）；9095 更是设备维度信息。
 		if checkinErr == nil {
-			if vst, verr := s.cfg.Upstream.CheckinStatus(a); verr != nil {
+			vst, verr := s.cfg.Upstream.CheckinStatus(a)
+			if verr != nil {
 				checkinErr = fmt.Errorf("签到复核失败：%w", verr)
 				log.Printf("checkin verify %s: %v", uid, verr)
 			} else if vst.GrantErr != nil {
@@ -682,6 +692,10 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 				res.Status, res.Credits = "ok", reward
 				log.Printf("checkin %s: ok +%d", uid, reward)
 			}
+			// 复核拿到的最新余额覆盖签到前的快照（免掉收尾那次额外余额请求）。
+			if verr == nil && vst.CreditsKnown {
+				finalCredits, finalKnown = vst.Credits, true
+			}
 		}
 	}
 	// 一次性新手礼包（桌面端/移动端各 3000 分）在这里无条件补一次：
@@ -700,29 +714,26 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 	if checkinErr != nil {
 		res.Reason = checkinErr.Error()
 	}
-	u, err := s.entUsageOf(uid, a)
-	if err != nil {
-		// 余额接口失败（v1 /points/v1/balance 已对 Bearer 收紧）不该推翻本轮签到结果：
-		// grant 与流水判定都已经完成，余额只是附加快照，下一轮刷新再补。
-		// 否则余额一 403，整池签到就全部报失败——2026-11-19 实测 32/32 个账号「失败」。
-		// 熔断窗口内不再逐号刷同一条 403 噪音（上游恢复后会自动再试）。
-		if !s.cfg.Upstream.QuotaBlocked() {
-			log.Printf("ent-usage %s: %v（余额快照跳过，不影响签到结果）", uid, err)
+	// 余额快照优先复用本次 CheckinStatus 的结果，**不再额外打一次余额接口**：
+	// 签到轮次原来每号要查三次余额（排序探询、状态查询、收尾刷新），37 个号一轮
+	// 上百次——正是上游网关对 balance/setting_info 返回 X-TT-System-Error:3 的原因。
+	if finalKnown {
+		expire := int64(0)
+		if st, ok := s.cfg.Pool.Status(uid); ok {
+			expire = st.Expire
 		}
+		s.cfg.Pool.SetBalance(uid, pool.Balance{
+			Unit: "credit", Remain: finalCredits, Total: finalCredits,
+		}, expire)
 		if checkinErr == nil {
+			// 「签到解冻」只在成功路径上做：失败路径也调它，等于一次失败签到
+			// 顺手把 12h 计划冷却冲掉。
+			s.cfg.Pool.ReenableIfCredits(uid, finalCredits)
 			s.cfg.Pool.ClearCheckinCooldown(uid)
+			return res, nil
 		}
-		return res, nil
-	}
-	// 先落余额与到期时间（签到后的新值），再谈解冻/冷却。
-	// 「签到解冻」（ReenableIfCredits 在 remain>0 时清网关冷却）**只在成功路径上做**：
-	// 失败路径也调它，等于一次失败签到顺手把 12h 计划冷却冲掉。它不碰签到域冷却，
-	// 所以下面那条路径不会把签到冷却冲掉。
-	//
-	// 这里传积分口径的 u.Remain：签到只存在于国内路径（国际版在本函数开头就 return 了），
-	// 所以拿到的必然是积分口径，美元号的 0 不会走进来。
-	if checkinErr == nil {
-		s.cfg.Pool.ReenableIfCredits(uid, u.Remain)
+	} else if checkinErr == nil {
+		// 两个余额接口都受限：跳过快照，签到结果照常返回，不刷 403 噪音。
 		s.cfg.Pool.ClearCheckinCooldown(uid)
 		return res, nil
 	}
