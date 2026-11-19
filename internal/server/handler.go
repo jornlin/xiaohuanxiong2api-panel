@@ -467,6 +467,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				release() // 名额已占，客户端已断开：必须还回去
 				return
 			}
+			// 全局最小出站间隔：把重启/重连时的并发尖峰摊平，避免上游成批 429。
+			h.cfg.Upstream.WaitSendSlot(r.Context())
+			if r.Context().Err() != nil {
+				release()
+				return
+			}
 			func() {
 				defer release()
 				done, err = h.attempt(r.Context(), w, acct, body, peek, sessKey, traceFrom(r))

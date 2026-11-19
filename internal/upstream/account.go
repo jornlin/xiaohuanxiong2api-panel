@@ -145,11 +145,54 @@ func (c *Client) noteBillsError(err error) {
 // available_points；point_grant_popups 是最近到账的通知列表（不是未入账）。
 func (c *Client) OfficeSettingInfo(a *auth.Auth) (map[string]any, error) {
 	resp, err := c.doJSON(http.MethodGet,
-		c.originBase()+"/api/web/office/v3/setting_info", nil, c.authHeader(a))
+		c.originBase()+"/api/web/office/v3/setting_info", nil, c.webAuthHeader(a))
 	if err != nil {
 		return nil, err
 	}
 	return payloadOf(resp, "工作台设置信息")
+}
+
+// EnsureWebSession 保证账号以 **web 会话** 调一次 setting_info。
+//
+// 2026-11-20 实测：每日 300 积分在第一次 web 会话 setting_info 时惰性入账
+// （v2 流水 client_type=web、created_at=调用时刻、grant_at=当天 00:00）。
+// 桌面会话调 setting_info 会被网关 403（X-TT-System-Error:3）。所以流程是：
+//  1. 先用现有票试一次（已经是 web 会话就直接触发）；
+//  2. 403 时用 web 头续期换一张 web 会话票，再试一次。
+//
+// 返回 refreshed=true 时调用方必须 a.SaveAtomic()（refresh_token 已轮换）。
+func (c *Client) EnsureWebSession(a *auth.Auth) (refreshed bool, popupPoints int64, err error) {
+	data, err := c.OfficeSettingInfo(a)
+	if err == nil {
+		return false, popupPointsOf(data), nil
+	}
+	var ue *Error
+	if !errors.As(err, &ue) || ue.Status != http.StatusForbidden {
+		return false, 0, err
+	}
+	if _, rerr := c.refreshWeb(a); rerr != nil {
+		return false, 0, rerr
+	}
+	data, err = c.OfficeSettingInfo(a)
+	if err != nil {
+		return true, 0, err
+	}
+	return true, popupPointsOf(data), nil
+}
+
+// popupPointsOf 汇总 setting_info.point_grant_popups 里的到账积分。
+// 注意：通知列表可能已被网页/客户端消费为空，0 不代表没到账——最终以流水复核为准。
+func popupPointsOf(data map[string]any) int64 {
+	items, _ := data["point_grant_popups"].([]any)
+	var sum int64
+	for _, raw := range items {
+		item, _ := raw.(map[string]any)
+		if item == nil {
+			continue
+		}
+		sum += nonNeg(mustInt(item["points"]))
+	}
+	return sum
 }
 
 // UserEntUsageDetail 查一次积分余额并归一成 EntUsage。
@@ -558,6 +601,11 @@ type CheckinState struct {
 	Enable       bool      // 上游是否允许该账号使用积分
 	EverGranted  bool      // 历史上有没有过 daily_grant
 	LastGrant    time.Time // 最近一次 daily_grant 的时间（零值 = 没有）
+	// TodayPoints 今天已入账的每日积分合计（0 = 今天没有 daily_grant）。
+	TodayPoints int64
+	// TodayGrantAt 今天这笔每日积分在上游的入账时刻（created_at，零值 = 未知）。
+	// 用来判断「是不是本次调用刚触发的」：签到面板据此回报 +300 而不是「已签」。
+	TodayGrantAt time.Time
 	// GrantErr 非 nil 表示流水查询失败（接口/权限问题）：此时 CheckedIn 不可信，
 	// 调用方不能据此判「签到失败」，更不能记签到冷却。
 	GrantErr error
@@ -577,12 +625,13 @@ func (c *Client) CheckinStatus(a *auth.Auth) (CheckinState, error) {
 	if usage, uerr := c.UserEntUsageDetail(a); uerr == nil {
 		st.Credits, st.CreditsKnown = usage.Remain, true
 	}
-	today, ever, last, berr := c.DailyGrant(a)
+	today, ever, last, todayPoints, todayAt, berr := c.DailyGrant(a)
 	if berr != nil {
 		st.GrantErr = berr
 		return st, nil
 	}
 	st.EverGranted, st.LastGrant, st.CheckedIn = ever, last, today
+	st.TodayPoints, st.TodayGrantAt = todayPoints, todayAt
 	if today {
 		a.MarkCheckedIn()
 	}
@@ -596,10 +645,10 @@ func (c *Client) CheckinStatus(a *auth.Auth) (CheckinState, error) {
 // 实测 2026-11-19，多个号最后一次 daily_grant 停在 11-12，之后每天都是 0；老逻辑
 // 只要有历史就判「签到复核未通过」，于是每轮都失败 + 冷却。看到最近发放时间，
 // 调度器就能把「停发」如实报成 skipped，而不是谎报失败。
-func (c *Client) DailyGrant(a *auth.Auth) (today, ever bool, last time.Time, err error) {
+func (c *Client) DailyGrant(a *auth.Auth) (today, ever bool, last time.Time, points int64, todayAt time.Time, err error) {
 	items, err := c.IncomeBills(a, 2)
 	if err != nil {
-		return false, false, time.Time{}, err
+		return false, false, time.Time{}, 0, time.Time{}, err
 	}
 	day := time.Now().In(shanghaiTZ).Format("2006-01-02")
 	for _, item := range items {
@@ -616,12 +665,16 @@ func (c *Client) DailyGrant(a *auth.Auth) (today, ever bool, last time.Time, err
 		}
 		if at.In(shanghaiTZ).Format("2006-01-02") == day {
 			today = true
+			points += item.Points
+			if created, ok := parseBillTime(item.CreatedAt); ok && created.After(todayAt) {
+				todayAt = created
+			}
 		}
 		if at.After(last) {
 			last = at
 		}
 	}
-	return today, ever, last, nil
+	return today, ever, last, points, todayAt, nil
 }
 
 // EarliestDailyExpiry 从 v2 发放流水里找**未过期的每日批次**最早到期时刻（Unix 秒）。
@@ -1212,6 +1265,32 @@ func (c *Client) authHeader(a *auth.Auth) map[string]string {
 	}
 	h["Accept"] = "application/json"
 	h["Authorization"] = "Bearer " + a.JWT()
+	return h
+}
+
+// DefaultWebUserAgent 是 web 会话请求使用的浏览器 UA。web 网关对 UA/平台头敏感：
+// 桌面客户端 UA 打 setting_info 会被 X-TT-System-Error:3 拒掉。
+const DefaultWebUserAgent = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
+	"AppleWebKit/537.36 (KHTML, like Gecko) Chrome/157.0.0.0 Safari/537.36"
+
+// webHeaders 复刻官方网页的请求头（不含 Authorization）。
+func (c *Client) webHeaders() map[string]string {
+	return map[string]string{
+		"Accept":             "application/json",
+		"Content-Type":       "application/json",
+		"User-Agent":         DefaultWebUserAgent,
+		"Origin":             c.originBase(),
+		"Referer":            c.originBase() + "/work/home",
+		"x-client-platform":  "web",
+		"x-raccoon-language": "zh",
+	}
+}
+
+func (c *Client) webAuthHeader(a *auth.Auth) map[string]string {
+	h := c.webHeaders()
+	if a != nil {
+		h["Authorization"] = "Bearer " + a.JWT()
+	}
 	return h
 }
 

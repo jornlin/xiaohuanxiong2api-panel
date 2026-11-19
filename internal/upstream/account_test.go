@@ -120,3 +120,46 @@ func TestBills403QuietWindow(t *testing.T) {
 		t.Fatalf("静默窗口内仍在重打 v1 bills：命中 %d 次，期望 1 次", n)
 	}
 }
+
+// 每日 300 分要靠 web 会话 setting_info 触发：桌面票 403 → web 续期 → 重试成功。
+func TestEnsureWebSessionRefreshesToWeb(t *testing.T) {
+	var gotRefreshPlatform string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/web/office/v3/setting_info":
+			if r.Header.Get("x-client-platform") != "web" || r.Header.Get("Authorization") != "Bearer web-token" {
+				w.Header().Set("X-TT-System-Error", "3")
+				w.WriteHeader(http.StatusForbidden)
+				return
+			}
+			_, _ = io.WriteString(w, `{"code":0,"data":{"available_points":1234,`+
+				`"point_grant_popups":[{"source":"daily","points":300}]}}`)
+		case "/refresh":
+			gotRefreshPlatform = r.Header.Get("x-client-platform")
+			_, _ = io.WriteString(w, `{"code":0,"data":{"access_token":"web-token",`+
+				`"refresh_token":"r2","user_id":"u-1"}}`)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+
+	up := New()
+	up.SetAgentHosts(srv.URL, srv.URL)
+	up.SetAPIHosts(srv.URL, srv.URL)
+	a := &auth.Auth{Data: auth.Data{AccessToken: "desktop-token", RefreshToken: "r1", UID: "u-1"}}
+
+	refreshed, points, err := up.EnsureWebSession(a)
+	if err != nil {
+		t.Fatalf("EnsureWebSession: %v", err)
+	}
+	if !refreshed || points != 300 {
+		t.Fatalf("refreshed=%v points=%d，期望 true/300", refreshed, points)
+	}
+	if gotRefreshPlatform != "web" {
+		t.Errorf("续期必须带 web 平台头，实际 %q", gotRefreshPlatform)
+	}
+	if a.JWT() != "web-token" || a.RefreshTokenValue() != "r2" {
+		t.Errorf("新票未写回账号：access=%q refresh=%q", a.JWT(), a.RefreshTokenValue())
+	}
+}

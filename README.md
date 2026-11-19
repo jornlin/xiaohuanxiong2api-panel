@@ -58,7 +58,7 @@
 | 续期 | `POST {auth_base}/refresh` | body `{"refresh_token":…}`，回 `data.access_token/refresh_token` |
 | 目录 | `GET {llm_base}/model_catalog` | `data.categories[].models[]`，`visible:false` 不展示 |
 | 积分 | `GET {points_base}/balance` | `data.available_points` + 四个钱包字段；`total_chargeable_points` 是实际可扣费额度，`topup_frozen`/`enterprise_reserved`/`enterprise_topup_points` 标出不可花费部分，`owner_type`/`owner_id` 用于校验凭证是否串号 |
-| 签到 | `POST {origin}/api/web/desktop/v1/login/points/grant` + `GET {points_base}/bills` | 每日 300 分是服务端 00:00 自动发放、午夜清零，没有「调一下就发分」的客户端开关；grant 是幂等的登录领取（领过回 `granted:false`），是否到账以 bills 里当天的 `daily_grant` 为准 |
+| 签到 | `GET {origin}/api/web/office/v3/setting_info`（**web 会话**）+ `GET {points_base}/bills` | 每日 300 分是「当天第一次以 web 会话调 setting_info」时惰性入账（2026-11-20 实测：流水 `client_type=web`、`grant_at=当天 00:00`、`created_at=调用时刻`）；桌面会话调 setting_info 会被网关 403（`X-TT-System-Error:3`），必须用 web 头续期换票。是否到账以 v2 流水里当天的 `daily_grant` 为准；桌面端 `login/points/grant` 是**一次性礼包**的幂等回执，不是每日积分入口 |
 | 手机端首登 | `POST {origin}/api/web/mobile/v1/login/points/grant` | 与桌面端那笔额度独立，桌面端领过的号照样能领 |
 | 任务状态 | `GET {points_base}/tasks` | 只读回任务三组：`new_user_task_states`（注册/桌面端/移动端礼包）、`invitee_task_states`（活跃 7 天/首次付费）、`invite`（邀请码与进度）。上游**没有任何「完成任务」写端点**（POST/PUT 全是 404），所以能靠 API 领的只有桌面端与移动端两笔礼包，活跃/付费由服务端按行为判定 |
 | 验证码登录 | `POST {auth_base}/send_sms` + `POST {auth_base}/login_with_sms` | 官方网页端同款通道：`phone` 必须是密文（AES-128-CFB，密钥 `senseraccoon2023` 就写在网页里，见 `upstream.EncryptSmsField`），明文回 `params_encryted_error`；`sms_code` 明文。**登录不需要图形验证码**（实测：假验证码回 `sms_code_verify_error` 而不是验证码挑战），发码则可能要阿里云滑块回执 |
@@ -159,9 +159,9 @@ registration_entry, registration_source}` 与 `inviter_user_id`），写死在�
 | `upstream.llm_base` / `auth_base` | 内置常量 | 推理网关 / 鉴权基址 |
 | `upstream.points_base` / `origin` | 内置常量 | 积分 / 主站（手机端首登奖励） |
 | `upstream.timeout_seconds` / `header_timeout_seconds` / `idle_timeout_seconds` | `120/120/300` | 短请求总超时 / 首字节超时 / 流内空闲 |
-| `cooldown.plan_credit` / `soft_rate` / `soft_rate_max` | `12h/60s/2h` | 额度、限流冷却与退避封顶 |
+| `cooldown.plan_credit` / `soft_rate` / `soft_rate_max` | `12h/10s/60s` | 额度、限流冷却与退避封顶（429 由全局闸门限速，账号冷却只做短隔离） |
 | `pool.*` | 见示例 | 在途上限、熔断/降权阈值、闲置补偿 |
-| `schedule.checkin_hours` / `keepalive_hours` | `[9]` / `[3]` | 签到与保活时点 |
+| `schedule.checkin_hours` / `keepalive_hours` | `[0,9]` / `[3]` | 签到（每日积分触发）与保活时点 |
 
 ## 接入客户端
 
@@ -204,9 +204,9 @@ wire_api = "responses"
 - **不注入提示词**、不改消息序列。
 - 上游不认 `reasoning_effort` 档位；它自己回的 `reasoning_content` 会作为 thinking/推理内容下发。
 - 积分单价没有可信公开表，用量页只记 token，不编造金额。
-- **一次性新手礼包（桌面端 + 移动端，各 3000 分）与签到解耦**：每日 300 分是上游 00:00
-  自动入账的，`CheckinStatus` 几乎总是 `checked_in=true`，签到流程走「已签」短路——
-  礼包挂在签到成功路径上就永远领不到（实测漏掉过移动端那 3000）。所以它们由
+- **一次性新手礼包（桌面端 + 移动端，各 3000 分）与签到解耦**：每日 300 分由
+  `setting_info` 触发入账（见上），不是桌面端 grant 发的，所以签到流程可能走「已签」
+  短路——礼包挂在签到成功路径上就永远领不到（实测漏掉过移动端那 3000）。它们由
   `scheduler.claimNewcomerGrants` 每轮无条件结算一次，面板「领新手礼包」按钮则强制问上游；
   `granted:false` 是上游的幂等回执（这个号早领过），不是失败。面板「新手任务」
   只读展示任务完成度与邀请码，免得「领没领到」只能靠余额猜。

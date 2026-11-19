@@ -109,7 +109,7 @@ func TestDailyGrantReadsV2Bills(t *testing.T) {
 	up.SetAPIHosts(srv.URL, srv.URL)
 	up.SetAgentHosts(srv.URL, srv.URL)
 
-	todayHit, ever, last, err := up.DailyGrant(&auth.Auth{Data: auth.Data{AccessToken: "dt", UID: "u-1"}})
+	todayHit, ever, last, _, _, err := up.DailyGrant(&auth.Auth{Data: auth.Data{AccessToken: "dt", UID: "u-1"}})
 	if err != nil {
 		t.Fatalf("DailyGrant 出错: %v", err)
 	}
@@ -135,7 +135,7 @@ func TestDailyGrantDetectsStopped(t *testing.T) {
 	up.SetAPIHosts(srv.URL, srv.URL)
 	up.SetAgentHosts(srv.URL, srv.URL)
 
-	todayHit, ever, last, err := up.DailyGrant(&auth.Auth{Data: auth.Data{AccessToken: "dt", UID: "u-1"}})
+	todayHit, ever, last, _, _, err := up.DailyGrant(&auth.Auth{Data: auth.Data{AccessToken: "dt", UID: "u-1"}})
 	if err != nil {
 		t.Fatalf("DailyGrant 出错: %v", err)
 	}

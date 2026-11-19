@@ -308,6 +308,7 @@ type Client struct {
 	// 命中限流后短暂暂停新请求（指数退避，封顶 10s），请求是排队等待而不是直接被拒。
 	throttleMu      sync.Mutex
 	gateUntil       time.Time
+	nextSlot        time.Time
 	throttleStreak  int
 	lastThrottle    time.Time
 	lastThrottleLog time.Time
@@ -605,6 +606,20 @@ func (c *Client) RefreshTokenIfNeeded(a *auth.Auth, skew time.Duration) (bool, e
 
 // refresh 单飞：同一份 refresh_token 并发只打一次上游（上游每次轮换，并发会让一副票作废）。
 func (c *Client) refresh(a *auth.Auth) (bool, error) {
+	return c.refreshWith(a, c.clientIDHeaders())
+}
+
+// refreshWeb 用 web 头续期，换一张 **web 会话**票。
+//
+// 为什么要单独一条：2026-11-20 实测，每日 300 分不是桌面端 grant 端点发放的，
+// 而是账号第一次以 web 会话调 setting_info 时惰性入账（流水 client_type=web）；
+// 桌面会话调 setting_info 被网关 403（X-TT-System-Error:3）。会话类型由续期请求
+// 的头决定，所以先 web 续期再 setting_info 才能触发入账。
+func (c *Client) refreshWeb(a *auth.Auth) (bool, error) {
+	return c.refreshWith(a, c.webHeaders())
+}
+
+func (c *Client) refreshWith(a *auth.Auth, headers map[string]string) (bool, error) {
 	refreshToken := a.RefreshTokenValue()
 	if refreshToken == "" {
 		return false, &Error{Kind: ErrClient, Status: 400, Msg: "该账号没有 refresh_token，无法续期，请重新登录"}
@@ -628,7 +643,7 @@ func (c *Client) refresh(a *auth.Auth) (bool, error) {
 	c.flights[key] = flight
 	c.flightMu.Unlock()
 
-	token, refresh, exp, uid, err := c.refreshOnce(a)
+	token, refresh, exp, uid, err := c.refreshOnceWith(a, headers)
 	flight.token, flight.exp, flight.uid, flight.err = token, exp, uid, err
 	close(flight.done)
 	c.flightMu.Lock()
@@ -654,10 +669,10 @@ func applyRefreshedUID(a *auth.Auth, uid string) {
 	}
 }
 
-// refreshOnce 真的打一次续期接口并返回新票（不写回账号）。
-func (c *Client) refreshOnce(a *auth.Auth) (token, refresh string, exp int64, uid string, err error) {
+// refreshOnceWith 真的打一次续期接口并返回新票（不写回账号）。
+func (c *Client) refreshOnceWith(a *auth.Auth, headers map[string]string) (token, refresh string, exp int64, uid string, err error) {
 	resp, err := c.doJSON(http.MethodPost, c.authBase()+RefreshPath,
-		map[string]string{"refresh_token": a.RefreshTokenValue()}, c.clientIDHeaders())
+		map[string]string{"refresh_token": a.RefreshTokenValue()}, headers)
 	if err != nil {
 		return "", "", 0, "", err
 	}
@@ -870,11 +885,38 @@ func throttleSignal(raw string) bool {
 	return false
 }
 
+// minSendGap 是全局出站最小间隔：重启/客户端重连时几百个请求会同时涌进来，
+// 上游按频率直接 429（实测一次重启能让 130+ 个号同时被限流）。把出站切成
+// 最多 1 次/秒，尖峰被摊平，账号就不会成批冷却。
+const minSendGap = time.Second
+
+// WaitSendSlot 按全局最小间隔排一个出站名额（调用方在每次 attempt 前调用）。
+// 名额先占后等：并发调用者按到达顺序排队，不会一起醒来再撞一次。
+func (c *Client) WaitSendSlot(ctx context.Context) {
+	c.throttleMu.Lock()
+	now := time.Now()
+	if c.nextSlot.Before(now) {
+		c.nextSlot = now
+	}
+	wait := c.nextSlot.Sub(now)
+	c.nextSlot = c.nextSlot.Add(minSendGap)
+	c.throttleMu.Unlock()
+	if wait <= 0 {
+		return
+	}
+	timer := time.NewTimer(wait)
+	select {
+	case <-ctx.Done():
+		timer.Stop()
+	case <-timer.C:
+	}
+}
+
 // NoteUpstreamOK 一次成功出站。只有长时间（60s）没有再见到限流才把退避档位清零，
 // 避免「失败-成功-失败」来回抖动时档位重置、闸门失去作用。
 func (c *Client) NoteUpstreamOK() {
 	c.throttleMu.Lock()
-	if c.throttleStreak != 0 && time.Since(c.lastThrottle) > time.Minute {
+	if c.throttleStreak != 0 && time.Since(c.lastThrottle) > 30*time.Second {
 		c.throttleStreak = 0
 	}
 	c.throttleMu.Unlock()
@@ -920,13 +962,14 @@ func (c *Client) WaitGateUntil(ctx context.Context, deadline time.Time) {
 func (c *Client) noteChatReject(status int, uid, xtt string, raw []byte) (throttled bool) {
 	now := time.Now()
 	body := truncate(string(raw), 300)
-	// 只有「网关级频率/风控」才拉全局闸门：X-TT-System-Error 头或正文明确说
-	// 频率超限/风控。以下情况**不**全局暂停，否则会把单账号/单模型的问题放大成整池变慢：
-	//   - 429（线上实测 body code=200108「您的模型请求频率超限」）= 单账号/单模型限流，
-	//     换号即可；仍会按账号软冷却；
-	//   - 403 里的排队信号（isQueued/serviceAvailable）= 某模型暂不可服务，由
-	//     handler 按上游建议等待重试，其它模型不该一起停。
-	throttled = status == http.StatusForbidden && (xtt != "" || throttleSignal(body))
+	// 全局闸门覆盖两类：
+	//   1. 403 + X-TT-System-Error / 频率文案：网关级风控；
+	//   2. 429（线上 body code=200108「您的模型请求频率超限」）：并发尖峰时上游会对
+	//      **整池**同时打回 429（实测一次重启后 130/138 个号同时被限流）。只按账号
+	//      软冷却会不断缩池 → 剩余号压力更大 → 更多 429，形成级联。必须全局限速。
+	// 403 的模型排队（isQueued/serviceAvailable）仍不拉闸门：那是单模型窗口。
+	throttled = status == http.StatusTooManyRequests ||
+		(status == http.StatusForbidden && (xtt != "" || throttleSignal(body)))
 
 	c.throttleMu.Lock()
 	logNow := now.Sub(c.lastRejectLog) >= 5*time.Second
@@ -940,8 +983,10 @@ func (c *Client) noteChatReject(status int, uid, xtt string, raw []byte) (thrott
 		}
 		return
 	}
-	// 60s 没再见限流就从 1s 重新起退；否则档位递增，封顶 10s。
-	if now.Sub(c.lastThrottle) > time.Minute {
+	// 30s 没再见限流就从 1s 重新起退；否则档位递增，封顶 2s。
+	// 封顶不能太大：429 在高并发下会持续出现，10s 的全景暂停会把正常吞吐压到
+	// 个位数请求/分钟（实测级联恢复期更糟）。2s 的节奏足以打散并发尖峰。
+	if now.Sub(c.lastThrottle) > 30*time.Second {
 		c.throttleStreak = 0
 	}
 	c.lastThrottle = now
@@ -949,8 +994,8 @@ func (c *Client) noteChatReject(status int, uid, xtt string, raw []byte) (thrott
 		c.throttleStreak++
 	}
 	delay := time.Second << (c.throttleStreak - 1)
-	if delay > 10*time.Second {
-		delay = 10 * time.Second
+	if delay > 2*time.Second {
+		delay = 2 * time.Second
 	}
 	if until := now.Add(delay); until.After(c.gateUntil) {
 		c.gateUntil = until

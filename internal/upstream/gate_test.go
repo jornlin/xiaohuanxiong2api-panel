@@ -43,32 +43,16 @@ func TestPlain403DoesNotGate(t *testing.T) {
 	}
 }
 
-// 单账号频率 429（线上 code=200108）不应拉全局闸门：换号即可，
-// 全局暂停会把一个号的限流放大成整池变慢。
-func TestAccountRateLimitDoesNotGate(t *testing.T) {
+// 429 频率限制必须拉全局闸门：线上一次并发尖峰会让整池 130+ 个号同时 429，
+// 只按账号冷却会不断缩池并放大级联。
+func TestRateLimitGatesGlobally(t *testing.T) {
 	c := New()
 	c.noteChatReject(429, "u-1", "", []byte(`{"error":{"code":200108,"message":"您的模型请求频率超限，请稍后重试"}}`))
 	c.throttleMu.Lock()
 	gated := time.Now().Before(c.gateUntil)
 	c.throttleMu.Unlock()
-	if gated {
-		t.Fatal("账号级 429 不应拉起全局闸门")
-	}
-	// 模型排队（serviceAvailable=false）是单模型窗口，也不该停掉其它模型。
-	c.noteChatReject(429, "u-2", "", []byte(`{"message":"busy","serviceAvailable":false}`))
-	c.throttleMu.Lock()
-	gated = time.Now().Before(c.gateUntil)
-	c.throttleMu.Unlock()
-	if gated {
-		t.Fatal("模型排队 429 不应触发全局闸门")
-	}
-	// 网关级标记（X-TT-System-Error）才是全局的。
-	c.noteChatReject(403, "u-3", "3", []byte(`{"message":"forbidden"}`))
-	c.throttleMu.Lock()
-	gated = time.Now().Before(c.gateUntil)
-	c.throttleMu.Unlock()
 	if !gated {
-		t.Fatal("X-TT-System-Error 403 应拉起闸门")
+		t.Fatal("429 应拉起全局闸门")
 	}
 }
 
@@ -90,5 +74,17 @@ func TestChat403WithTTHeaderIsBusy(t *testing.T) {
 	var ue *Error
 	if !errors.As(err, &ue) || ue.Kind != ErrBusy || !ue.Throttled {
 		t.Fatalf("err = %+v，期望 ErrBusy+Throttled", err)
+	}
+}
+
+// 出站最小间隔：连续调用之间必须隔开 minSendGap，避免并发尖峰同时打到上游。
+func TestSendSlotSpacing(t *testing.T) {
+	c := New()
+	ctx := context.Background()
+	start := time.Now()
+	c.WaitSendSlot(ctx)
+	c.WaitSendSlot(ctx)
+	if d := time.Since(start); d < minSendGap/2 {
+		t.Fatalf("两次出站仅间隔 %s，期望约 %s", d, minSendGap)
 	}
 }

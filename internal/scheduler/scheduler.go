@@ -550,8 +550,9 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 	// （实测 auth.json 不再落 refresh），签到/查询本身用 access_token 就够。
 	// 预刷新逻辑自己会跳过未到期票；真到期又无票时，RefreshTokenIfNeeded 报错、
 	// 后面 status 调用如实暴露「请重新登录」，不在这里提前拦。
-	// 每日发放是服务端 00:00 自动入账（bills 流水实锤），CheckinStatus 以流水里
-	// 当天有无 daily_grant 为准；enable=false 只在「上游把该账号额度关了」时出现。
+	// 每日 300 分是「首次 web 会话 setting_info」惰性入账（2026-11-20 实测，流水
+	// client_type=web、grant_at=当天 00:00）；CheckinStatus 以流水里当天有无
+	// daily_grant 为准。桌面会话的 setting_info 会被网关 403，见 EnsureWebSession。
 	// 签到前把 access token 换新的：9 点签到离上一次保活（凌晨 3 点）有段距离，拿一张
 	// 已过期的票只会白跑一轮（照 wild-work：2h 内到期就先刷）。刷失败不在这里报错——真有
 	// 问题会让下面的 status 调用如实暴露，那条错误信息比「刷新失败」更贴题。
@@ -568,6 +569,34 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 	checkedIn, reward, enable := cst.CheckedIn, cst.Credits, cst.Enable
 	// 收尾落池用的余额：默认复用签到前的状态查询，复核拿到更新的快照时覆盖。
 	finalCredits, finalKnown := cst.Credits, cst.CreditsKnown
+	// 每日 300 分是「首次 web 会话 setting_info」惰性入账的（见 EnsureWebSession）。
+	// 未签到时先触发一次，再重查流水；这是签到能否真正到账的关键一步。
+	var triggeredPoints int64
+	// 今日 daily_grant 是刚刚（10 分钟内）才入账的 → 这就是本次签到触发的，
+	// 面板应按「+300」回报，而不是冷冰冰的「已签」。
+	if serr == nil && checkedIn && cst.TodayPoints > 0 && !cst.TodayGrantAt.IsZero() &&
+		time.Since(cst.TodayGrantAt) < 10*time.Minute {
+		triggeredPoints = cst.TodayPoints
+	}
+	if serr == nil && !checkedIn && enable {
+		if refreshed, pts, gerr := s.cfg.Upstream.EnsureWebSession(a); gerr == nil {
+			if refreshed {
+				if serr := a.SaveAtomic(); serr != nil {
+					log.Printf("checkin web session %s: 新票落盘失败: %v", uid, serr)
+				}
+			}
+			triggeredPoints = pts
+			if cst2, err2 := s.cfg.Upstream.CheckinStatus(a); err2 == nil {
+				cst = cst2
+				checkedIn, reward, enable = cst.CheckedIn, cst.Credits, cst.Enable
+				finalCredits, finalKnown = cst.Credits, cst.CreditsKnown
+				triggeredPoints = cst.TodayPoints
+				log.Printf("checkin %s: web setting_info 触发每日积分（今日已入账 %d）", uid, cst.TodayPoints)
+			}
+		} else if gerr != nil {
+			log.Printf("checkin web session %s: %v", uid, gerr)
+		}
+	}
 	// token 被别处轮换/提前吊销 → status 报 session 失效：换一张新票再查一次，别把
 	// 「票过期」记成签到失败（这条只重试一次，重试前必须真的换到了新票）。
 	if isSessionDead(serr) {
@@ -612,10 +641,9 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 		// 今天还没轮到它），不是「未开通」。只在 ever=false 时查一次注册时间，老号
 		// 不需要多打这一枪。
 		//
-		// 注意：**不要**因为「最近 N 天没发」就跳过领取。客户端的实证（2026-11-19）：
-		// 一个 11-13 起就没再收到 daily_grant 的号，用户在桌面客户端打开后当场补发了
-		// 11-13 到今天的一整串 300 分——领取动作就是下面这次 grant。判定「停发」只能
-		// 放在**领取之后**（拿到结果再说），提前跳过等于把本来能补发的号直接放弃。
+		// 注意：**不要**因为「最近 N 天没发」就跳过领取。上游支持补发，而真正的触发
+		// 动作是 web 会话 setting_info（见上面的 EnsureWebSession）；判定「停发」只能
+		// 放在触发/领取之后，提前跳过等于把本来能补发的号直接放弃。
 		if !cst.EverGranted {
 			if created, ok := s.cfg.Upstream.UserCreatedAt(a); ok && sameDayShanghai(created, time.Now()) {
 				res.Status = "pending"
@@ -713,9 +741,14 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 			}
 		}
 	}
+	// 本次由 setting_info 触发的每日积分：按真实入账额报 ok（不是「already」——
+	// 对用户来说这就是「签到成功 +300」）。
+	if checkinErr == nil && triggeredPoints > 0 {
+		res.Status, res.Credits, res.Reason = "ok", triggeredPoints, ""
+	}
 	// 一次性新手礼包（桌面端/移动端各 3000 分）在这里无条件补一次：
-	// 每日分是上游 00:00 自动发的，上面几乎总走「already」短路，claim 分支
-	// 根本不执行——礼包不能跟着签到结果一起被跳过（见 claimNewcomerGrants）。
+	// 每日分是 setting_info 触发入账的（不是桌面端 grant），claim 分支可能没走；
+	// 礼包不能跟着签到结果一起被跳过（见 claimNewcomerGrants）。
 	grants := s.claimNewcomerGrants(a, false, desktopTried)
 	if desktopGrant != nil {
 		grants = append([]NewcomerGrant{*desktopGrant}, grants...)

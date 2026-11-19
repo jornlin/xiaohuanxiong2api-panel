@@ -6,11 +6,12 @@
   "default_model": "raccoon-chat-ml-5-5",
   "cooldown": {
     "plan_credit": "12h",
-    "soft_rate": "20s",
-    "soft_rate_max": "2h"
+    "soft_rate": "10s",
+    "soft_rate_max": "60s"
   },
   "schedule": {
     "checkin_hours": [
+      0,
       9
     ],
     "keepalive_hours": [
