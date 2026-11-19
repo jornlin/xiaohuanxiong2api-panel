@@ -13,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/misakano7545/xiaohuanxiong2api-panel/internal/auth"
@@ -245,9 +246,13 @@ func (p *Panel) invites(w http.ResponseWriter, r *http.Request) {
 		MarketingText string `json:"marketing_text,omitempty"`
 		Error         string `json:"error,omitempty"`
 	}
-	// 逐号 /tasks 是 N 次上游请求（号多时很可观）：60 秒内直接复用上一份结果。
+	// 逐号 /tasks 是 N 次上游请求：缓存 5 分钟（与前端 TTL 一致），手动刷新带 ?force=1 绕过。
+	// 串行 + 300ms 间隔实测 138 个号要 50 秒；改成 4 路并发后约十几秒，仍是小流量、
+	// 不至于触发网关的频率风控。
+	force := r.URL.Query().Get("force") != ""
+	const invitesTTL = 5 * time.Minute
 	p.invitesMu.Lock()
-	if len(p.invitesJSON) > 0 && time.Since(p.invitesAt) < 60*time.Second {
+	if !force && len(p.invitesJSON) > 0 && time.Since(p.invitesAt) < invitesTTL {
 		body := p.invitesJSON
 		p.invitesMu.Unlock()
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
@@ -258,38 +263,58 @@ func (p *Panel) invites(w http.ResponseWriter, r *http.Request) {
 	}
 	p.invitesMu.Unlock()
 
+	accounts := p.cfg.Pool.List()
+	rows := make([]row, len(accounts))
+	skipped := make([]bool, len(accounts))
+	var wg sync.WaitGroup
+	sem := make(chan struct{}, 4)
+	for i := range accounts {
+		st := accounts[i]
+		a := p.cfg.Pool.AuthByUID(st.UID)
+		if a == nil {
+			skipped[i] = true
+			continue
+		}
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+			st := accounts[i]
+			a := p.cfg.Pool.AuthByUID(st.UID)
+			rw := row{
+				UID: st.UID, Nickname: st.Nickname,
+				Phone: st.Phone, NationCode: st.NationCode, InvitedBy: st.InvitedBy,
+			}
+			tasks, err := p.cfg.Upstream.Tasks(a)
+			if err != nil {
+				rw.Error = publicErr(err)
+			} else {
+				rw.Code = tasks.Invite.Code
+				rw.RegisteredInvitee = tasks.Invite.RegisteredInvitees
+				rw.GrantedPoints = tasks.Invite.GrantedPoints
+				rw.RewardPerInvitee = tasks.Invite.RegisterRewardPoints
+				rw.Remaining = tasks.Invite.RemainingRewardInvitees
+				rw.MarketingText = tasks.Invite.MarketingText
+				if rw.Code != "" {
+					// 官方邀请链接：面板此前拼成 /register?invite_code=…，与官网分享链接不一致。
+					rw.Link = "https://xiaohuanxiong.com/events/refer?code=" + rw.Code +
+						"&utm_source=friend_invitation_action"
+				}
+			}
+			rows[i] = rw
+		}(i)
+	}
+	wg.Wait()
+
 	out := []row{}
 	summary := map[string]int64{
 		"accounts": 0, "with_code": 0, "invited_total": 0, "granted_total": 0,
 		"slots_left": 0, "bound": 0, "unbound": 0,
 	}
-	for _, st := range p.cfg.Pool.List() {
-		a := p.cfg.Pool.AuthByUID(st.UID)
-		if a == nil {
+	for i, rw := range rows {
+		if skipped[i] {
 			continue
-		}
-		if len(out) > 0 {
-			time.Sleep(300 * time.Millisecond) // 号与号之间留节奏，避免网关频率风控
-		}
-		rw := row{
-			UID: st.UID, Nickname: st.Nickname,
-			Phone: st.Phone, NationCode: st.NationCode, InvitedBy: st.InvitedBy,
-		}
-		tasks, err := p.cfg.Upstream.Tasks(a)
-		if err != nil {
-			rw.Error = publicErr(err)
-		} else {
-			rw.Code = tasks.Invite.Code
-			rw.RegisteredInvitee = tasks.Invite.RegisteredInvitees
-			rw.GrantedPoints = tasks.Invite.GrantedPoints
-			rw.RewardPerInvitee = tasks.Invite.RegisterRewardPoints
-			rw.Remaining = tasks.Invite.RemainingRewardInvitees
-			rw.MarketingText = tasks.Invite.MarketingText
-			if rw.Code != "" {
-				// 官方邀请链接：面板此前拼成 /register?invite_code=…，与官网分享链接不一致。
-				rw.Link = "https://xiaohuanxiong.com/events/refer?code=" + rw.Code +
-					"&utm_source=friend_invitation_action"
-			}
 		}
 		summary["accounts"]++
 		if rw.Code != "" {
