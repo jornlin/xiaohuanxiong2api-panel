@@ -58,6 +58,9 @@ type Status struct {
 	// Realm 账号地区（cn / intl）：国际版账号没有签到接口、只能做国际版模型。
 	Realm   string `json:"realm,omitempty"`
 	Credits int64  `json:"credits"`
+	// CreditsKnown 是否真的拿到过余额快照。上游余额接口 403 期间新号的 credits
+	// 会一直是 0——不区分「未知」与「真的是 0」，界面就会把 9000 分显示成 0。
+	CreditsKnown bool `json:"credits_known"`
 	// CreditsTotal 上游给的积分总额（各包 credits_limit 之和），只作分母：
 	// 「积分」列显示 剩余/总额。0 表示还没查到过，界面只显示剩余。
 	CreditsTotal int64 `json:"credits_total,omitempty"`
@@ -91,6 +94,8 @@ type Status struct {
 type entry struct {
 	a       *auth.Auth
 	credits int64
+	// creditsKnown 余额快照是否真的拿到过（见 Status.CreditsKnown）。
+	creditsKnown bool
 	// creditsTotal 是上游总额（分母），只由余额查询路径写；见 SetCredits。
 	creditsTotal int64
 	expire       int64
@@ -175,7 +180,10 @@ func (e *entry) healthy(now time.Time) bool {
 // 以前这段是**三处**抄写的匿名 struct（stateFile 里一次、saveLocked 里两次），
 // 加字段必然漏一处；收成具名类型后只有这一份定义。
 type stateAccount struct {
-	Credits      int64 `json:"credits"`
+	Credits int64 `json:"credits"`
+	// CreditsKnown 用指针：老 state 文件没有这个键（nil）时按 credits!=0 推断，
+	// 不能把老号的非零余额一律当成「未知」。
+	CreditsKnown *bool `json:"credits_known,omitempty"`
 	CreditsTotal int64 `json:"credits_total,omitempty"`
 	Expire       int64 `json:"expire,omitempty"`
 	// ExpireCredits 到期那批的积分额（见 Status.ExpireCredits）。要持久化：
@@ -661,6 +669,7 @@ func (p *Pool) SetBalance(uid string, b Balance, expire int64) {
 		e.usedUSD, e.limitUSD = 0, 0
 	}
 	e.expire = expire
+	e.creditsKnown = true
 	p.saveLocked()
 }
 
@@ -922,6 +931,12 @@ func (p *Pool) CooldownSoft(uid, reason string) {
 	if !ok {
 		return
 	}
+	// 同一冷却窗口内的重复 429 只记一次退避：一个请求的多个并发在途、或同一限流窗口
+	// 里连续失败，几十毫秒内能打进来好几次；每次都 +1 是指数翻倍，一次窗口就能把号
+	// 罚到 soft_rate_max（2h）——用户看到的就是「动不动冷却」。
+	if time.Now().Before(e.until) && e.reason == reason {
+		return
+	}
 	e.softStreak++
 	d := p.lim.SoftCooldown << (e.softStreak - 1)
 	if d <= 0 || d > p.lim.SoftCooldownMax {
@@ -1002,6 +1017,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Nickname:      e.a.Nickname,
 		Realm:         e.a.Realm(),
 		Credits:       e.credits,
+		CreditsKnown:  e.creditsKnown,
 		CreditsTotal:  e.creditsTotal,
 		Expire:        e.expire,
 		ExpireCredits: e.expireCredits,
@@ -1044,9 +1060,14 @@ func (p *Pool) load() {
 		return
 	}
 	for uid, s := range sf.Accounts {
+		creditsKnown := s.Credits != 0
+		if s.CreditsKnown != nil {
+			creditsKnown = *s.CreditsKnown
+		}
 		p.byUID[uid] = &entry{
 			a:                &auth.Auth{Data: auth.Data{UID: uid}}, // placeholder，Add 时会换成完整凭证
 			credits:          s.Credits,
+			creditsKnown:     creditsKnown,
 			creditsTotal:     s.CreditsTotal,
 			expire:           s.Expire,
 			expireCredits:    s.ExpireCredits,
@@ -1072,8 +1093,10 @@ func (p *Pool) saveLocked() {
 	}
 	sf := stateFile{Accounts: map[string]stateAccount{}}
 	for uid, e := range p.byUID {
+		creditsKnown := e.creditsKnown
 		sf.Accounts[uid] = stateAccount{
 			Credits:       e.credits,
+			CreditsKnown:  &creditsKnown,
 			CreditsTotal:  e.creditsTotal,
 			Expire:        e.expire,
 			ExpireCredits: e.expireCredits,

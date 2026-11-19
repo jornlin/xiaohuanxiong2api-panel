@@ -220,6 +220,11 @@ function credCell(a) {
     return '<div class="n">' + esc(fmtUSD(usdRemain(a))) +
       (limit > 0 ? '<span class="tot">/' + esc(fmtUSD(limit)) + '</span>' : '') + '</div>';
   }
+  // 余额接口 403 期间新号从没拿到过快照：显示「—」而不是 0。
+  // 显示 0 会让人以为「领的 9000 分丢了」，实际积分在流水里（v2 income 可查）。
+  if (a.credits_known === false) {
+    return '<div class="n" title="余额接口受限，尚未取得实时余额；积分/礼包到账以 v2 积分流水为准">—</div>';
+  }
   return '<div class="n">' + (a.credits || 0) +
     (a.credits_total ? '<span class="tot">/' + a.credits_total + '</span>' : '') + '</div>';
 }
