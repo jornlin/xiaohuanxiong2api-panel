@@ -947,8 +947,8 @@ th.sorted[data-dir="desc"]::after { content: " ▼"; font-size: 10px; }
                   <input type="checkbox" name="prefer_daily_quota"></span>
                 <span class="hint">有每日额度时选号显著加权，避免先花永久积分；拿不到积分拆分（上游 balance 受限）时自动不生效</span></label>
               <label class="fld"><span class="lb">每日额度尾巴阈值</span>
-                <input name="daily_tail_points" type="number" min="0" placeholder="500">
-                <span class="hint">每日剩余低于该值就不再优先，避免为几十分把号钉死</span></label>
+                <input name="daily_tail_points" type="number" min="0" placeholder="0">
+                <span class="hint">每日剩余低于该值不再优先；0 = 只要还有每日额度就优先。每日额度通常只有 300，阈值别超过它</span></label>
             </div>
           </div>
         </div>

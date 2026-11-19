@@ -166,7 +166,8 @@ func Default() *Config {
 	c.Pool.IdleWeightMax = 5
 	c.Pool.ExpiringSoon = "168h"
 	c.Pool.PreferDailyQuota = true
-	c.Pool.DailyTailPoints = 500
+	// 0 = 只要每日余额 > 0 就优先（每日额度本身只有 300，阈值若设 500 等于永久关闭）。
+	c.Pool.DailyTailPoints = 0
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
