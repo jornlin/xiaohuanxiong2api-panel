@@ -122,6 +122,46 @@ func TestWriteKeepFromCorruptFile(t *testing.T) {
 	}
 }
 
+// 单文件 bind mount（Docker -v ./config.json:/app/config.json）下 rename 会报
+// device or resource busy；这个判断决定要不要退化为原地写。
+func TestBusyOrCrossDevice(t *testing.T) {
+	yes := []string{
+		"rename /app/.config.json.123 /app/config.json: device or resource busy",
+		"rename a b: invalid cross-device link",
+	}
+	for _, s := range yes {
+		if !busyOrCrossDevice(errors.New(s)) {
+			t.Errorf("应识别为挂载点/跨设备：%s", s)
+		}
+	}
+	no := []string{
+		"rename a b: permission denied",
+		"rename a b: no such file or directory",
+	}
+	for _, s := range no {
+		if busyOrCrossDevice(errors.New(s)) {
+			t.Errorf("不该退化：%s", s)
+		}
+	}
+}
+
+// writeInPlace 覆盖一个已存在的文件：内容整体替换、权限不动。
+func TestWriteInPlace(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "config.json")
+	if err := os.WriteFile(p, []byte(`{"old":1}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeInPlace(p, []byte(`{"new":2}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(read(t, p)); got != `{"new":2}` {
+		t.Fatalf("内容 = %s", got)
+	}
+	if fi, err := os.Stat(p); err != nil || fi.Mode().Perm() != 0o600 {
+		t.Fatalf("权限 = %v, %v", fi.Mode(), err)
+	}
+}
+
 // 自定义校验：JSON 合法但语义不合格的文件也要走 .bak。
 func TestReadCustomValidator(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "workbuddy-x.json")

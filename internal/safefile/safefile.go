@@ -23,6 +23,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -115,10 +116,50 @@ func replace(path string, b []byte, perm fs.FileMode) error {
 		return err
 	}
 	if err := os.Rename(tmp, path); err != nil {
+		// 目标本身是被挂载的文件（Docker 单文件 bind mount，如
+		// -v ./config.json:/app/config.json）：挂载点不能被 rename 替换，内核回 EBUSY。
+		// 这是部署形态决定的，不是权限/磁盘问题——退化为原地覆盖写。
+		// 代价是这一步不再原子（掉电可能留下半截文件），但挂载点下没有别的选项；
+		// 配置文件读取侧有 .bak 兜底，且保存动作本来就是用户主动触发的。
+		if busyOrCrossDevice(err) {
+			if werr := writeInPlace(path, b, perm); werr != nil {
+				return fmt.Errorf("原地写入 %s 失败（rename: %v）：%w", path, err, werr)
+			}
+			tmp = ""
+			return nil
+		}
 		return err
 	}
 	tmp = ""
 	return nil
+}
+
+// busyOrCrossDevice 判断 rename 失败是否因为目标是挂载点（EBUSY）或跨设备（EXDEV）。
+//
+// 不用 syscall.EBUSY：CI 会构建 windows 版本，那里没有这些 POSIX errno 常量。
+// Go 的 syscall.Errno.Error() 在 Linux/macOS 上就是错误原文，匹配这两句足够精确。
+func busyOrCrossDevice(err error) bool {
+	msg := err.Error()
+	return strings.Contains(msg, "device or resource busy") ||
+		strings.Contains(msg, "invalid cross-device link") ||
+		strings.Contains(msg, "cross-device link")
+}
+
+// writeInPlace 直接截断重写目标文件（O_TRUNC），用于不能 rename 的挂载点文件。
+func writeInPlace(path string, b []byte, perm fs.FileMode) error {
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, perm)
+	if err != nil {
+		return err
+	}
+	if _, err := f.Write(b); err != nil {
+		_ = f.Close()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		return err
+	}
+	return f.Close()
 }
 
 // describe 说清楚坏在哪，供日志和报错使用。
