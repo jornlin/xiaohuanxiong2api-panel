@@ -89,6 +89,10 @@ type Config struct {
 		IdleWeightMax     float64 `json:"idle_weight_max"`      // 5
 		// ExpiringSoon 快过期窗口（如 "168h"）：窗口内到期的积分优先消耗；空 = 禁用分桶。
 		ExpiringSoon string `json:"expiring_soon"`
+		// 每日赠送/限时积分优先：有每日额度时选号显著加权（避免先花永久积分）。
+		// 拆分来自 v1 balance；拿不到快照时该策略自动失效，不会误伤选号。
+		PreferDailyQuota bool  `json:"prefer_daily_quota"` // true
+		DailyTailPoints  int64 `json:"daily_tail_points"`  // 500：每日剩到该值以下不再优先
 	} `json:"pool"`
 
 	SessionSticky struct {
@@ -161,6 +165,8 @@ func Default() *Config {
 	c.Pool.IdleWeightPerHour = 0.5
 	c.Pool.IdleWeightMax = 5
 	c.Pool.ExpiringSoon = "168h"
+	c.Pool.PreferDailyQuota = true
+	c.Pool.DailyTailPoints = 500
 	c.SessionSticky.Enabled = true
 	c.SessionSticky.TTL = "30m"
 	c.SessionSticky.GCInterval = "5m"
@@ -415,6 +421,9 @@ func (c *Config) normalize() error {
 	}
 	if c.Pool.IdleWeightMax <= 0 {
 		c.Pool.IdleWeightMax = 5
+	}
+	if c.Pool.DailyTailPoints < 0 {
+		c.Pool.DailyTailPoints = 0
 	}
 	if c.Pool.MaxInFlight < 0 {
 		// 负数不是「不限」：池以 >0 为限流判据，夹成 0 等于把非法值静默变成最宽松档。

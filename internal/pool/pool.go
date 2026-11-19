@@ -61,6 +61,12 @@ type Status struct {
 	// CreditsKnown 是否真的拿到过余额快照。上游余额接口 403 期间新号的 credits
 	// 会一直是 0——不区分「未知」与「真的是 0」，界面就会把 9000 分显示成 0。
 	CreditsKnown bool `json:"credits_known"`
+	// 积分桶（v1 balance 快照）：Daily=每日赠送/限时，Monthly/Reward/Topup=永久。
+	// 0 代表「这一桶没有」或「还没拿到拆分快照」，前端结合 credits_known 判断。
+	Daily   int64 `json:"daily,omitempty"`
+	Monthly int64 `json:"monthly,omitempty"`
+	Reward  int64 `json:"reward,omitempty"`
+	Topup   int64 `json:"topup,omitempty"`
 	// Phone / NationCode 账号绑定手机号（授权码入池的号没有 loginid，只能从
 	// /auth/v1/user_info 补全；面板靠它认出「随机昵称 + 7 位 uid」是谁）。
 	Phone      string `json:"phone,omitempty"`
@@ -102,6 +108,9 @@ type entry struct {
 	credits int64
 	// creditsKnown 余额快照是否真的拿到过（见 Status.CreditsKnown）。
 	creditsKnown bool
+	// 积分桶（v1 balance）：daily=每日赠送/限时；monthly/reward/topup=永久。
+	// balance 403 期间这些值来自最后一次成功快照，0 不代表真的没有。
+	daily, monthly, reward, topup int64
 	// creditsTotal 是上游总额（分母），只由余额查询路径写；见 SetCredits。
 	creditsTotal int64
 	expire       int64
@@ -150,6 +159,11 @@ type Limits struct {
 	PlanCooldown       time.Duration // 1005 硬冷却
 	SoftCooldown       time.Duration // 429/404 软冷却基数
 	SoftCooldownMax    time.Duration // 软冷却指数退避封顶
+	// PreferDaily 优先花每日赠送/限时积分（Daily>尾巴阈值时权重加成），
+	// 没有每日额度时再按原权重选号。DailyTailPoints 是尾巴保护：
+	// 每日只剩一点点时不再优先，避免为了几十分把号钉死。
+	PreferDaily     bool
+	DailyTailPoints int64
 }
 
 // DefaultLimits 未配置时的兜底（零值 Limits 也能安全工作）。
@@ -542,6 +556,12 @@ func (p *Pool) drawLocked(cands []*entry, now time.Time) *entry {
 // 权重只影响抽中概率，不影响正确性：真正没额度的号会在 1005 时被硬冷却踢出候选。
 func (p *Pool) weight(e *entry, maxCredits int64, now time.Time) float64 {
 	w := 1.0
+	// 每日赠送/限时积分优先：只要这一桶还有「像样」的余额（> 尾巴阈值），就显著
+	// 加权，让消耗落在会过期的积分上；用完（≤阈值）后自然回落，不会为了几十分
+	// 把号钉死。拆分来自 v1 balance；拿不到快照时 daily=0，等同于关闭该策略。
+	if p.lim.PreferDaily && e.unit != "usd" && e.daily > p.lim.DailyTailPoints {
+		w += 25
+	}
 	switch {
 	case e.unit == "usd" && e.limitUSD > 0:
 		// 美元号（国际版 Free plan 等）：按**剩余额度占比**给分。
@@ -646,6 +666,9 @@ type Balance struct {
 	Unit   string // "credit"（默认）| "usd"
 	Remain int64  // 积分口径
 	Total  int64
+	// 积分桶（国内口径）：Daily=每日赠送/限时，其余=永久（月会员/奖励/充值）。
+	// v1 balance 是唯一提供拆分的地方；setting_info 只给总额时这些字段保持旧值。
+	Daily, Monthly, Reward, Topup int64
 	// 美元口径（Unit="usd"）。Free plan 实测 used=0.00059，必须留小数。
 	UsedUSD  float64
 	LimitUSD float64
@@ -670,8 +693,10 @@ func (p *Pool) SetBalance(uid string, b Balance, expire int64) {
 		// 美元号：credits 留 0（没有积分这回事），余额看 usedUSD/limitUSD。
 		// 不把美元塞进 credits —— 那会让「积分」列显示一个不是积分的数。
 		e.credits, e.creditsTotal = 0, 0
+		e.daily, e.monthly, e.reward, e.topup = 0, 0, 0, 0
 	} else {
 		e.credits, e.creditsTotal = b.Remain, b.Total
+		e.daily, e.monthly, e.reward, e.topup = b.Daily, b.Monthly, b.Reward, b.Topup
 		e.usedUSD, e.limitUSD = 0, 0
 	}
 	e.expire = expire
@@ -1029,6 +1054,10 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Realm:         e.a.Realm(),
 		Credits:       e.credits,
 		CreditsKnown:  e.creditsKnown,
+		Daily:         e.daily,
+		Monthly:       e.monthly,
+		Reward:        e.reward,
+		Topup:         e.topup,
 		Phone:         phone,
 		NationCode:    nation,
 		InvitedBy:     invited,

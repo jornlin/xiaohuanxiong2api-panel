@@ -47,6 +47,8 @@ func limitsOf(c *Config) pool.Limits {
 		PlanCooldown:       c.PlanCreditDur,
 		SoftCooldown:       c.SoftRateDur,
 		SoftCooldownMax:    c.SoftRateMaxDur,
+		PreferDaily:        c.Pool.PreferDailyQuota,
+		DailyTailPoints:    c.Pool.DailyTailPoints,
 	}
 }
 

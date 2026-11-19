@@ -226,7 +226,12 @@ function credCell(a) {
   if (a.credits_known === false) {
     return '<div class="n" title="余额接口（v1 balance 与工作台 setting_info）暂不可用；积分/礼包到账以 v2 积分流水为准">—</div>';
   }
-  return '<div class="n">' + (a.credits || 0) +
+  // 每日/永久拆分来自 v1 balance；拿不到拆分时只显示总额（不猜）。
+  const perm = (a.monthly || 0) + (a.reward || 0) + (a.topup || 0);
+  const tip = (a.daily || perm)
+    ? '每日/限时 ' + fmtNum(a.daily || 0) + ' · 永久 ' + fmtNum(perm)
+    : '';
+  return '<div class="n"' + (tip ? ' title="' + esc(tip) + '"' : '') + '>' + (a.credits || 0) +
     (a.credits_total ? '<span class="tot">/' + a.credits_total + '</span>' : '') + '</div>';
 }
 
@@ -1302,6 +1307,7 @@ const CFG_MAP = {
   // 选号
   max_in_flight: ['pool', 'max_in_flight'], idle_weight_per_hour: ['pool', 'idle_weight_per_hour'],
   idle_weight_max: ['pool', 'idle_weight_max'], expiring_soon: ['pool', 'expiring_soon'],
+  prefer_daily_quota: ['pool', 'prefer_daily_quota'], daily_tail_points: ['pool', 'daily_tail_points'],
   // 日志
   request_client_info: ['logging', 'request_client_info'],
   // 会话粘性 / 提示词 / 上游

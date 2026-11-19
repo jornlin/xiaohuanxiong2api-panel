@@ -380,6 +380,7 @@ func (s *Scheduler) entUsageOf(uid string, a *auth.Auth) (upstream.EntUsage, err
 	}
 	s.cfg.Pool.SetBalance(uid, pool.Balance{
 		Unit: u.Unit, Remain: u.Remain, Total: u.Total,
+		Daily: u.Daily, Monthly: u.Monthly, Reward: u.Reward, Topup: u.Topup,
 		UsedUSD: u.UsedUSD, LimitUSD: u.LimitUSD,
 	}, u.Expire)
 	s.cfg.Pool.SetExpireCredits(uid, u.ExpirePoints)
@@ -723,13 +724,16 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 	// 签到轮次原来每号要查三次余额（排序探询、状态查询、收尾刷新），37 个号一轮
 	// 上百次——正是上游网关对 balance/setting_info 返回 X-TT-System-Error:3 的原因。
 	if finalKnown {
-		expire := int64(0)
+		prev := pool.Status{}
 		if st, ok := s.cfg.Pool.Status(uid); ok {
-			expire = st.Expire
+			prev = st
 		}
+		// 余额桶沿用上一份拆分快照：本次 CheckinStatus 只拿到总额（setting_info 口径），
+		// 不能把 daily/reward 等桶写成 0，否则「每日优先」会立刻失效。
 		s.cfg.Pool.SetBalance(uid, pool.Balance{
 			Unit: "credit", Remain: finalCredits, Total: finalCredits,
-		}, expire)
+			Daily: prev.Daily, Monthly: prev.Monthly, Reward: prev.Reward, Topup: prev.Topup,
+		}, prev.Expire)
 		if checkinErr == nil {
 			// 「签到解冻」只在成功路径上做：失败路径也调它，等于一次失败签到
 			// 顺手把 12h 计划冷却冲掉。

@@ -927,6 +927,15 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <input name="expiring_soon" placeholder="168h">
                 <span class="hint">窗口内到期的积分优先消耗；留空 = 禁用</span></label>
             </div>
+            <div class="grid3" style="margin-top:10px">
+              <label class="fld"><span class="lb">每日赠送积分优先</span>
+                <span class="switch" style="margin-top:6px"><span class="lb">优先消耗每日/限时积分</span>
+                  <input type="checkbox" name="prefer_daily_quota"></span>
+                <span class="hint">有每日额度时选号显著加权，避免先花永久积分；拿不到积分拆分（上游 balance 受限）时自动不生效</span></label>
+              <label class="fld"><span class="lb">每日额度尾巴阈值</span>
+                <input name="daily_tail_points" type="number" min="0" placeholder="500">
+                <span class="hint">每日剩余低于该值就不再优先，避免为几十分把号钉死</span></label>
+            </div>
           </div>
         </div>
 
