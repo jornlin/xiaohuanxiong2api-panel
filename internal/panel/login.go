@@ -590,8 +590,13 @@ func (p *Panel) saveAccount(creds *auth.Auth) (uid, nickname string, err error) 
 	// 授权码/浏览器授权入池的号没有 loginid：顺手查一次 user_info 补手机号
 	// （一次只读请求；失败不阻断入池，之后可用面板「补全手机号」重试）。
 	if phone, _ := creds.PhoneValue(); phone == "" {
-		if pr, perr := p.cfg.Upstream.FetchProfile(creds); perr == nil && pr.Phone != "" {
-			creds.SetPhone(pr.Phone, pr.NationCode)
+		if pr, perr := p.cfg.Upstream.FetchProfile(creds); perr == nil {
+			if pr.Phone != "" {
+				creds.SetPhone(pr.Phone, pr.NationCode)
+			}
+			if pr.InvitedBy != "" {
+				creds.SetInvitedBy(pr.InvitedBy)
+			}
 		}
 	}
 	if err := creds.SaveAtomic(); err != nil {

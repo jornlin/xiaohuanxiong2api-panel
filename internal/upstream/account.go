@@ -570,6 +570,9 @@ type Profile struct {
 	Nickname   string
 	Phone      string
 	NationCode string
+	// InvitedBy 注册时绑定的邀请码（registration_attribution.invite_code）。
+	// 注册后无法补绑，这里只做事实记录。
+	InvitedBy string
 }
 
 // FetchProfile 拉一次用户资料（只读、一次请求）。
@@ -585,11 +588,16 @@ func (c *Client) FetchProfile(a *auth.Auth) (Profile, error) {
 	if err != nil {
 		return Profile{}, err
 	}
+	invited := ""
+	if attr, ok := data["registration_attribution"].(map[string]any); ok {
+		invited = text(attr, "invite_code")
+	}
 	return Profile{
 		UID:        text(data, "id", "user_id", "uid"),
 		Nickname:   text(data, "name", "nickname"),
 		Phone:      text(data, "phone"),
 		NationCode: text(data, "nation_code"),
+		InvitedBy:  invited,
 	}, nil
 }
 

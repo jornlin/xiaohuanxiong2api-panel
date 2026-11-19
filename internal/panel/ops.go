@@ -228,23 +228,37 @@ func (p *Panel) accountGrants(w http.ResponseWriter, r *http.Request) {
 // 注册完立刻能看出这次邀请算没算上（上游没有补绑接口，只在注册那一刻生效）。
 func (p *Panel) invites(w http.ResponseWriter, r *http.Request) {
 	type row struct {
-		UID               string `json:"uid"`
-		Nickname          string `json:"nickname,omitempty"`
+		UID        string `json:"uid"`
+		Nickname   string `json:"nickname,omitempty"`
+		Phone      string `json:"phone,omitempty"`
+		NationCode string `json:"nation_code,omitempty"`
+		// InvitedBy 该号注册时绑定的邀请码（空 = 未绑定邀请人，注册后无法补绑）。
+		InvitedBy         string `json:"invited_by,omitempty"`
 		Code              string `json:"code"`
 		RegisteredInvitee int64  `json:"registered_invitees"`
 		GrantedPoints     int64  `json:"granted_points"`
 		RewardPerInvitee  int64  `json:"register_reward_points"`
+		Remaining         int64  `json:"remaining_reward_invitees"`
+		// Link 官方邀请链接（与官网「邀请好友」分享同形）。
+		Link string `json:"link,omitempty"`
 		// MarketingText 上游下发的活动/规则提示（当前无活动时为空），邀请页原样展示。
 		MarketingText string `json:"marketing_text,omitempty"`
 		Error         string `json:"error,omitempty"`
 	}
 	out := []row{}
+	summary := map[string]int64{
+		"accounts": 0, "with_code": 0, "invited_total": 0, "granted_total": 0,
+		"slots_left": 0, "bound": 0, "unbound": 0,
+	}
 	for _, st := range p.cfg.Pool.List() {
 		a := p.cfg.Pool.AuthByUID(st.UID)
 		if a == nil {
 			continue
 		}
-		rw := row{UID: st.UID, Nickname: st.Nickname}
+		rw := row{
+			UID: st.UID, Nickname: st.Nickname,
+			Phone: st.Phone, NationCode: st.NationCode, InvitedBy: st.InvitedBy,
+		}
 		tasks, err := p.cfg.Upstream.Tasks(a)
 		if err != nil {
 			rw.Error = publicErr(err)
@@ -253,11 +267,31 @@ func (p *Panel) invites(w http.ResponseWriter, r *http.Request) {
 			rw.RegisteredInvitee = tasks.Invite.RegisteredInvitees
 			rw.GrantedPoints = tasks.Invite.GrantedPoints
 			rw.RewardPerInvitee = tasks.Invite.RegisterRewardPoints
+			rw.Remaining = tasks.Invite.RemainingRewardInvitees
 			rw.MarketingText = tasks.Invite.MarketingText
+			if rw.Code != "" {
+				// 官方邀请链接：面板此前拼成 /register?invite_code=…，与官网分享链接不一致。
+				rw.Link = "https://xiaohuanxiong.com/events/refer?code=" + rw.Code +
+					"&utm_source=friend_invitation_action"
+			}
+		}
+		summary["accounts"]++
+		if rw.Code != "" {
+			summary["with_code"]++
+		}
+		summary["invited_total"] += rw.RegisteredInvitee
+		summary["granted_total"] += rw.GrantedPoints
+		if rw.Remaining > 0 {
+			summary["slots_left"] += rw.Remaining
+		}
+		if rw.InvitedBy != "" {
+			summary["bound"]++
+		} else {
+			summary["unbound"]++
 		}
 		out = append(out, rw)
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": out})
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "summary": summary, "accounts": out})
 }
 
 // inviteRecords 邀请记录（**只读**，零额度消耗）：GET /panel/api/invite_records?uid=&offset=
@@ -399,7 +433,9 @@ func (p *Panel) profilesSync(w http.ResponseWriter, r *http.Request) {
 		if a == nil {
 			continue
 		}
-		if phone, _ := a.PhoneValue(); phone != "" {
+		// 缺手机号或缺邀请归因的号都要补（两个字段都齐才跳过）。
+		phone, _ := a.PhoneValue()
+		if phone != "" && a.InvitedByValue() != "" {
 			continue
 		}
 		if !first {
@@ -411,11 +447,16 @@ func (p *Panel) profilesSync(w http.ResponseWriter, r *http.Request) {
 			out = append(out, row{UID: st.UID, Error: publicErr(err)})
 			continue
 		}
-		if pr.Phone == "" {
-			out = append(out, row{UID: st.UID, Error: "上游未返回手机号"})
+		if pr.Phone == "" && pr.InvitedBy == "" {
+			out = append(out, row{UID: st.UID, Error: "上游未返回手机号/邀请归因"})
 			continue
 		}
-		a.SetPhone(pr.Phone, pr.NationCode)
+		if pr.Phone != "" {
+			a.SetPhone(pr.Phone, pr.NationCode)
+		}
+		if pr.InvitedBy != "" {
+			a.SetInvitedBy(pr.InvitedBy)
+		}
 		if serr := a.SaveAtomic(); serr != nil {
 			out = append(out, row{UID: st.UID, Phone: pr.Phone, Error: "落盘失败：" + serr.Error()})
 			continue

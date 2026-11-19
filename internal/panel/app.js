@@ -156,7 +156,7 @@ async function submitKey() {
 }
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
-const TITLES = { accounts: '账号池', models: '模型', usage: '用量', packages: '积分构成', config: '配置', logs: '运行日志' };
+const TITLES = { accounts: '账号池', invites: '邀请', models: '模型', usage: '用量', packages: '积分构成', config: '配置', logs: '运行日志' };
 function go(v) {
   navSet(false);
   view = v;
@@ -165,6 +165,7 @@ function go(v) {
   $('ttl').textContent = TITLES[v];
   if (!ready) return;                    // 认证探测通过后 start() 会再调一次
   if (v === 'accounts') loadOverview(true);
+  if (v === 'invites') loadInvites();
   if (v === 'models' && !$('mdBody').children.length) loadModels();
   if (v === 'usage') loadUsage(true);
   if (v === 'packages') loadPackages();
@@ -1837,8 +1838,12 @@ async function loadSmsInvites() {
 // 注册链接：官方注册入口 + invite_code（前端就是这么拼的：/register 页面从 query 取 invite_code）
 function syncInviteUrl() {
   const code = $('smsInvite').value;
+  // 官方「邀请好友」分享链接的真实形态（2026-11-19 抓包）：
+  // https://xiaohuanxiong.com/events/refer?code=<邀请码>&utm_source=friend_invitation_action
+  // 之前拼的 /register?invite_code=… 不是官方入口，邀请关系可能不被上游认。
   $('smsInviteUrl').value = code
-    ? 'https://xiaohuanxiong.com/register?lang=zh&invite_code=' + encodeURIComponent(code)
+    ? 'https://xiaohuanxiong.com/events/refer?code=' + encodeURIComponent(code) +
+      '&utm_source=friend_invitation_action'
     : '';
 }
 
@@ -1875,7 +1880,78 @@ function inviteDate(s) {
   return d.toLocaleDateString('zh-CN', { timeZone: 'Asia/Shanghai' });
 }
 
-async function openInviteRecords() {
+/* ── 邀请页：汇总 + 逐号绑定状态/邀请码/官方链接 ─────────────────── */
+let invitesData = null;
+let invitesLoading = false;
+
+async function loadInvites() {
+  if (invitesLoading) return;
+  invitesLoading = true;
+  $('invBody').innerHTML = '<tr><td colspan="8"><div class="empty">加载中…（逐号查询上游邀请码，约需数秒）</div></td></tr>';
+  try {
+    invitesData = await api('invites');
+    renderInvites();
+  } catch (e) {
+    $('invBody').innerHTML = '<tr><td colspan="8"><div class="empty">' + esc(e.message) + '</div></td></tr>';
+  } finally {
+    invitesLoading = false;
+  }
+}
+
+function invRows() {
+  const all = (invitesData && invitesData.accounts) || [];
+  const f = $('invFilter') ? $('invFilter').value : 'all';
+  return all.filter(a => {
+    if (f === 'invited') return (a.registered_invitees || 0) > 0;
+    if (f === 'no_invitee') return !(a.registered_invitees || 0);
+    if (f === 'bound') return !!a.invited_by;
+    if (f === 'unbound') return !a.invited_by;
+    return true;
+  });
+}
+
+function renderInvites() {
+  const s = (invitesData && invitesData.summary) || {};
+  $('invNote').textContent = '共 ' + (s.accounts || 0) + ' 个号 · 有邀请码 ' + (s.with_code || 0) +
+    ' · 已邀 ' + (s.invited_total || 0) + ' 人 · 已发 ' + fmtNum(s.granted_total || 0) + ' 分';
+  $('invStats').innerHTML =
+    usKpi(String(s.accounts || 0), '账号总数') +
+    usKpi(String(s.with_code || 0), '有邀请码') +
+    usKpi(String(s.invited_total || 0), '已邀请人数') +
+    usKpi(fmtNum(s.granted_total || 0), '邀请已发积分') +
+    usKpi(String(s.slots_left || 0), '剩余奖励名额') +
+    usKpi(String(s.bound || 0) + ' / ' + String(s.unbound || 0), '已绑定 / 未绑定邀请人');
+  const rows = invRows();
+  if (!rows.length) {
+    $('invBody').innerHTML = '<tr><td colspan="8"><div class="empty">没有匹配的账号</div></td></tr>';
+    return;
+  }
+  $('invBody').innerHTML = rows.map(a => {
+    const who = '<div class="nm">' + esc(a.nickname || a.uid) + '</div>' +
+      '<div class="id">' + (a.phone ? esc(a.phone) + ' · ' : '') + esc(a.uid) + '</div>';
+    const bind = a.invited_by
+      ? tag('ok', '已绑定', '注册时使用了邀请码 ' + a.invited_by)
+      : tag('mute', '未绑定', '注册时没有带邀请码；上游没有补绑接口');
+    const link = a.link
+      ? '<div class="urlrow" style="gap:6px"><input readonly value="' + esc(a.link) + '" ' +
+        'style="min-width:240px;max-width:360px;font-size:12px">' +
+        '<button class="xs" data-copy="' + esc(a.link) + '">复制</button></div>'
+      : '<span class="hint">—</span>';
+    return '<tr>' +
+      '<td>' + who + '</td>' +
+      '<td>' + (a.code ? '<span class="mono">' + esc(a.code) + '</span>' : '<span class="hint">—</span>') + '</td>' +
+      '<td class="num">' + (a.registered_invitees || 0) + '</td>' +
+      '<td class="num">' + fmtNum(a.granted_points || 0) + '</td>' +
+      '<td class="num">' + (a.remaining_reward_invitees != null ? a.remaining_reward_invitees : '—') + '</td>' +
+      '<td>' + bind + '</td>' +
+      '<td>' + link + '</td>' +
+      '<td class="c-acts"><button class="xs ghost" data-rec="' + esc(a.uid) + '">记录</button></td>' +
+      '</tr>';
+  }).join('');
+}
+
+// preferUID 指定要查看的邀请人（邀请页每行的「记录」按钮传当前账号）。
+async function openInviteRecords(preferUID) {
   $('inviteVeil').classList.add('on');
   const sel = $('inviteWho');
   sel.innerHTML = '<option value="">加载中…</option>';
@@ -1888,8 +1964,8 @@ async function openInviteRecords() {
       $('inviteBody').innerHTML = '<tr><td colspan="6"><div class="empty">池里没有可用邀请码：先把邀请人账号加进来</div></td></tr>';
       return;
     }
-    // 默认沿用上次选中的账号；没有就取第一个。
-    const keep = inviteUID;
+    // 指定了 uid 就用它；否则沿用上次选中的账号；没有就取第一个。
+    const keep = preferUID || inviteUID;
     sel.innerHTML = rows.map(r =>
       '<option value="' + esc(r.uid) + '">' + esc(r.nickname || r.uid) +
       ' · 已邀 ' + (r.registered_invitees || 0) + ' 人</option>').join('');
@@ -2460,6 +2536,19 @@ function grantsMsg(gs) {
     } catch (e) { toast(e.message, 'err'); }
     finally { b.disabled = false; loadOverview(true); }
   };
+  // 邀请页：复制链接 / 查看邀请记录 / 筛选 / 刷新
+  $('invBody').addEventListener('click', async ev => {
+    const c = ev.target.closest('button[data-copy]');
+    if (c) {
+      const ok = await copyText(c.dataset.copy, null);
+      toast(ok ? '邀请链接已复制' : '复制失败，请手动选择链接', ok ? 'ok' : 'err');
+      return;
+    }
+    const r = ev.target.closest('button[data-rec]');
+    if (r) openInviteRecords(r.dataset.rec);
+  });
+  $('invFilter').onchange = renderInvites;
+  $('btnInvitesReload').onclick = () => { invitesData = null; loadInvites(); };
   $('btnInviteClose').onclick = () => $('inviteVeil').classList.remove('on');
   $('inviteWho').onchange = () => {
     inviteUID = $('inviteWho').value;

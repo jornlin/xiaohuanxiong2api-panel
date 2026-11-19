@@ -64,6 +64,9 @@ type Data struct {
 	// 才能在面板里认出是哪个号；补全后随账号文件一起落盘。
 	Phone      string `json:"phone,omitempty"`
 	NationCode string `json:"nation_code,omitempty"`
+	// InvitedBy 注册时绑定的邀请码（user_info 的 registration_attribution.invite_code）。
+	// 只有注册那一刻有效，之后没有补绑接口；空 = 该号注册时未绑定邀请。
+	InvitedBy string `json:"invited_by,omitempty"`
 	// MachineID 是小浣熊没有的东西（设备指纹是 Qoder 的），保留字段只为让基线池代码
 	// 的「换指纹」路径有个稳定落点，恒空。
 	MachineID string `json:"machine_id,omitempty"`
@@ -201,6 +204,20 @@ func (a *Auth) SetPhone(phone, nation string) {
 	a.mu.Unlock()
 }
 
+// InvitedByValue 返回注册时绑定的邀请码（空 = 未绑定）。
+func (a *Auth) InvitedByValue() string {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.InvitedBy
+}
+
+// SetInvitedBy 写入注册归因的邀请码（调用方负责 SaveAtomic 落盘）。
+func (a *Auth) SetInvitedBy(code string) {
+	a.mu.Lock()
+	a.InvitedBy = code
+	a.mu.Unlock()
+}
+
 // DesktopGrantDone 是否已经不必再问桌面端礼包：
 // 真的领到过（Granted）或今天已经问过（At==今天）。
 // 「今天问过但没领到」只是限频，不代表终态——手动签到会 ResetGrantMarks 后重问。
@@ -322,6 +339,7 @@ func (a *Auth) snapshotLocked() Data {
 		Email:          a.Email,
 		Phone:          a.Phone,
 		NationCode:     a.NationCode,
+		InvitedBy:      a.InvitedBy,
 		MachineID:      a.MachineID,
 		Credit:         a.Credit,
 		CreditAt:       a.CreditAt,

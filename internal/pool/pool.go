@@ -65,6 +65,8 @@ type Status struct {
 	// /auth/v1/user_info 补全；面板靠它认出「随机昵称 + 7 位 uid」是谁）。
 	Phone      string `json:"phone,omitempty"`
 	NationCode string `json:"nation_code,omitempty"`
+	// InvitedBy 注册时绑定的邀请码（空 = 未绑定；注册后不可补绑）。
+	InvitedBy string `json:"invited_by,omitempty"`
 	// CreditsTotal 上游给的积分总额（各包 credits_limit 之和），只作分母：
 	// 「积分」列显示 剩余/总额。0 表示还没查到过，界面只显示剩余。
 	CreditsTotal int64 `json:"credits_total,omitempty"`
@@ -1016,9 +1018,10 @@ func (p *Pool) List() []Status {
 
 func (p *Pool) statusOf(uid string, e *entry) Status {
 	now := time.Now()
-	phone, nation := "", ""
+	phone, nation, invited := "", "", ""
 	if e.a != nil {
 		phone, nation = e.a.PhoneValue()
+		invited = e.a.InvitedByValue()
 	}
 	return Status{
 		UID:           uid,
@@ -1028,6 +1031,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		CreditsKnown:  e.creditsKnown,
 		Phone:         phone,
 		NationCode:    nation,
+		InvitedBy:     invited,
 		CreditsTotal:  e.creditsTotal,
 		Expire:        e.expire,
 		ExpireCredits: e.expireCredits,
