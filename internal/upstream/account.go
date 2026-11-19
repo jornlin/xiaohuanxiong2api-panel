@@ -299,7 +299,11 @@ func (c *Client) UserEntUsageDetailWithExpiry(a *auth.Auth) (EntUsage, error) {
 	// 只有这里补到期：UserEntUsageDetail 保持「一次余额请求」的廉价口径，
 	// 签到前的紧迫度探询、面板刷新等调用点自己决定要不要多花一次流水请求。
 	expire, points := c.earliestBatchExpiry(a)
-	usage.Expire, usage.ExpirePoints = expire, points
+	// v1 流水 403 时这里恒 0：**不能覆盖** UserEntUsageDetail 已经用 v2 流水
+	// （QuotaBuckets）算好的到期时刻，否则「到期」列又被抹空。
+	if expire > 0 {
+		usage.Expire, usage.ExpirePoints = expire, points
+	}
 	return usage, nil
 }
 
