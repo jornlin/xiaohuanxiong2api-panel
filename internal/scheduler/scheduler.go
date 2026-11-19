@@ -694,7 +694,10 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 		// 余额接口失败（v1 /points/v1/balance 已对 Bearer 收紧）不该推翻本轮签到结果：
 		// grant 与流水判定都已经完成，余额只是附加快照，下一轮刷新再补。
 		// 否则余额一 403，整池签到就全部报失败——2026-11-19 实测 32/32 个账号「失败」。
-		log.Printf("ent-usage %s: %v（余额快照跳过，不影响签到结果）", uid, err)
+		// 熔断窗口内不再逐号刷同一条 403 噪音（上游恢复后会自动再试）。
+		if !s.cfg.Upstream.QuotaBlocked() {
+			log.Printf("ent-usage %s: %v（余额快照跳过，不影响签到结果）", uid, err)
+		}
 		if checkinErr == nil {
 			s.cfg.Pool.ClearCheckinCooldown(uid)
 		}
