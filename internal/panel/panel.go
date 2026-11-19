@@ -322,6 +322,8 @@ func (p *Panel) writeOverview(w http.ResponseWriter, extra map[string]any) {
 		"disabled":      disabled,
 		"usage_hours":   usagePanelHours,
 		"accounts":      rows,
+		// 余额接口（v1）403 熔断中：积分列显示的是最后一次成功快照，不是实时值。
+		"quota_blocked": p.cfg.Upstream != nil && p.cfg.Upstream.QuotaBlocked(),
 	}
 	for k, v := range hostInfo {
 		body[k] = v

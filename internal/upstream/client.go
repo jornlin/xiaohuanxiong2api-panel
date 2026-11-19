@@ -266,6 +266,13 @@ type Client struct {
 
 	flightMu sync.Mutex
 	flights  map[string]*refreshFlight
+
+	// 余额接口熔断：v1 /points/v1/balance 从 2026-11-19 下午起对 Bearer 令牌返回 403。
+	// 每轮签到/刷新都对 30+ 个号重打一次只会持续刺激上游风控，所以 403 后静默 30 分钟，
+	// 期间用最后一次成功快照（没有快照就如实报错）。
+	quotaMu           sync.Mutex
+	quotaBlockedUntil time.Time
+	quotaCache        map[string]EntUsage
 }
 
 // New 生产默认值：连接池共享，短请求 120s 兜底、长流只看首字节超时。
@@ -284,6 +291,7 @@ func New() *Client {
 		points:     PointsBase,
 		origin:     Origin,
 		flights:    map[string]*refreshFlight{},
+		quotaCache: map[string]EntUsage{},
 	}
 }
 

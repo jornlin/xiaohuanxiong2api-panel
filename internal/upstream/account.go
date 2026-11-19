@@ -83,10 +83,49 @@ func (c *Client) FetchQuota(a *auth.Auth) (map[string]any, error) {
 // FetchPlan 返回订阅节点：小浣熊没有订阅接口，交给同一个额度响应兜住。
 func (c *Client) FetchPlan(a *auth.Auth) (map[string]any, error) { return c.FetchQuota(a) }
 
+// quotaBlockDuration 余额接口 403 后的静默窗口。30 个号轮流重打只会让上游风控更久，
+// 期间用最后一次成功快照顶上。
+const quotaBlockDuration = 30 * time.Minute
+
+// QuotaBlocked 余额接口当前是否处于 403 熔断窗口（面板用来解释「积分不刷新」）。
+func (c *Client) QuotaBlocked() bool {
+	c.quotaMu.Lock()
+	defer c.quotaMu.Unlock()
+	return time.Now().Before(c.quotaBlockedUntil)
+}
+
 // UserEntUsageDetail 查一次积分余额并归一成 EntUsage。
+//
+// 余额接口是 v1（/points/v1/balance），2026-11-19 下午起对 Bearer 令牌返回 403
+// （客户端走带会话的请求所以不受影响）。403 时进入 30 分钟熔断并返回最后一次成功
+// 快照：余额只是展示字段，不能让它拖垮签到，也不该每轮对 30+ 个号持续重打。
 func (c *Client) UserEntUsageDetail(a *auth.Auth) (EntUsage, error) {
+	uid := ""
+	if a != nil {
+		uid = a.UID
+	}
+	c.quotaMu.Lock()
+	blocked := time.Now().Before(c.quotaBlockedUntil)
+	cached, hasCache := c.quotaCache[uid]
+	c.quotaMu.Unlock()
+	if blocked {
+		if hasCache {
+			return cached, nil
+		}
+		return EntUsage{}, &Error{Kind: ErrClient, Status: http.StatusForbidden,
+			Msg: "余额接口受限（上游临时 403，已暂停查询，稍后自动恢复）"}
+	}
 	data, err := c.FetchQuota(a)
 	if err != nil {
+		var ue *Error
+		if errors.As(err, &ue) && ue.Status == http.StatusForbidden {
+			c.quotaMu.Lock()
+			c.quotaBlockedUntil = time.Now().Add(quotaBlockDuration)
+			c.quotaMu.Unlock()
+			if hasCache {
+				return cached, nil
+			}
+		}
 		return EntUsage{}, err
 	}
 	usage := EntUsage{
@@ -101,6 +140,9 @@ func (c *Client) UserEntUsageDetail(a *auth.Auth) (EntUsage, error) {
 		return EntUsage{}, &Error{Kind: ErrServer, Status: 502, Msg: "小浣熊额度响应里没有 available_points"}
 	}
 	usage.Total = usage.Remain
+	c.quotaMu.Lock()
+	c.quotaCache[uid] = usage
+	c.quotaMu.Unlock()
 	return usage, nil
 }
 

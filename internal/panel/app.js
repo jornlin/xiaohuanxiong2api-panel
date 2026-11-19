@@ -432,9 +432,12 @@ async function loadOverview(quiet) {
     $('navState').textContent = d.healthy > 0 ? '服务正常' : (d.total ? '无可用账号' : '待添加账号');
     $('navPulse').className = 'pulse' + (d.healthy > 0 ? '' : (d.total ? ' warn' : ' bad'));
     // 空密钥 + 绑全接口 = 面板对全网开放（不是「本机免鉴权」），这里必须分开说。
-    $('accNote').textContent = d.auth_required
+    let accNote = d.auth_required
       ? '已启用密钥鉴权'
       : (d.auth_scope === 'open' ? '⚠ 免密钥访问（已绑全接口）' : '本机免鉴权');
+    // 余额接口 403 熔断中：积分列是最后一次成功快照，别让人误以为「分丢了」。
+    if (d.quota_blocked) accNote += ' · 余额接口受限，积分显示为最近快照';
+    $('accNote').textContent = accNote;
     // 网关基址现状（overview 的 agent_host_*）：上游换域名时这里是第一现场。
     $('agHostNote').textContent = d.agent_host_intl
       ? '推理 ' + d.agent_host_intl + ' · 鉴权 ' + (d.agent_host_cn || '—') + ' '
