@@ -378,16 +378,12 @@ func (s *Scheduler) entUsageOf(uid string, a *auth.Auth) (upstream.EntUsage, err
 	if err != nil {
 		return u, err
 	}
-	// v1 到期接口 403 时，用 v2 发放流水里 daily_grant 的 expire_at 补「到期」列：
-	// 每日批次自带到期时间，永久积分没有，正是面板要展示的那一项。
-	if u.Expire == 0 {
-		if exp, eerr := s.cfg.Upstream.EarliestDailyExpiry(a); eerr == nil && exp > 0 {
-			u.Expire = exp
-		}
-	}
+	// 到期时刻与每日/永久拆分已由 UserEntUsageDetail 一并算好：
+	// v1 有 earliestBatchExpiry；v1 403 时走 QuotaBuckets（v2 流水）补两桶与到期。
 	s.cfg.Pool.SetBalance(uid, pool.Balance{
 		Unit: u.Unit, Remain: u.Remain, Total: u.Total,
-		Daily: u.Daily, Monthly: u.Monthly, Reward: u.Reward, Topup: u.Topup,
+		Daily: u.Daily, DailyToday: u.DailyToday,
+		Monthly: u.Monthly, Reward: u.Reward, Topup: u.Topup,
 		UsedUSD: u.UsedUSD, LimitUSD: u.LimitUSD,
 	}, u.Expire)
 	s.cfg.Pool.SetExpireCredits(uid, u.ExpirePoints)

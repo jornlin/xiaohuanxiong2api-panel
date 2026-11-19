@@ -321,17 +321,33 @@ func (p *Panel) writeOverview(w http.ResponseWriter, extra map[string]any) {
 			scope = "open"
 		}
 	}
+	// 每日/永久积分汇总（顶部卡片）：每日已用 = 今日发放 - 当前每日剩余。
+	// 数据来自每号最近一次余额刷新（v1 或 setting_info+流水推算）；拿不到拆分的号不计入。
+	var dailyBal, dailyToday, permBal int64
+	for _, st := range list {
+		dailyBal += st.Daily
+		dailyToday += st.DailyToday
+		permBal += st.Monthly + st.Reward + st.Topup
+	}
+	dailyUsed := dailyToday - dailyBal
+	if dailyUsed < 0 {
+		dailyUsed = 0
+	}
 	body := map[string]any{
-		"version":       p.cfg.Version,
-		"uptime_sec":    int(time.Since(p.started).Seconds()),
-		"auth_required": p.key() != "",
-		"auth_scope":    scope,
-		"total":         len(list),
-		"healthy":       healthy,
-		"cooling":       cooling,
-		"disabled":      disabled,
-		"usage_hours":   usagePanelHours,
-		"accounts":      rows,
+		"version":             p.cfg.Version,
+		"uptime_sec":          int(time.Since(p.started).Seconds()),
+		"auth_required":       p.key() != "",
+		"auth_scope":          scope,
+		"total":               len(list),
+		"healthy":             healthy,
+		"cooling":             cooling,
+		"disabled":            disabled,
+		"usage_hours":         usagePanelHours,
+		"accounts":            rows,
+		"daily_balance":       dailyBal,
+		"daily_today_granted": dailyToday,
+		"daily_used_today":    dailyUsed,
+		"permanent_balance":   permBal,
 		// 余额接口（v1）403 熔断中：积分列显示的是最后一次成功快照，不是实时值。
 		"quota_blocked": p.cfg.Upstream != nil && p.cfg.Upstream.QuotaBlocked(),
 	}

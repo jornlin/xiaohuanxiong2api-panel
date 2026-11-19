@@ -37,9 +37,11 @@ type EntUsage struct {
 	// ExpirePoints 上面那个时刻会作废的积分额（只算每日批次，不含不会过期的奖励/充值）。
 	ExpirePoints int64 `json:"expire_points,omitempty"`
 	Daily        int64 `json:"daily,omitempty"`
-	Monthly      int64 `json:"monthly,omitempty"`
-	Reward       int64 `json:"reward,omitempty"`
-	Topup        int64 `json:"topup,omitempty"`
+	// DailyToday 今天发放的每日积分（顶部「今日已用每日额度」的基数）。
+	DailyToday int64 `json:"daily_today,omitempty"`
+	Monthly    int64 `json:"monthly,omitempty"`
+	Reward     int64 `json:"reward,omitempty"`
+	Topup      int64 `json:"topup,omitempty"`
 	// 面板/池子要的三件美元口径字段：小浣熊只有积分，恒 0 / 空。
 	Unit     string  `json:"unit,omitempty"`
 	UsedUSD  float64 `json:"used_usd,omitempty"`
@@ -168,6 +170,24 @@ func (c *Client) UserEntUsageDetail(a *auth.Auth) (EntUsage, error) {
 		if data, serr := c.OfficeSettingInfo(a); serr == nil {
 			if v := mustInt(data["available_points"]); v >= 0 {
 				usage := EntUsage{Unit: UnitCredit, Remain: v, Total: v}
+				// setting_info 只有总额：用 v2 发放流水按 FEFO 推算每日/永久两桶。
+				// 失败保持 0（未知），不猜——daily=0 时「每日优先」自然不生效。
+				if bk, berr := c.QuotaBuckets(a); berr == nil {
+					daily := bk.Daily
+					if perm := v - bk.Permanent; perm < daily {
+						daily = perm
+					}
+					if daily < 0 {
+						daily = 0
+					}
+					usage.Daily = daily
+					usage.DailyToday = bk.TodayGrant
+					usage.Reward = v - daily // 永久（月会员/奖励/充值合并口径）
+					if usage.Reward < 0 {
+						usage.Reward = 0
+					}
+					usage.Expire = bk.EarliestExpire
+				}
 				cache(usage)
 				return usage, nil
 			}
@@ -530,6 +550,58 @@ func (c *Client) EarliestDailyExpiry(a *auth.Auth) (int64, error) {
 		}
 	}
 	return earliest, nil
+}
+
+// QuotaBuckets 从 v2 发放流水推算「每日/限时」与「永久」两桶。
+//
+// 上游按失效先后（FEFO）扣减：先花未过期的 daily_grant，再花不过期的
+// reward/topup/invite 等。所以：
+//
+//	每日剩余 = min(未过期每日发放合计, max(0, available - 永久发放合计))
+//	永久剩余 = available - 每日剩余
+//
+// 不需要 v1 balance（它 403）；income 通常只有几十条，10 页上限足够。
+type QuotaBuckets struct {
+	Daily          int64 // 未过期 daily_grant 发放合计
+	Permanent      int64 // 不过期的 reward/topup/invite 等发放合计
+	TodayGrant     int64 // 今天发放的 daily_grant 合计
+	EarliestExpire int64 // 最早未过期每日批次的到期时刻（Unix 秒）
+}
+
+// QuotaBuckets 拉发放流水并汇总两桶（只读，一次 1-10 个请求）。
+func (c *Client) QuotaBuckets(a *auth.Auth) (QuotaBuckets, error) {
+	items, err := c.IncomeBills(a, 10)
+	if err != nil {
+		return QuotaBuckets{}, err
+	}
+	now := time.Now()
+	today := now.In(shanghaiTZ).Format("2006-01-02")
+	var b QuotaBuckets
+	for _, it := range items {
+		if it.Points <= 0 {
+			continue
+		}
+		if it.BizType == "daily_grant" {
+			if it.ExpireAt == "" {
+				continue
+			}
+			t, ok := parseBillTime(it.ExpireAt)
+			if !ok || !t.After(now) {
+				continue
+			}
+			b.Daily += it.Points
+			if b.EarliestExpire == 0 || t.Unix() < b.EarliestExpire {
+				b.EarliestExpire = t.Unix()
+			}
+			if at, ok := parseBillTime(it.CreatedAt); ok &&
+				at.In(shanghaiTZ).Format("2006-01-02") == today {
+				b.TodayGrant += it.Points
+			}
+		} else {
+			b.Permanent += it.Points
+		}
+	}
+	return b, nil
 }
 
 // IncomeBills 拉 v2 发放流水（type=income，cursor 分页），最多 pages 页。

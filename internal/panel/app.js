@@ -637,6 +637,12 @@ async function loadOverview(quiet) {
     const cSum = list.reduce((s, a) => s + (isUSD(a) ? 0 : (a.credits || 0)), 0);
     const cTot = list.reduce((s, a) => s + (isUSD(a) ? 0 : (a.credits_total || 0)), 0);
     $('sCredits').textContent = cSum + (cTot ? '/' + cTot : '');
+    // 每日/永久两桶（v1 或 setting_info+流水推算）：顶部直接看「还能花多少每日额度」。
+    $('sDaily').textContent = fmtNum(d.daily_balance || 0);
+    $('sDaily').title = '今日已发 ' + fmtNum(d.daily_today_granted || 0) +
+      ' · 今日已用 ' + fmtNum(d.daily_used_today || 0);
+    $('sDailyUsed').textContent = fmtNum(d.daily_used_today || 0);
+    $('sPermanent').textContent = fmtNum(d.permanent_balance || 0);
     // 国际版额度是美元，单独一张卡，不并进「积分合计」——两个口径不可换算，
     // 相加只会得到一个既不是积分也不是美元的假数。没有美元账号就整卡隐藏。
     const usdAccounts = list.filter(isUSD);

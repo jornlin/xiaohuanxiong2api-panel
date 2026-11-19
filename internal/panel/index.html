@@ -744,6 +744,9 @@ th.sorted[data-dir="desc"]::after { content: " ▼"; font-size: 10px; }
         <div class="stat warn"><div class="v" id="sCooling">-</div><div class="k">冷却中</div></div>
         <div class="stat bad"><div class="v" id="sDisabled">-</div><div class="k">已禁用</div></div>
         <div class="stat"><div class="v" id="sCredits">-</div><div class="k">积分合计</div></div>
+        <div class="stat" title="每日赠送/限时积分剩余；今日已发与已用见悬停提示"><div class="v" id="sDaily">-</div><div class="k">每日赠送余额</div></div>
+        <div class="stat"><div class="v" id="sDailyUsed">-</div><div class="k">今日已用每日</div></div>
+        <div class="stat"><div class="v" id="sPermanent">-</div><div class="k">永久积分</div></div>
         <!-- 国际版不是「无限免费」：Free plan 走美元计量（实测 basic_usage_limit=1 即 $1 额度）。
              单列一张卡，不把美元并进「积分合计」——两种单位不可换算。无美元账号时整卡隐藏。
              小浣熊暂无国际版，此卡先注释；出现国际账号时取消注释即可（app.js 已做 null 保护）。
