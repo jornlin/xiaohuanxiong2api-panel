@@ -45,12 +45,10 @@ type Auth struct {
 	Data
 	mu       sync.RWMutex
 	FilePath string `json:"-"`
-	// desktopGranted / mobileGranted 是两笔一次性新手礼包（各 3000 分）是否已经
-	// **问过上游**（不问 granted 真假：上游对领过的号回 granted=false，那同样是
-	// 「已结算」）。**进程内记忆、不落盘**：上游对同一账号幂等，重启后多打一次只是
-	// 白读一次；为它改账号文件格式不值得。
-	desktopGranted bool
-	mobileGranted  bool
+	// 一次性新手礼包的「上次问询日期」放在 Data 里持久化（DesktopGrantAt /
+	// MobileGrantAt）。原来的进程内标记在每次重启后清零——36 个号 × 每次重启
+	// 一轮 grant，短时间几十上百次重复请求正是上游网关风控（X-TT-System-Error: 3）
+	// 的来源。按**日期**落盘：同一天不重复问，次日允许再试，不会永久锁死。
 }
 
 // Data 是可序列化字段（不含锁与路径，避免拷锁）。
@@ -69,6 +67,11 @@ type Data struct {
 	Credit    int64  `json:"credit"`
 	CreditAt  string `json:"credit_at,omitempty"`
 	CheckedIn string `json:"checked_in,omitempty"`
+
+	// 一次性新手礼包上次问询的日期（YYYY-MM-DD）。见 Auth 结构体上的说明：
+	// 落盘是为了重启后同一天不重复打上游。
+	DesktopGrantAt string `json:"desktop_grant_at,omitempty"`
+	MobileGrantAt  string `json:"mobile_grant_at,omitempty"`
 }
 
 // Lock / Unlock / RLock / RUnlock 供其他包在改写字段期间加锁。
@@ -171,31 +174,38 @@ func (a *Auth) CheckedInToday() bool {
 	return a.CheckedIn == time.Now().Format("2006-01-02")
 }
 
-// DesktopGrantDone 桌面端礼包是否已经问过上游（见 Auth.desktopGranted 的口径）。
+// grantToday 返回东八区今天的日期串（与 CheckedIn 同口径）。
+func grantToday() string {
+	return time.Now().Format("2006-01-02")
+}
+
+// DesktopGrantDone 今天是否已经问过桌面端礼包。
+// 按日期而非永久标记：同一天不重复打上游，次日允许再试。
 func (a *Auth) DesktopGrantDone() bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.desktopGranted
+	return a.DesktopGrantAt == grantToday()
 }
 
-// MarkDesktopGrantDone 记一次桌面端礼包已结算（无论 granted 真假）。
+// MarkDesktopGrantDone 记下「今天问过了」。调用方负责 SaveAtomic 落盘，
+// 否则重启后同一天还会再打一轮（这正是风控的来源）。
 func (a *Auth) MarkDesktopGrantDone() {
 	a.mu.Lock()
-	a.desktopGranted = true
+	a.DesktopGrantAt = grantToday()
 	a.mu.Unlock()
 }
 
-// MobileGrantDone 手机端首登奖励是否已结算（见 Auth.mobileGranted 的口径）。
+// MobileGrantDone 今天是否已经问过手机端首登奖励。
 func (a *Auth) MobileGrantDone() bool {
 	a.mu.RLock()
 	defer a.mu.RUnlock()
-	return a.mobileGranted
+	return a.MobileGrantAt == grantToday()
 }
 
-// MarkMobileGrantDone 记一次手机端首登奖励已结算（无论 granted 真假）。
+// MarkMobileGrantDone 记下「今天问过了」，同样由调用方落盘。
 func (a *Auth) MarkMobileGrantDone() {
 	a.mu.Lock()
-	a.mobileGranted = true
+	a.MobileGrantAt = grantToday()
 	a.mu.Unlock()
 }
 
@@ -203,8 +213,8 @@ func (a *Auth) MarkMobileGrantDone() {
 // 给用户手动点「领新手礼包」用：进程内标记只是省一次幂等请求，不该拦下显式点击。
 func (a *Auth) ResetGrantMarks() {
 	a.mu.Lock()
-	a.desktopGranted = false
-	a.mobileGranted = false
+	a.DesktopGrantAt = ""
+	a.MobileGrantAt = ""
 	a.mu.Unlock()
 }
 

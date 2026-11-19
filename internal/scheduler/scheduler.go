@@ -610,10 +610,21 @@ func (s *Scheduler) CheckinUID(uid string) (CheckinResult, error) {
 		// 桌面端那笔礼包就是被这次"每日登录领取"顺带领掉的：把结果留好，
 		// 否则面板只会看到移动端那笔，看着像漏领。
 		// granted=true 且 popup.source=daily 时，上游就是把当天/欠发的每日积分补上了。
-		desktopGrant, claimErr = s.claimWithRetry(a)
-		desktopTried = true
-		if claimErr == nil && desktopGrant != nil {
-			log.Printf("checkin claim %s: granted=%v", uid, desktopGrant.Granted)
+		//
+		// 每个号每天最多问一次：这个端点是网关风控最敏感的一条（一天几十上百次
+		// 重复请求会换来 X-TT-System-Error: 3 的 403）。日期标记落盘，重启也不会重问。
+		if !a.DesktopGrantDone() {
+			desktopGrant, claimErr = s.claimWithRetry(a)
+			desktopTried = true
+			if claimErr == nil {
+				a.MarkDesktopGrantDone()
+				if serr := a.SaveAtomic(); serr != nil {
+					log.Printf("checkin claim %s: 问询标记落盘失败: %v", uid, serr)
+				}
+			}
+			if claimErr == nil && desktopGrant != nil {
+				log.Printf("checkin claim %s: granted=%v", uid, desktopGrant.Granted)
+			}
 		}
 		switch {
 		case claimErr == nil:
@@ -809,6 +820,10 @@ func (s *Scheduler) claimNewcomerGrants(a *auth.Auth, force, skipDesktop bool) [
 			out = append(out, NewcomerGrant{Key: "desktop_login", Error: err.Error()})
 		default:
 			a.MarkDesktopGrantDone()
+			// 落盘：否则重启后同一天还会对所有号再打一轮（风控来源）。
+			if serr := a.SaveAtomic(); serr != nil {
+				log.Printf("desktop-grant %s: 问询标记落盘失败: %v", a.UID, serr)
+			}
 			log.Printf("desktop-grant %s: granted=%v", a.UID, granted)
 			out = append(out, NewcomerGrant{Key: "desktop_login", Granted: granted})
 		}
@@ -821,6 +836,9 @@ func (s *Scheduler) claimNewcomerGrants(a *auth.Auth, force, skipDesktop bool) [
 			out = append(out, NewcomerGrant{Key: "mobile_login", Error: err.Error()})
 		default:
 			a.MarkMobileGrantDone()
+			if serr := a.SaveAtomic(); serr != nil {
+				log.Printf("mobile-grant %s: 问询标记落盘失败: %v", a.UID, serr)
+			}
 			log.Printf("mobile-grant %s: granted=%v", a.UID, granted)
 			out = append(out, NewcomerGrant{Key: "mobile_login", Granted: granted})
 		}
