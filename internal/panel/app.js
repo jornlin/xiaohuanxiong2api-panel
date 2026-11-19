@@ -1813,6 +1813,13 @@ async function loadSmsInvites() {
       '<option value="' + esc(r.code) + '"' + (r.code === pick.code ? ' selected' : '') + '>' +
       esc(r.nickname || r.uid) + ' · 已邀 ' + (r.registered_invitees || 0) + ' 人 · ' +
       esc(r.code.slice(0, 8)) + '… · 每邀 +' + (r.register_reward_points || 0) + '</option>').join('');
+    // 上游下发活动/规则提示时（marketing_text）在邀请区显示一行；没有活动就隐藏。
+    const mt = rows.map(r => (r.marketing_text || '').trim()).find(Boolean) || '';
+    const mtEl = $('smsInviteMarketing');
+    if (mtEl) {
+      mtEl.hidden = !mt;
+      mtEl.textContent = mt ? '官方活动：' + mt : '';
+    }
     syncInviteUrl();
   } catch (e) {
     sel.innerHTML = '<option value="">（拉取失败：' + esc(e.message) + '）</option>';
@@ -1825,6 +1832,105 @@ function syncInviteUrl() {
   $('smsInviteUrl').value = code
     ? 'https://xiaohuanxiong.com/register?lang=zh&invite_code=' + encodeURIComponent(code)
     : '';
+}
+
+/* ── 邀请记录（只读）──────────────────────────────────────────────── */
+// 数据来自官网「赚取积分」页同款端点 /points/v1/invite-records（20 条/页）。
+// 阶段 key 与官网一致：register / desktop_login / active_7d / first_payment
+// （没有 mobile_login —— 移动端礼包只发新用户，不进邀请人奖励）。
+let inviteUID = '';
+let inviteOffset = 0;
+let inviteTotal = 0;
+
+const INVITE_STAGES = [
+  ['register', '注册'],
+  ['desktop_login', '桌面'],
+  ['active_7d', '活跃7天'],
+  ['first_payment', '首付'],
+];
+
+function inviteStageTags(stages) {
+  const st = stages || {};
+  return INVITE_STAGES.map(([key, label]) => {
+    const s = (st[key] || {}).status || '';
+    if (s === 'completed') return tag('ok', label, label + '：已完成');
+    if (s === 'risk_revoked') return tag('bad', label, label + '：风控撤销');
+    if (s === 'not_eligible') return tag('mute', label, label + '：无资格');
+    return tag('mute', label, label + '：未完成');
+  }).join(' ');
+}
+
+function inviteDate(s) {
+  // 上游给 ISO 时间（带时区）；列表只显示上海时区日期，与官网一致。
+  const d = new Date(s);
+  if (!s || Number.isNaN(d.getTime())) return '—';
+  return d.toLocaleDateString('zh-CN', { timeZone: 'Asia/Shanghai' });
+}
+
+async function openInviteRecords() {
+  $('inviteVeil').classList.add('on');
+  const sel = $('inviteWho');
+  sel.innerHTML = '<option value="">加载中…</option>';
+  $('inviteBody').innerHTML = '<tr><td colspan="6"><div class="empty">加载中…</div></td></tr>';
+  try {
+    const d = await api('invites');
+    const rows = (d.accounts || []).filter(r => r.code);
+    if (!rows.length) {
+      sel.innerHTML = '<option value="">（池里没有可用邀请码）</option>';
+      $('inviteBody').innerHTML = '<tr><td colspan="6"><div class="empty">池里没有可用邀请码：先把邀请人账号加进来</div></td></tr>';
+      return;
+    }
+    // 默认沿用上次选中的账号；没有就取第一个。
+    const keep = inviteUID;
+    sel.innerHTML = rows.map(r =>
+      '<option value="' + esc(r.uid) + '">' + esc(r.nickname || r.uid) +
+      ' · 已邀 ' + (r.registered_invitees || 0) + ' 人</option>').join('');
+    inviteUID = rows.some(r => r.uid === keep) ? keep : rows[0].uid;
+    sel.value = inviteUID;
+    inviteOffset = 0;
+    await loadInviteRecords();
+  } catch (e) {
+    sel.innerHTML = '<option value="">（拉取失败）</option>';
+    $('inviteBody').innerHTML = '<tr><td colspan="6"><div class="empty">' + esc(e.message) + '</div></td></tr>';
+  }
+}
+
+async function loadInviteRecords() {
+  if (!inviteUID) return;
+  $('inviteBody').innerHTML = '<tr><td colspan="6"><div class="empty">加载中…</div></td></tr>';
+  try {
+    const d = await api('invite_records?uid=' + encodeURIComponent(inviteUID) + '&offset=' + inviteOffset);
+    const items = d.items || [];
+    inviteTotal = (d.paging && d.paging.total) || 0;
+    if (!items.length) {
+      $('inviteBody').innerHTML = '<tr><td colspan="6"><div class="empty"><div class="big">还没有邀请记录</div>' +
+        '好友通过你的邀请链接注册后会出现在这里（任务完成后积分由系统自动发放）</div></td></tr>';
+    } else {
+      $('inviteBody').innerHTML = items.map(it => {
+        const eligible = it.inviter_reward_eligible
+          ? tag('ok', '计入名额', '在 20 位奖励名额内')
+          : tag('mute', '超出名额', '仍可建立邀请关系，但不再给邀请人发奖励');
+        return '<tr>' +
+          '<td>' + esc(it.masked_user || '—') + '</td>' +
+          '<td>' + esc(inviteDate(it.registered_at)) + '</td>' +
+          '<td class="num">' + (it.active_days || 0) + '/3</td>' +
+          '<td class="efs">' + inviteStageTags(it.stages) + '</td>' +
+          '<td class="num">' + fmtNum(it.granted_points || 0) + '</td>' +
+          '<td>' + eligible + '</td>' +
+          '</tr>';
+      }).join('');
+    }
+    const from = inviteTotal ? inviteOffset + 1 : 0;
+    const to = Math.min(inviteOffset + 20, inviteTotal);
+    $('invitePage').textContent = inviteTotal
+      ? ('第 ' + from + '–' + to + ' 条 / 共 ' + inviteTotal + ' 条')
+      : '共 0 条';
+    $('btnInvitePrev').disabled = inviteOffset <= 0;
+    $('btnInviteNext').disabled = inviteOffset + 20 >= inviteTotal;
+  } catch (e) {
+    $('inviteBody').innerHTML = '<tr><td colspan="6"><div class="empty">' + esc(e.message) + '</div></td></tr>';
+    $('invitePage').textContent = '';
+  }
 }
 
 // sendSmsCode 发验证码：成功后按上游惯例倒计时 60 秒，避免连点触发风控。
@@ -2330,6 +2436,21 @@ function grantsMsg(gs) {
     } catch (e) { toast(e.message, 'err'); }
     finally { b.disabled = false; await loadOverview(true); if (note) $('accNote').textContent = note; }
   };
+  // 邀请记录（只读）：选邀请人账号 → 按 20 条/页翻页。
+  $('btnInviteRecords').onclick = openInviteRecords;
+  $('btnInviteClose').onclick = () => $('inviteVeil').classList.remove('on');
+  $('inviteWho').onchange = () => {
+    inviteUID = $('inviteWho').value;
+    inviteOffset = 0;
+    loadInviteRecords();
+  };
+  $('btnInvitePrev').onclick = () => {
+    if (inviteOffset >= 20) { inviteOffset -= 20; loadInviteRecords(); }
+  };
+  $('btnInviteNext').onclick = () => {
+    if (inviteOffset + 20 < inviteTotal) { inviteOffset += 20; loadInviteRecords(); }
+  };
+  $('btnInviteRefresh').onclick = loadInviteRecords;
   $('accBody').addEventListener('click', async ev => {
     const b = ev.target.closest('button[data-a]');
     if (!b) return;

@@ -51,6 +51,19 @@ func newTestPanel(t *testing.T) (*Panel, *upstream.Client, *pool.Pool) {
 		case "/login_with_authorization_code":
 			_, _ = io.WriteString(w, `{"code":0,"data":{"access_token":"code-access","user_id":"u-9",
 				"refresh_token":"code-refresh","office_org_name":"测试企业"}}`)
+		case "/invite-records":
+			if q := r.URL.Query(); q.Get("paging.limit") != "20" {
+				t.Errorf("邀请记录必须 20 条/页：%q", q.Get("paging.limit"))
+			}
+			_, _ = io.WriteString(w, `{"code":0,"data":{"items":[
+				{"type":"invitee","key":"r1","status":"completed","masked_user":"138****1234",
+				 "registered_at":"2026-11-01T10:00:00+08:00","active_days":3,
+				 "stages":{"register":{"status":"completed","points":3000},
+				           "desktop_login":{"status":"completed","points":3000},
+				           "active_7d":{"status":"unfinished"},
+				           "first_payment":{"status":"unfinished"}},
+				 "granted_points":1500,"inviter_reward_eligible":true}],
+				"paging":{"offset":0,"limit":20,"total":1}}}`)
 		default:
 			http.NotFound(w, r)
 		}
@@ -459,6 +472,38 @@ func TestLoginCodeDuplicateSubmit(t *testing.T) {
 	code, res = call(t, pn, http.MethodPost, "/panel/api/login/code", `{"url":`+strconv.Quote(pasted)+`}`)
 	if code != http.StatusOK || res["action"] != "imported" || res["uid"] != "u-9" || res["duplicate"] != true {
 		t.Errorf("会话完成后重复提交应幂等回报账号，得到 %d %v", code, res)
+	}
+}
+
+// TestInviteRecordsEndpoint 邀请记录只读接口：uid 必填、账号不存在 404、正常返回一页。
+func TestInviteRecordsEndpoint(t *testing.T) {
+	pn, _, _ := newTestPanel(t)
+
+	if code, _ := call(t, pn, http.MethodGet, "/panel/api/invite_records", ""); code != http.StatusBadRequest {
+		t.Errorf("缺 uid 应 400，得到 %d", code)
+	}
+	if code, _ := call(t, pn, http.MethodGet, "/panel/api/invite_records?uid=nope", ""); code != http.StatusNotFound {
+		t.Errorf("账号不存在应 404，得到 %d", code)
+	}
+
+	code, res := call(t, pn, http.MethodGet, "/panel/api/invite_records?uid=u-1", "")
+	if code != http.StatusOK || res["uid"] != "u-1" {
+		t.Fatalf("邀请记录 = %d %v", code, res)
+	}
+	items, _ := res["items"].([]any)
+	if len(items) != 1 {
+		t.Fatalf("记录条数 = %d，期望 1", len(items))
+	}
+	rec, _ := items[0].(map[string]any)
+	if rec["masked_user"] != "138****1234" || rec["granted_points"].(float64) != 1500 {
+		t.Errorf("记录字段 = %v", rec)
+	}
+	if rec["inviter_reward_eligible"] != true {
+		t.Errorf("奖励资格 = %v", rec["inviter_reward_eligible"])
+	}
+	pg, _ := res["paging"].(map[string]any)
+	if pg["total"].(float64) != 1 || pg["limit"].(float64) != 20 {
+		t.Errorf("分页 = %v", pg)
 	}
 }
 

@@ -1,6 +1,8 @@
 package upstream
 
 import (
+	"encoding/json"
+	"fmt"
 	"net/http"
 
 	"github.com/misakano7545/xiaohuanxiong2api-panel/internal/auth"
@@ -40,6 +42,9 @@ type InviteStatus struct {
 	GrantedPoints           int64  `json:"granted_points"`
 	RemainingRewardInvitees int64  `json:"remaining_reward_invitees"`
 	RegisterRewardPoints    int64  `json:"register_reward_points"`
+	// MarketingText 是上游下发的运营文案（活动/规则变更提示），没有活动时为空串。
+	// 前端只做展示，不参与任何判定。
+	MarketingText string `json:"marketing_text,omitempty"`
 }
 
 // TasksStatus 是一次任务状态查询的结果。
@@ -74,9 +79,132 @@ func (c *Client) Tasks(a *auth.Auth) (TasksStatus, error) {
 			GrantedPoints:           nonNegative(inv["granted_points"]),
 			RemainingRewardInvitees: nonNegative(inv["remaining_reward_invitees"]),
 			RegisterRewardPoints:    nonNegative(inv["register_reward_points"]),
+			MarketingText:           text(inv, "marketing_text"),
 		}
 	}
 	return out, nil
+}
+
+// InviteRecordsPath 是邀请记录分页端点（points 域，GET）。
+//
+// 官网「赚取积分」页的邀请记录列表就走这条：limit 被前端正则**固定为 20**
+// （见 events/tasks 页的请求守卫），所以这里也只按 20 翻页。
+const InviteRecordsPath = "/invite-records"
+
+// InviteRecordsLimit 是上游允许的单页条数。
+const InviteRecordsLimit = 20
+
+// InviteRecordStage 是一个被邀请好友在某项任务上的进度。
+// key 见 InviteStageKeys；status 实测 completed / risk_revoked / not_eligible，
+// 其余值前端按「未完成」展示，不透传未知值也不报错。
+type InviteRecordStage struct {
+	Status string `json:"status"`
+	Points int64  `json:"points,omitempty"`
+}
+
+// InviteStageKeys 是官网渲染的四个阶段（注意没有 mobile_login：移动端礼包不发邀请人奖励）。
+var InviteStageKeys = []string{"register", "desktop_login", "active_7d", "first_payment"}
+
+// InviteRecord 是一条邀请记录（一个被邀请好友）。
+//
+// 字段来自官网 /events/tasks 的列表渲染（2026-11-19 抓包核对）：
+// masked_user（脱敏用户标识）、registered_at（ISO 时间）、active_days（7 日活跃天数）、
+// stages（按任务 key 的进度）、granted_points（已发放给邀请人的积分）、
+// inviter_reward_eligible（是否计入邀请人奖励名额；超出 20 人上限为 false）。
+type InviteRecord struct {
+	Type                  string                       `json:"type"`
+	Key                   string                       `json:"key"`
+	Status                string                       `json:"status"`
+	MaskedUser            string                       `json:"masked_user"`
+	RegisteredAt          string                       `json:"registered_at"`
+	ActiveDays            int64                        `json:"active_days"`
+	Stages                map[string]InviteRecordStage `json:"stages,omitempty"`
+	GrantedPoints         int64                        `json:"granted_points"`
+	InviterRewardEligible bool                         `json:"inviter_reward_eligible"`
+}
+
+// InviteRecordsPaging 是分页信息，原样透传给面板前端。
+type InviteRecordsPaging struct {
+	Offset int64 `json:"offset"`
+	Limit  int64 `json:"limit"`
+	Total  int64 `json:"total"`
+}
+
+// InviteRecordsPage 是一页邀请记录。
+type InviteRecordsPage struct {
+	Items  []InviteRecord      `json:"items"`
+	Paging InviteRecordsPaging `json:"paging"`
+}
+
+// InviteRecords 拉一页邀请记录（只读，零额度消耗）。
+//
+// offset 必须是 InviteRecordsLimit 的整数倍（上游按 offset/limit 翻页）。
+func (c *Client) InviteRecords(a *auth.Auth, offset int) (InviteRecordsPage, error) {
+	if offset < 0 {
+		offset = 0
+	}
+	q := fmt.Sprintf("?paging.offset=%d&paging.limit=%d", offset, InviteRecordsLimit)
+	resp, err := c.doJSON(http.MethodGet, c.pointsBase()+InviteRecordsPath+q, nil, c.authHeader(a))
+	if err != nil {
+		return InviteRecordsPage{}, err
+	}
+	data, err := payloadOf(resp, "邀请记录查询")
+	if err != nil {
+		return InviteRecordsPage{}, err
+	}
+	out := InviteRecordsPage{Items: []InviteRecord{}}
+	if pg, ok := data["paging"].(map[string]any); ok {
+		out.Paging = InviteRecordsPaging{
+			Offset: nonNegative(pg["offset"]),
+			Limit:  nonNegative(pg["limit"]),
+			Total:  nonNegative(pg["total"]),
+		}
+	}
+	items, _ := data["items"].([]any)
+	for _, raw := range items {
+		obj, _ := raw.(map[string]any)
+		if obj == nil {
+			continue
+		}
+		rec := InviteRecord{
+			Type:                  text(obj, "type"),
+			Key:                   text(obj, "key"),
+			Status:                text(obj, "status"),
+			MaskedUser:            text(obj, "masked_user"),
+			RegisteredAt:          text(obj, "registered_at"),
+			ActiveDays:            nonNegative(obj["active_days"]),
+			GrantedPoints:         nonNegative(obj["granted_points"]),
+			InviterRewardEligible: boolOf(obj["inviter_reward_eligible"]),
+		}
+		if stages, ok := obj["stages"].(map[string]any); ok {
+			rec.Stages = map[string]InviteRecordStage{}
+			for key, sv := range stages {
+				so, _ := sv.(map[string]any)
+				rec.Stages[key] = InviteRecordStage{
+					Status: text(so, "status"),
+					Points: nonNegative(so["points"]),
+				}
+			}
+		}
+		out.Items = append(out.Items, rec)
+	}
+	return out, nil
+}
+
+// boolOf 宽容读一个布尔字段：上游有的接口用 true/false，有的用 "true"/1。
+func boolOf(v any) bool {
+	switch t := v.(type) {
+	case bool:
+		return t
+	case string:
+		return t == "true" || t == "1"
+	case float64:
+		return t != 0
+	case json.Number:
+		n, _ := t.Int64()
+		return n != 0
+	}
+	return false
 }
 
 // nonNegative 读一个展示用的计数：缺字段/非数字（mustInt 回 -1）一律当 0。

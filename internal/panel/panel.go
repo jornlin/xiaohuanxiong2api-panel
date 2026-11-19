@@ -140,6 +140,8 @@ func New(cfg Config) *Panel {
 	p.mux.HandleFunc("GET /panel/api/tasks", p.withAuth(p.tasksStatus))
 	// 池里各账号的邀请码：面板用它拼「带邀请码的注册链接」
 	p.mux.HandleFunc("GET /panel/api/invites", p.withAuth(p.invites))
+	// 邀请记录明细（只读，20 条/页）：官网「赚取积分」邀请列表同款端点
+	p.mux.HandleFunc("GET /panel/api/invite_records", p.withAuth(p.inviteRecords))
 	return p
 }
 

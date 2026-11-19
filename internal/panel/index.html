@@ -731,6 +731,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <button class="xs" id="btnCheckinState" title="只读查询各账号今天签了没（不领取、不吃额度）">签到状态</button>
           <button class="xs" id="btnGrants" title="领一次性新手礼包：桌面端 + 移动端各 3000 分。与签到无关（每日分是上游 00:00 自动发的），领过的号上游回「已领过」">领新手礼包</button>
           <button class="xs" id="btnTasks" title="只读查看新手任务领了几项、邀请码与邀请进度（零额度消耗）">新手任务</button>
+          <button class="xs" id="btnInviteRecords" title="只读查看每个被邀请好友的注册时间、任务进度与积分到账（官方「赚取积分」页同款数据）">邀请记录</button>
           <button class="xs" id="btnBalanceAll">全部刷新积分</button>
           <button class="xs" id="btnKeepalive" title="立刻对全账号刷新 token（不花积分）">全部保活</button>
           <button class="xs" id="btnImport" title="粘贴「登录回调链接」或「凭证 JSON」导入账号（与「添加账号」同一条换票/落盘管线）">导入凭证</button>
@@ -1143,6 +1144,42 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   </div>
 </div>
 
+<!-- 邀请记录：官网「赚取积分」页的邀请明细（只读）。数据来自
+     /points/v1/invite-records，20 条/页；字段与官网列表一致（脱敏好友、注册时间、
+     7 日活跃、四项任务进度、已发积分、是否计入邀请人奖励名额）。 -->
+<div class="veil" id="inviteVeil">
+  <div class="dlg" style="width:900px;max-width:96vw">
+    <header>
+      <h3>邀请记录</h3>
+      <span class="grow"></span>
+      <button id="btnInviteClose">关闭</button>
+    </header>
+    <div class="body">
+      <div class="grid2">
+        <label class="fld"><span class="lb">邀请人账号</span><select id="inviteWho"></select></label>
+        <label class="fld"><span class="lb">数据口径</span>
+          <span class="hint" id="inviteMeta">只读：与官网「赚取积分」页的邀请记录同源（20 条/页）</span></label>
+      </div>
+      <div class="tbl-wrap">
+        <table class="acc">
+          <thead><tr>
+            <th>好友</th><th>注册时间</th><th class="num">7 日活跃</th>
+            <th>任务进度</th><th class="num">已发积分</th><th>奖励资格</th>
+          </tr></thead>
+          <tbody id="inviteBody"></tbody>
+        </table>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;margin-top:10px">
+        <button class="xs" id="btnInvitePrev">上一页</button>
+        <span class="hint" id="invitePage"></span>
+        <button class="xs" id="btnInviteNext">下一页</button>
+        <span class="grow"></span>
+        <button class="xs" id="btnInviteRefresh">刷新</button>
+      </div>
+    </div>
+  </div>
+</div>
+
 <!-- 添加账号：两条路径（浏览器回跳 / refreshToken 直登）分 tab。原先两套输入挤在一屏，
      用户不知道该填哪个，底部还并排两个「加入」抢主次。 -->
 <div class="veil" id="addVeil">
@@ -1202,6 +1239,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
             <button class="xs" id="btnSmsCopyInvite">复制链接</button>
             <button class="xs" id="btnSmsOpenInvite">打开</button>
           </div>
+          <div class="state ok" id="smsInviteMarketing" hidden></div>
           <span class="hint"><b>流程：</b>① 复制上面这条链接 → ② 在<b>你自己的浏览器</b>里打开，输手机号点「发送验证码」
             （这一步必须人工：上游发码要过阿里云人机校验，服务端拿不到回执）→ ③ 回来填手机号 + 验证码登录。<br>
             链接里带 <code>invite_code</code>，注册时邀请会算到<b>这个码的主人</b>账上（1500 分/位）。

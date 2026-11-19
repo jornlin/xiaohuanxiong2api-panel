@@ -53,6 +53,84 @@ func TestTasksParsesRealPayload(t *testing.T) {
 		got.Invite.RemainingRewardInvitees != 20 {
 		t.Errorf("邀请信息解析错: %+v", got.Invite)
 	}
+	if got.Invite.MarketingText != "" {
+		t.Errorf("没有活动时 marketing_text 应为空: %q", got.Invite.MarketingText)
+	}
+}
+
+// TestTasksMarketingText 活动期上游会在 invite 里下发运营文案，要原样带出给面板展示。
+func TestTasksMarketingText(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, `{"code":0,"data":{
+			"invite":{"invite_code":"c1","marketing_text":"春节活动：邀请好友双倍积分",
+				"register_reward_points":1500,"registered_invitee_count":0,
+				"granted_points":0,"remaining_reward_invitees":20},
+			"new_user_task_states":[],"invitee_task_states":[]}}`)
+	}))
+	defer srv.Close()
+
+	up := New()
+	up.SetAPIHosts(srv.URL, srv.URL)
+	up.SetAgentHosts(srv.URL, srv.URL)
+
+	got, err := up.Tasks(&auth.Auth{Data: auth.Data{AccessToken: "dt", UID: "u-1"}})
+	if err != nil {
+		t.Fatalf("Tasks 出错: %v", err)
+	}
+	if got.Invite.MarketingText != "春节活动：邀请好友双倍积分" {
+		t.Errorf("marketing_text = %q", got.Invite.MarketingText)
+	}
+}
+
+// TestInviteRecordsParses 邀请记录：20 条/页的分页参数、四项阶段、奖励资格原样解析。
+func TestInviteRecordsParses(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/invite-records" {
+			http.NotFound(w, r)
+			return
+		}
+		if q := r.URL.Query(); q.Get("paging.offset") != "20" || q.Get("paging.limit") != "20" {
+			t.Errorf("分页参数 = %q/%q", q.Get("paging.offset"), q.Get("paging.limit"))
+		}
+		_, _ = io.WriteString(w, `{"code":0,"message":"success","data":{
+			"items":[
+				{"type":"invitee","key":"r1","status":"completed","masked_user":"138****1234",
+				 "registered_at":"2026-11-01T10:00:00+08:00","active_days":3,
+				 "stages":{"register":{"status":"completed","points":3000},
+				           "desktop_login":{"status":"completed","points":3000},
+				           "active_7d":{"status":"completed","points":1000},
+				           "first_payment":{"status":"unfinished"}},
+				 "granted_points":1500,"inviter_reward_eligible":true},
+				"不是对象"],
+			"paging":{"offset":20,"limit":20,"total":41}}}`)
+	}))
+	defer srv.Close()
+
+	up := New()
+	up.SetAPIHosts(srv.URL, srv.URL)
+	up.SetAgentHosts(srv.URL, srv.URL)
+
+	page, err := up.InviteRecords(&auth.Auth{Data: auth.Data{AccessToken: "dt", UID: "u-1"}}, 20)
+	if err != nil {
+		t.Fatalf("InviteRecords 出错: %v", err)
+	}
+	if len(page.Items) != 1 {
+		t.Fatalf("记录 %d 条，期望 1 条（非对象项丢弃）: %+v", len(page.Items), page.Items)
+	}
+	rec := page.Items[0]
+	if rec.MaskedUser != "138****1234" || rec.ActiveDays != 3 || rec.GrantedPoints != 1500 ||
+		!rec.InviterRewardEligible || rec.RegisteredAt == "" {
+		t.Errorf("记录字段解析错: %+v", rec)
+	}
+	if rec.Stages["register"].Status != "completed" || rec.Stages["register"].Points != 3000 {
+		t.Errorf("register 阶段 = %+v", rec.Stages["register"])
+	}
+	if rec.Stages["first_payment"].Status != "unfinished" {
+		t.Errorf("first_payment 阶段 = %+v", rec.Stages["first_payment"])
+	}
+	if page.Paging.Total != 41 || page.Paging.Offset != 20 || page.Paging.Limit != 20 {
+		t.Errorf("分页解析错: %+v", page.Paging)
+	}
 }
 
 // TestTasksNormalizes 缺 status 记 unfinished、无名项跳过、未知 key 不给分值。

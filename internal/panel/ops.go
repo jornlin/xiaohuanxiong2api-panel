@@ -234,7 +234,9 @@ func (p *Panel) invites(w http.ResponseWriter, r *http.Request) {
 		RegisteredInvitee int64  `json:"registered_invitees"`
 		GrantedPoints     int64  `json:"granted_points"`
 		RewardPerInvitee  int64  `json:"register_reward_points"`
-		Error             string `json:"error,omitempty"`
+		// MarketingText 上游下发的活动/规则提示（当前无活动时为空），邀请页原样展示。
+		MarketingText string `json:"marketing_text,omitempty"`
+		Error         string `json:"error,omitempty"`
 	}
 	out := []row{}
 	for _, st := range p.cfg.Pool.List() {
@@ -251,10 +253,54 @@ func (p *Panel) invites(w http.ResponseWriter, r *http.Request) {
 			rw.RegisteredInvitee = tasks.Invite.RegisteredInvitees
 			rw.GrantedPoints = tasks.Invite.GrantedPoints
 			rw.RewardPerInvitee = tasks.Invite.RegisterRewardPoints
+			rw.MarketingText = tasks.Invite.MarketingText
 		}
 		out = append(out, rw)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "accounts": out})
+}
+
+// inviteRecords 邀请记录（**只读**，零额度消耗）：GET /panel/api/invite_records?uid=&offset=
+//
+// 官网「赚取积分」页的邀请记录列表同款端点（/points/v1/invite-records，20 条/页）。
+// 面板只做展示：被邀请好友的脱敏标识、注册时间、7 日活跃天数、四项任务的到账进度、
+// 已发放给邀请人的积分、是否计入 20 人奖励名额。奖品归属与判定全在上游。
+func (p *Panel) inviteRecords(w http.ResponseWriter, r *http.Request) {
+	uid := strings.TrimSpace(r.URL.Query().Get("uid"))
+	if uid == "" {
+		writeErr(w, http.StatusBadRequest, "需要 uid（邀请人账号）")
+		return
+	}
+	offset := 0
+	if v := strings.TrimSpace(r.URL.Query().Get("offset")); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 0 {
+			writeErr(w, http.StatusBadRequest, "offset 不是合法数字")
+			return
+		}
+		offset = n
+	}
+	a := p.cfg.Pool.AuthByUID(uid)
+	if a == nil {
+		writeErr(w, http.StatusNotFound, "账号不存在: "+uid)
+		return
+	}
+	page, err := p.cfg.Upstream.InviteRecords(a, offset)
+	if err != nil {
+		writeErr(w, http.StatusBadGateway, publicErr(err))
+		return
+	}
+	nickname := ""
+	for _, st := range p.cfg.Pool.List() {
+		if st.UID == uid {
+			nickname = st.Nickname
+			break
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "uid": uid, "nickname": nickname,
+		"items": page.Items, "paging": page.Paging,
+	})
 }
 
 // tasksStatus 任务状态（**只读**，零额度消耗）：透传上游 /points/v1/tasks。
