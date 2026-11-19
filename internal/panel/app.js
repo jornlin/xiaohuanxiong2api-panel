@@ -402,6 +402,26 @@ function expCell(unix) {
   return s;
 }
 
+// expCellRich 账号池「到期」列（原「积分到期提醒」表并入）：
+// 第一行日期 + 相对天数标签，第二行「该日到期 X 分」（只算每日批次；奖励/充值不会过期）。
+// 数据全部来自 /overview 的账号快照，零额外上游请求。
+function expCellRich(a) {
+  a = a || {};
+  const unix = Number(a.expire || 0);
+  if (!unix) return '<span style="color:var(--ink-3)">—</span>';
+  const d = new Date(unix * 1000);
+  const days = Math.round((unix * 1000 - Date.now()) / 86400000);
+  const md = (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0');
+  const remain = Number(a.credits || 0);
+  const expiring = Math.min(Number(a.expire_credits || 0) || remain, remain);
+  let s = '<div class="num">' + md;
+  if (days < 0) s += ' ' + tag('bad', '已过期');
+  else if (days <= 3) s += ' ' + tag('warn', days === 0 ? '今天' : '剩 ' + days + ' 天');
+  s += '</div>';
+  if (expiring > 0) s += '<div class="id" title="该日会作废的每日批次积分（上游按失效先后扣减）">到期 ' + fmtNum(expiring) + ' 分</div>';
+  return s;
+}
+
 /* 用量列：与用量视图同源（近 usageHours 小时的台账汇总）。无调用记录时不显示假零——
    「0 次」会被读成「调过但失败了，这个号有问题」。 */
 function usageCell(u) {
@@ -480,6 +500,23 @@ const ACC_SORT = {
   last: a => a.last_success || '',
 };
 
+// 到期筛选：把原「积分到期提醒」表的用途收进账号池——按「7/30 天内到期」筛出该先看的号。
+function accExpFiltered(list) {
+  const f = $('accExpFilter') ? $('accExpFilter').value : 'all';
+  if (f === 'all') return list;
+  const now = Date.now();
+  return list.filter(a => {
+    const u = Number(a.expire || 0);
+    if (f === 'none') return !u;
+    if (!u) return false;
+    const days = Math.round((u * 1000 - now) / 86400000);
+    if (f === 'expired') return days < 0;
+    if (f === '7') return days >= 0 && days <= 7;
+    if (f === '30') return days >= 0 && days <= 30;
+    return true;
+  });
+}
+
 function renderAccounts(list) {
   const tb = $('accBody');
   if (!list.length) {
@@ -488,7 +525,13 @@ function renderAccounts(list) {
       '也可以切到 refreshToken 页粘贴一条凭证</div></td></tr>';
     return;
   }
-  const rows = sortApply('acc', list, ACC_SORT, 'credits', -1);
+  const filtered = accExpFiltered(list);
+  pgSig('acc', $('accExpFilter') ? $('accExpFilter').value : 'all');
+  if (!filtered.length) {
+    tb.innerHTML = '<tr><td colspan="11"><div class="empty">当前到期筛选没有匹配的账号</div></td></tr>';
+    return;
+  }
+  const rows = sortApply('acc', filtered, ACC_SORT, 'credits', -1);
   LAST.acc = rows;
   const page = pgApply('accBody', 'acc', rows);
   sortMark('accBody', 'acc');
@@ -530,7 +573,7 @@ function renderAccounts(list) {
       '<td class="who"><div class="nm">' + (a.realm !== 'cn' ? '<span class="tag mute">国际</span> ' : '') + esc(a.nickname || a.uid) + '</div><div class="id">' + (a.phone ? esc(a.phone) + ' · ' : '') + esc(a.uid) + '</div></td>' +
       '<td>' + st.join(' ') + '</td>' +
       '<td class="cred" title="' + esc(credTitle(a)) + '">' + credCell(a) + '</td>' +
-      '<td>' + expCell(a.expire) + '</td>' +
+      '<td>' + expCellRich(a) + '</td>' +
       '<td>' + expCell(a.token_expires_at) + '</td>' +
       '<td class="num">' + (a.err_count || 0) + '</td>' +
       '<td class="num" title="累计成功 / 失败（自记录起）">' + (a.success_count || 0) +
@@ -547,38 +590,33 @@ PG_RENDER.acc = () => renderAccounts((overviewData && overviewData.accounts) || 
 // 想用完得日均消耗多少」。数据只用 overview 已经带回来的 credits / expire，
 // 不额外打上游——这一步是纯本地汇总。
 // 美元计费账号（国际版，credits 恒 0）不入表：两个单位不可换算。
+// renderExpiry 积分到期汇总。明细已经并入账号池「到期」列（日期/剩余天数/该日到期积分），
+// 这里只报「临近到期的规模」，不再单独维护一张表。
 function renderExpiry(list) {
   const rows = [];
   for (const a of (list || [])) {
     if (isUSD(a)) continue;
     const remain = Number(a.credits || 0);
     const exp = Number(a.expire || 0);
-    // 「该日到期」只算会作废的那批（每日发放批次），不能用可用总额——奖励/充值积分
-    // 不会过期，混进来会得出「全都要没了」的假数。expire_credits 缺失才退回总额。
     const expiring = Number(a.expire_credits || 0) || remain;
     if (!exp || remain <= 0) continue;
-    // 四舍五入到「天」：向上取整会把 5 小时后到期的说成明天（和日期列矛盾），
-    // 纯向下又会把「整 3 天」说成 2 天；按最近的整天报最接近用户直觉。
     const days = Math.max(0, Math.round((exp * 1000 - Date.now()) / 86400000));
-    rows.push({ uid: a.uid, remain, exp, days, expiring: Math.min(expiring, remain) });
+    rows.push({ exp, days, expiring: Math.min(expiring, remain) });
   }
-  rows.sort((x, y) => x.exp - y.exp);
-  const tb = $('expBody');
-  if (!tb) return;
-  const page = pgApply('expBody', 'exp', rows);
-  tb.innerHTML = !rows.length
-    ? '<tr><td colspan="5"><div class="empty">暂无到期信息（积分流水里没有未过期的每日发放批次，或余额已为 0）</div></td></tr>'
-    : page.map(r => '<tr><td class="who"><div class="nm">' + esc(r.uid) + '</div></td>' +
-        '<td>' + new Date(r.exp * 1000).toLocaleDateString('zh-CN') + '</td>' +
-        '<td class="num">' + (r.days === 0 ? '今天' : r.days === 1 ? '明天' : r.days + ' 天') + '</td>' +
-        '<td class="num">' + fmtNum(r.expiring) + '</td>' +
-        '<td class="num">' + fmtNum(Math.ceil(r.expiring / Math.max(1, r.days))) + '</td></tr>').join('');
-  if ($('expNote')) {
-    const total = rows.reduce((s, r) => s + r.expiring, 0);
-    $('expNote').textContent = rows.length ? rows.length + ' 个账号 · 合计 ' + fmtNum(total) : '—';
-  }
+  const within7 = rows.filter(r => r.days <= 7);
+  const total7 = within7.reduce((s, r) => s + r.expiring, 0);
+  const totalAll = rows.reduce((s, r) => s + r.expiring, 0);
+  const el = $('expNote');
+  if (!el) return;
+  el.textContent = rows.length
+    ? (within7.length
+      ? within7.length + ' 个号 7 天内到期 ' + fmtNum(total7) + ' 分'
+      : '暂无 7 天内到期')
+    : '暂无到期信息';
+  el.title = rows.length
+    ? '全部到期批次合计 ' + fmtNum(totalAll) + ' 分（上游按失效先后 FEFO 扣减）'
+    : '积分流水里没有未过期的每日发放批次，或余额已为 0';
 }
-PG_RENDER.exp = () => renderExpiry((overviewData && overviewData.accounts) || []);
 
 async function loadOverview(quiet) {
   try {
@@ -2769,6 +2807,8 @@ function grantsMsg(gs) {
     } catch (e) { toast(e.message, 'err'); }
     finally { b.disabled = false; loadOverview(true); }
   };
+  // 账号池「到期」筛选：原积分到期提醒表的入口，筛完自动回第一页。
+  $('accExpFilter').onchange = () => renderAccounts((overviewData && overviewData.accounts) || []);
   // 邀请页：复制链接 / 查看邀请记录 / 筛选 / 刷新
   $('invBody').addEventListener('click', async ev => {
     const c = ev.target.closest('button[data-copy]');
