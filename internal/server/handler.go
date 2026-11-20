@@ -683,6 +683,11 @@ func (h *Handler) attempt(ctx context.Context, w http.ResponseWriter, acct *auth
 		h.noteFailure(acct.UID, kind, 0)
 		return false, &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 	}
+	// ChatStream 返回时首帧已经可用（SSE 会先 peek 一帧判错），这里记客户端感知的
+	// 首字延迟：从入站请求开始，包含选号、排队、限流闸门和之前的失败重试。
+	if tr != nil && tr.TTFBMs == 0 {
+		tr.TTFBMs = time.Since(tr.Start).Milliseconds()
+	}
 
 	if peek.Stream {
 		h.cfg.Pool.NoteSuccess(acct.UID)
@@ -827,10 +832,19 @@ func (h *Handler) noteUsage(uid, model string, started time.Time, ok bool, upstr
 	if tt, has := numField(upstreamUsage, "total_tokens"); has {
 		d.TotalTokens, d.HasTotal = tt, true
 	}
-	// 缓存命中：SOLO 的 token_usage 用 cache_read_input_tokens 报命中量。
-	// 上游没报这个键就是没有缓存信息（不是 0% 命中），HasCacheHit 保持 false。
-	if ch, has := numField(upstreamUsage, "cache_read_input_tokens"); has {
-		d.CacheHitTokens, d.HasCacheHit = ch, true
+	// 缓存命中：上游（小浣熊/OpenAI 方言）把命中量放在
+	// usage.prompt_tokens_details.cached_tokens；SOLO 的 token_usage 用
+	// cache_read_input_tokens。两种都认，先看嵌套字段。
+	// 上游没报就是没有缓存信息（不是 0% 命中），HasCacheHit 保持 false。
+	if details, ok := upstreamUsage["prompt_tokens_details"].(map[string]any); ok {
+		if ch, has := numField(details, "cached_tokens"); has {
+			d.CacheHitTokens, d.HasCacheHit = ch, true
+		}
+	}
+	if !d.HasCacheHit {
+		if ch, has := numField(upstreamUsage, "cache_read_input_tokens"); has {
+			d.CacheHitTokens, d.HasCacheHit = ch, true
+		}
 	}
 	// 请求记录（面板「运行日志」页的请求表）与用量台账吃同一个 Delta：token/积分/缓存命中
 	// 在这里一次性带上，避免两处各算一遍再对不上。失败尝试同样带 token（上游有时在错误

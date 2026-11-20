@@ -26,8 +26,17 @@ func TestExtractKey(t *testing.T) {
 	if b := ExtractKey([]byte(bodyB)); b == a1 {
 		t.Fatal("不同会话不该派生同键")
 	}
-	if got := ExtractKey([]byte(`{"user_id":"u","messages":[{"role":"user","content":"x"}]}`)); got != "" {
-		t.Fatalf("带 user 维度不该派生，got %q", got)
+	// 带 user 维度不再禁用粘性：user 纳入哈希，同一用户同一会话仍稳定，
+	// 不同用户/不同开场白不会共用账号。
+	u1 := ExtractKey([]byte(`{"user_id":"u1","messages":[{"role":"system","content":"S"},{"role":"user","content":"x"}]}`))
+	u1b := ExtractKey([]byte(`{"user_id":"u1","messages":[{"role":"system","content":"S"},{"role":"user","content":"x"}]}`))
+	u2 := ExtractKey([]byte(`{"user_id":"u2","messages":[{"role":"system","content":"S"},{"role":"user","content":"x"}]}`))
+	anth := ExtractKey([]byte(`{"user":"u1","messages":[{"role":"system","content":"S"},{"role":"user","content":"x"}]}`))
+	if u1 == "" || u1 != u1b {
+		t.Fatalf("带 user 的派生键应稳定: %q %q", u1, u1b)
+	}
+	if u1 == u2 || u1 != anth {
+		t.Fatalf("user 维度未纳入哈希: u1=%q u2=%q anth=%q", u1, u2, anth)
 	}
 	// 多轮追加历史后，键仍稳定（只看 system + 首条 user）。
 	multi := `{"model":"m","messages":[{"role":"system","content":"S"},{"role":"user","content":"第一条"},{"role":"assistant","content":"答"},{"role":"user","content":"追问"}]}`

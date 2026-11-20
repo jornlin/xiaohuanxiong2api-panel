@@ -885,10 +885,16 @@ func throttleSignal(raw string) bool {
 	return false
 }
 
-// minSendGap 是全局出站最小间隔：重启/客户端重连时几百个请求会同时涌进来，
+// 全局出站最小间隔：重启/客户端重连时几百个请求会同时涌进来，
 // 上游按频率直接 429（实测一次重启能让 130+ 个号同时被限流）。把出站切成
 // 最多 1 次/秒，尖峰被摊平，账号就不会成批冷却。
-const minSendGap = time.Second
+const (
+	// 正常情况 5 次/秒；最近 2 分钟吃过后端 429 才退到 1 次/秒。
+	// 固定 1s 会给每个请求平白加最多 1s 首字延迟（实测网关 TTFB 1.7~4.5s），
+	// 而 429 后的全局闸门已经负责真正的限速。
+	sendGapFast      = 200 * time.Millisecond
+	sendGapThrottled = time.Second
+)
 
 // maxSendSlotWait 是单个出站名额的最长排队时间：重启后 138 个请求同时到达时，
 // 严格按 1s 排队会让最后一个等 2 分多钟，超过客户端/代理超时。到 30s 就先放行
@@ -900,11 +906,15 @@ const maxSendSlotWait = 30 * time.Second
 func (c *Client) WaitSendSlot(ctx context.Context) {
 	c.throttleMu.Lock()
 	now := time.Now()
+	gap := sendGapFast
+	if !c.lastThrottle.IsZero() && time.Since(c.lastThrottle) < 2*time.Minute {
+		gap = sendGapThrottled
+	}
 	if c.nextSlot.Before(now) {
 		c.nextSlot = now
 	}
 	wait := c.nextSlot.Sub(now)
-	c.nextSlot = c.nextSlot.Add(minSendGap)
+	c.nextSlot = c.nextSlot.Add(gap)
 	c.throttleMu.Unlock()
 	if wait <= 0 {
 		return

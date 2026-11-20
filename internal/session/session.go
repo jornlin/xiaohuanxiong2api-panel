@@ -8,8 +8,9 @@
 //     conversationId、prompt_cache_key（OpenAI 系的前缀缓存键，语义就是"同一会话"）。
 //  2. 否则从内容派生：SHA-256(system 文本 + 首条 user 文本) 的前 16 字节。
 //     不用全部消息：多轮历史每轮追加，全量哈希每轮都变，粘性会完全失效。
-//  3. 带 user 维度标识（metadata.user_id / user_id）的请求**不派生**：user 粒度过粗，
-//     一个用户的所有并行对话会被钉到同一账号，还不如普通轮换。
+//  3. 带 user 维度标识（metadata.user_id / user_id）的请求把 user 一并纳入派生哈希：
+//     既保留「同一用户同一会话粘同一账号」的缓存收益，又不会让一个用户的所有并行
+//     对话（首条 user 文本不同）挤到同一个账号。
 //
 // 过期：TTL 到期即视为未绑定（Resolve 判定 + GC 清理），不做续期外的任何状态迁移。
 package session
@@ -191,29 +192,31 @@ func ExtractKey(body []byte) string {
 	if v := strOrEmpty(obj["prompt_cache_key"]); v != "" {
 		return v
 	}
-	if hasUserIDKey(obj) {
-		return ""
-	}
-	return deriveKey(obj)
+	return deriveKey(obj, userIDOf(obj))
 }
 
-// hasUserIDKey 报告请求是否带 user 维度标识（只用于派生回退闸）。
-func hasUserIDKey(obj map[string]any) bool {
+// userIDOf 取 user 维度标识（Anthropic metadata.user_id / OpenAI 顶层 user_id）。
+// 只作为派生哈希的一部分，不单独当会话键（user 粒度过粗）。
+func userIDOf(obj map[string]any) string {
 	if meta, ok := obj["metadata"].(map[string]any); ok {
-		if strOrEmpty(meta["user_id"]) != "" {
-			return true
+		if v := strOrEmpty(meta["user_id"]); v != "" {
+			return v
 		}
 	}
-	return strOrEmpty(obj["user_id"]) != ""
+	if v := strOrEmpty(obj["user_id"]); v != "" {
+		return v
+	}
+	// Anthropic /v1/messages 翻译成 chat 后，user_id 会落在 OpenAI 的顶层 user 字段。
+	return strOrEmpty(obj["user"])
 }
 
-// deriveKey 从内容派生稳定会话键：SHA-256(system 文本 + 首条 user 文本) 前 16 字节。
+// deriveKey 从内容派生稳定会话键：SHA-256(user_id + system 文本 + 首条 user 文本)。
 // 取不到任何用户文本（纯图片等）→ 空串，退回普通轮换。
 //
 // 刻意只取前缀（system + 首条 user），不是缺陷：粘性的目的是命中上游 prompt 缓存，而同一会话
 // 每轮都在尾部追加，哈希整段会让键每轮都变、缓存全废。代价是「前缀完全相同」的两个会话共用
 // 一个键（同一条 system + 同一个开场白）——它们本来就会命中同一份前缀缓存，共用账号不算错。
-func deriveKey(obj map[string]any) string {
+func deriveKey(obj map[string]any, userID string) string {
 	msgs, ok := obj["messages"].([]any)
 	if !ok || len(msgs) == 0 {
 		return ""
@@ -241,7 +244,7 @@ func deriveKey(obj map[string]any) string {
 	if firstUserText == "" {
 		return ""
 	}
-	sum := sha256.Sum256([]byte(systemText + "\x00" + firstUserText))
+	sum := sha256.Sum256([]byte(userID + "\x00" + systemText + "\x00" + firstUserText))
 	return derivedKeyPrefix + hex.EncodeToString(sum[:16])
 }
 

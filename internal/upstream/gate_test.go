@@ -77,14 +77,14 @@ func TestChat403WithTTHeaderIsBusy(t *testing.T) {
 	}
 }
 
-// 出站最小间隔：连续调用之间必须隔开 minSendGap，避免并发尖峰同时打到上游。
+// 出站最小间隔：正常态连续调用至少隔开 sendGapFast，避免并发尖峰同时打到上游。
 func TestSendSlotSpacing(t *testing.T) {
 	c := New()
 	ctx := context.Background()
 	start := time.Now()
 	c.WaitSendSlot(ctx)
 	c.WaitSendSlot(ctx)
-	if d := time.Since(start); d < minSendGap/2 {
-		t.Fatalf("两次出站仅间隔 %s，期望约 %s", d, minSendGap)
+	if d := time.Since(start); d < sendGapFast/2 {
+		t.Fatalf("两次出站仅间隔 %s，期望约 %s", d, sendGapFast)
 	}
 }

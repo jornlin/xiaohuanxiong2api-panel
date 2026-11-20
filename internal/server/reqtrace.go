@@ -31,6 +31,9 @@ type reqTrace struct {
 	UA       string
 	Model    string
 	Account  string
+	// TTFBMs 客户端感知的首字延迟：从入站请求开始到上游第一帧可用（含排队/重试/换号）。
+	// 只记第一次成功出站的首帧；reqlog 归档与面板据此定位「首字慢」是网关还是上游。
+	TTFBMs int64
 
 	// 以下由 addUsage 累加：多账号重试时 token 相加，积分按单价估算（与用量台账同一套
 	// pricing，见 internal/usage）。上游没报的维度保持零值 —— 零值在 Event 上被 omitempty
@@ -200,9 +203,13 @@ func logChatRow(tr *reqTrace, status int, outcome string, dur time.Duration, wit
 	if withSource {
 		src = fmt.Sprintf(" | src=%s ua=%q", tr.ClientIP, tr.UA)
 	}
-	log.Printf("| #%03d | %s | %s | %s | %d | tok=%s | credit=%s | dur=%s | rid=%s | out=%s%s",
+	ttfb := "-"
+	if tr.TTFBMs > 0 {
+		ttfb = strconv.FormatInt(tr.TTFBMs, 10) + "ms"
+	}
+	log.Printf("| #%03d | %s | %s | %s | %d | tok=%s | credit=%s | ttfb=%s | dur=%s | rid=%s | out=%s%s",
 		chatSeq.Add(1), tr.Start.Format("15:04:05"), tr.Model, tr.Account, status,
-		tok, credit, dur.Round(time.Millisecond), tr.ID, outcome, src)
+		tok, credit, ttfb, dur.Round(time.Millisecond), tr.ID, outcome, src)
 }
 
 // modelBareName 去掉面板载荷里的域前缀（cn:raccoon-8c4485 → raccoon-8c4485），
@@ -268,6 +275,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		OK:               ok,
 		Outcome:          outcome,
 		DurationMs:       time.Since(tr.Start).Milliseconds(),
+		TTFBMs:           tr.TTFBMs,
 		PromptTokens:     tr.PromptTokens,
 		CompletionTokens: tr.CompletionTokens,
 		TotalTokens:      tr.TotalTokens,
