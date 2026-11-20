@@ -330,6 +330,18 @@ func liftMaxTokens(body []byte) []byte {
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return body
 	}
+	if !liftMaxTokensMap(obj) {
+		return body
+	}
+	raw, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return raw
+}
+
+// liftMaxTokensMap 是 liftMaxTokens 的「已解析」版本，返回是否改动。
+func liftMaxTokensMap(obj map[string]any) bool {
 	changed := false
 	for _, k := range []string{"max_tokens", "max_completion_tokens", "max_output_tokens"} {
 		if v, ok := obj[k].(float64); ok && v > 0 && v < minOutputTokens {
@@ -337,9 +349,22 @@ func liftMaxTokens(body []byte) []byte {
 			changed = true
 		}
 	}
-	if !changed {
-		return body
+	return changed
+}
+
+// prepareChatBody 一次解析完成 model / extra_body.thinking / max_tokens 三处改写。
+//
+// 此前 setModelInBody + applyThinking + liftMaxTokens 各自 parse+marshal 一遍；
+// 100k+ token 的请求体 3MB 左右，实测单次 unmarshal ~17ms、marshal ~22ms，
+// 合并后省掉约 40~60ms 的网关侧首字开销。
+func prepareChatBody(body []byte, modelID string) []byte {
+	var obj map[string]any
+	if err := json.Unmarshal(body, &obj); err != nil {
+		return setModelInBody(body, modelID)
 	}
+	obj["model"] = modelID
+	applyThinkingMap(obj)
+	liftMaxTokensMap(obj)
 	raw, err := json.Marshal(obj)
 	if err != nil {
 		return body
@@ -416,14 +441,12 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	setTraceModel()
 	peek.Model = configName
 
-	body = setModelInBody(body, configName)
 	body = h.applyPrompt(body)
-	// 思考开关：`reasoning_effort` 在上游是空转参数（实测对 reasoning_tokens 无影响），
-	// 真正生效的是 extra_body.thinking。三条协议（chat/messages/responses）最后都汇到
-	// 这里，所以只在这一处翻译。
-	body = applyThinking(body)
-	// 思考 token 算在 max_tokens 里，小额度会让正文回空——统一给个下限。
-	body = liftMaxTokens(body)
+	// 一次解析完成 model / 思考开关 / max_tokens 下限：
+	// `reasoning_effort` 在上游是空转参数（实测对 reasoning_tokens 无影响），
+	// 真正生效的是 extra_body.thinking；思考 token 也算在 max_tokens 里，
+	// 小额度会让正文回空。三条协议（chat/messages/responses）最后都汇到这里。
+	body = prepareChatBody(body, configName)
 
 	tried := map[string]bool{}
 	var lastErr error

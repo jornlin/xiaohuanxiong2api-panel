@@ -318,10 +318,14 @@ type Client struct {
 // New 生产默认值：连接池共享，短请求 120s 兜底、长流只看首字节超时。
 func New() *Client {
 	tr := &http.Transport{
-		MaxIdleConns:          100,
-		MaxIdleConnsPerHost:   20,
+		// 138 个号可能同时向同一个上游主机发起 SSE：连接池太小会让突发请求
+		// 反复新建 TLS 连接，首字平白多出一次握手。放宽空闲连接并启用 HTTP/2
+		// （服务端支持时多路复用；不支持会自动回落 HTTP/1.1）。
+		MaxIdleConns:          256,
+		MaxIdleConnsPerHost:   128,
 		IdleConnTimeout:       90 * time.Second,
 		ResponseHeaderTimeout: 120 * time.Second,
+		ForceAttemptHTTP2:     true,
 	}
 	return &Client{
 		HTTP:       &http.Client{Timeout: 120 * time.Second, Transport: tr},

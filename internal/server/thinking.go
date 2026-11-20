@@ -47,10 +47,23 @@ func applyThinking(body []byte) []byte {
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return body
 	}
+	if !applyThinkingMap(obj) {
+		return body
+	}
+	out, err := json.Marshal(obj)
+	if err != nil {
+		return body
+	}
+	return out
+}
+
+// applyThinkingMap 是 applyThinking 的「已解析」版本，供 prepareChatBody 与
+// applyThinking 共用一份判据。返回是否改动了 obj。
+func applyThinkingMap(obj map[string]any) bool {
 	// 已经带了 extra_body.thinking：尊重调用方，不覆盖。
 	if eb, ok := obj["extra_body"].(map[string]any); ok {
 		if _, has := eb["thinking"]; has {
-			return body
+			return false
 		}
 	}
 	effort := ""
@@ -64,7 +77,7 @@ func applyThinking(body []byte) []byte {
 	}
 	want := thinkingTypeOf(effort)
 	if want == "" {
-		return body
+		return false
 	}
 	eb, _ := obj["extra_body"].(map[string]any)
 	if eb == nil {
@@ -72,9 +85,5 @@ func applyThinking(body []byte) []byte {
 	}
 	eb["thinking"] = map[string]any{"type": want}
 	obj["extra_body"] = eb
-	out, err := json.Marshal(obj)
-	if err != nil {
-		return body
-	}
-	return out
+	return true
 }
