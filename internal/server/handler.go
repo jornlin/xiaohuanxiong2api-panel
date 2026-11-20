@@ -683,11 +683,20 @@ func (h *Handler) attempt(ctx context.Context, w http.ResponseWriter, acct *auth
 		h.noteFailure(acct.UID, kind, 0)
 		return false, &upstream.Error{Kind: kind, Status: status, Msg: string(respBody)}
 	}
-	// ChatStream 返回时首帧已经可用（SSE 会先 peek 一帧判错），这里记客户端感知的
-	// 首字延迟：从入站请求开始，包含选号、排队、限流闸门和之前的失败重试。
-	if tr != nil && tr.TTFBMs == 0 {
-		tr.TTFBMs = time.Since(tr.Start).Milliseconds()
+	// ChatStream 返回时首帧已经可用（SSE 会先 peek 一帧判错）：
+	//   TTFBMs   从入站开始，含选号/排队/闸门/重试（客户端感知）；
+	//   UpTTFBMs 只算本次上游连接→首帧（网关开销 = 两者差值）。
+	// 同时把上游延迟喂给池子的账号 EWMA，供新会话选号避开持续慢的账号。
+	upTTFB := time.Since(attemptStart).Milliseconds()
+	if tr != nil {
+		if tr.TTFBMs == 0 {
+			tr.TTFBMs = time.Since(tr.Start).Milliseconds()
+		}
+		if tr.UpTTFBMs == 0 {
+			tr.UpTTFBMs = upTTFB
+		}
 	}
+	h.cfg.Pool.NoteLatency(acct.UID, upTTFB)
 
 	if peek.Stream {
 		h.cfg.Pool.NoteSuccess(acct.UID)

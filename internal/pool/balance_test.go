@@ -2,6 +2,7 @@ package pool
 
 import (
 	"testing"
+	"time"
 
 	"github.com/misakano7545/xiaohuanxiong2api-panel/internal/auth"
 )
@@ -93,5 +94,24 @@ func TestHasHealthy(t *testing.T) {
 	p.Disable("u-1", "test")
 	if p.HasHealthy("") {
 		t.Fatal("禁用号不应返回 true")
+	}
+}
+
+// 上游首字延迟 EWMA：快账号的选号权重应高于持续慢的账号（新会话场景）。
+func TestLatencyWeight(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{Data: auth.Data{UID: "fast"}})
+	p.Add(&auth.Auth{Data: auth.Data{UID: "slow"}})
+	for i := 0; i < 5; i++ {
+		p.NoteLatency("fast", 1200)
+		p.NoteLatency("slow", 18000)
+	}
+	now := time.Now()
+	p.mu.RLock()
+	wf := p.weight(p.byUID["fast"], 0, now)
+	ws := p.weight(p.byUID["slow"], 0, now)
+	p.mu.RUnlock()
+	if wf <= ws {
+		t.Fatalf("快账号权重应更高：fast=%v slow=%v", wf, ws)
 	}
 }

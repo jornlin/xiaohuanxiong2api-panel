@@ -170,6 +170,10 @@ type entry struct {
 	// sessionDeadFails 连续 session 失效计数（持久化：重启不该给故障号免费重试）。
 	// 上游偶发 401 不代表号真死，连续 sessionDeadThreshold 次才禁用，见 NoteSessionDead。
 	sessionDeadFails int
+	// 上游首字节延迟 EWMA（毫秒，内存态：重启即重新采样）。只用于新会话选号时
+	// 轻微避开持续慢的账号；会话粘性命中时不参与选号。
+	ttfbEWMA float64
+	ttfbN    int
 	// 在途请求数（不持久化：重启即在途归零，没有需要恢复的在途请求）。
 	inFlight int
 	// lastUsed 上次被选中时间，用于闲置补偿（不持久化：重启后视为全部闲置）。
@@ -600,6 +604,31 @@ func (p *Pool) drawLocked(cands []*entry, now time.Time) *entry {
 	return eligible[len(eligible)-1].e
 }
 
+// NoteLatency 记录一次成功出站的上游首字节延迟（毫秒），维护账号 EWMA。
+// 内存态、不落盘：延迟随上游负载变化，重启后重新采样即可。
+func (p *Pool) NoteLatency(uid string, ms int64) {
+	if ms <= 0 {
+		return
+	}
+	if ms > 60000 {
+		ms = 60000
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return
+	}
+	if e.ttfbN == 0 {
+		e.ttfbEWMA = float64(ms)
+	} else {
+		e.ttfbEWMA = e.ttfbEWMA*0.8 + float64(ms)*0.2
+	}
+	if e.ttfbN < 1<<30 {
+		e.ttfbN++
+	}
+}
+
 // spendableCredits 选号时的「可花积分」口径。
 //
 // 优先用上游 total_chargeable_points（实际会扣费的部分）；字段缺失才回落到账面
@@ -655,6 +684,19 @@ func (p *Pool) weight(e *entry, maxCredits int64, now time.Time) float64 {
 		w += remain / e.limitUSD * 10
 	case maxCredits > 0:
 		w += float64(e.spendableCredits()) / float64(maxCredits) * 10
+	}
+	// 延迟项：8s 为中性，快账号小幅加权、持续慢的账号降权，范围 [-0.5,+1]。
+	// 幅度刻意压得比积分项（0~10）小：缓存粘性/积分仍是主因素，延迟只做微调。
+	// 会话粘性命中时不走这里；它只影响新会话/解绑后的重新选号。
+	if e.ttfbN >= 3 {
+		lat := (8000 - e.ttfbEWMA) / 8000
+		if lat > 1 {
+			lat = 1
+		}
+		if lat < -0.5 {
+			lat = -0.5
+		}
+		w += lat
 	}
 	if p.lim.IdleWeightPerHour <= 0 {
 		return w
